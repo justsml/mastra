@@ -20,16 +20,6 @@
         "default": "./dist/index.cjs"
       }
     },
-    "./gen-ai-messages": {
-      "import": {
-        "types": "./dist/gen-ai-messages.d.ts",
-        "default": "./dist/gen-ai-messages.js"
-      },
-      "require": {
-        "types": "./dist/gen-ai-messages.d.ts",
-        "default": "./dist/gen-ai-messages.cjs"
-      }
-    },
     "./package.json": "./package.json"
   },
   "scripts": {

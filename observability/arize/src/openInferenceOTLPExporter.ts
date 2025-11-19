@@ -3,7 +3,7 @@ import type { Mutable } from '@arizeai/openinference-genai/types';
 import type { ExportResult } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import { convertMastraMessagesToGenAIMessages } from './gen-ai';
+import { convertMastraMessagesToGenAIMessages } from '@mastra/otel-exporter';
 
 export class OpenInferenceOTLPTraceExporter extends OTLPTraceExporter {
   export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void) {

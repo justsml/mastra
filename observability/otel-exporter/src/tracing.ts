@@ -41,7 +41,7 @@ export class OtelExporter extends BaseExporter {
     super(config);
 
     this.config = config;
-    this.spanConverter = new SpanConverter();
+    this.spanConverter = new SpanConverter(undefined, config);
 
     // Set up OpenTelemetry diagnostics if debug mode
     if (config.logLevel === 'debug') {
@@ -170,7 +170,7 @@ export class OtelExporter extends BaseExporter {
     }
 
     // Store the resource in the span converter
-    this.spanConverter = new SpanConverter(resource);
+    this.spanConverter = new SpanConverter(resource, this.config);
 
     // Always use BatchSpanProcessor for production
     // It queues spans and exports them in batches for better performance

@@ -15,7 +15,9 @@ import { SpanKind } from '@opentelemetry/api';
 import type { Attributes } from '@opentelemetry/api';
 import type { InstrumentationScope } from '@opentelemetry/core';
 import type { Resource } from '@opentelemetry/resources';
+import { convertMastraMessagesToGenAIMessages } from './gen-ai-messages.js';
 import { MastraReadableSpan } from './mastra-span.js';
+import type { OtelExporterConfig } from './types.js';
 
 // Map Mastra span types to OpenTelemetry span kinds following OTEL conventions
 // Only non-INTERNAL mappings are specified - all others default to SpanKind.INTERNAL
@@ -35,13 +37,15 @@ const SPAN_KIND_MAPPING: Partial<Record<SpanType, SpanKind>> = {
 export class SpanConverter {
   private resource?: Resource;
   private instrumentationLibrary: InstrumentationScope;
+  private includeContentAttributes: boolean;
 
-  constructor(resource?: Resource) {
+  constructor(resource?: Resource, config?: OtelExporterConfig) {
     this.resource = resource;
     this.instrumentationLibrary = {
       name: '@mastra/otel',
       version: '1.0.0',
     };
+    this.includeContentAttributes = config?.genAiConventions?.includeContentAttributes ?? false;
   }
 
   /**
@@ -100,8 +104,8 @@ export class SpanConverter {
 
       case SpanType.AGENT_RUN: {
         const agentAttrs = Span.attributes as AgentRunAttributes;
-        const agentId = agentAttrs?.agentId || 'unknown';
-        return `agent.${agentId}`;
+        const agentName = agentAttrs?.agentName || agentAttrs?.agentId || 'unknown';
+        return `invoke_agent ${agentName}`;
       }
 
       case SpanType.WORKFLOW_RUN: {
@@ -153,6 +157,12 @@ export class SpanConverter {
       // Add specific attributes based on span type
       if (Span.type === SpanType.MODEL_GENERATION) {
         attributes['gen_ai.prompt'] = inputStr;
+
+        // Add gen_ai.input.messages if content attributes are enabled
+        if (this.includeContentAttributes) {
+          const convertedInput = convertMastraMessagesToGenAIMessages(inputStr);
+          attributes['gen_ai.input.messages'] = convertedInput;
+        }
       } else if (Span.type === SpanType.TOOL_CALL || Span.type === SpanType.MCP_TOOL_CALL) {
         attributes['gen_ai.tool.input'] = inputStr;
       }
@@ -166,6 +176,12 @@ export class SpanConverter {
       // Add specific attributes based on span type
       if (Span.type === SpanType.MODEL_GENERATION) {
         attributes['gen_ai.completion'] = outputStr;
+
+        // Add gen_ai.output.messages if content attributes are enabled
+        if (this.includeContentAttributes) {
+          const convertedOutput = convertMastraMessagesToGenAIMessages(outputStr);
+          attributes['gen_ai.output.messages'] = convertedOutput;
+        }
       } else if (Span.type === SpanType.TOOL_CALL || Span.type === SpanType.MCP_TOOL_CALL) {
         attributes['gen_ai.tool.output'] = outputStr;
       }
@@ -181,7 +197,7 @@ export class SpanConverter {
       }
 
       if (modelAttrs.provider) {
-        attributes['gen_ai.system'] = modelAttrs.provider;
+        attributes['gen_ai.provider.name'] = modelAttrs.provider;
       }
 
       // Token usage - use OTEL standard naming
@@ -238,6 +254,20 @@ export class SpanConverter {
       if (modelAttrs.finishReason) {
         attributes['gen_ai.response.finish_reasons'] = modelAttrs.finishReason;
       }
+      if (modelAttrs.responseModel) {
+        attributes['gen_ai.response.model'] = modelAttrs.responseModel;
+      }
+      if (modelAttrs.responseId) {
+        attributes['gen_ai.response.id'] = modelAttrs.responseId;
+      }
+
+      // Server attributes
+      if (modelAttrs.serverAddress) {
+        attributes['server.address'] = modelAttrs.serverAddress;
+      }
+      if (modelAttrs.serverPort !== undefined) {
+        attributes['server.port'] = modelAttrs.serverPort;
+      }
     }
 
     // Add tool-specific attributes using OTEL conventions
@@ -277,11 +307,22 @@ export class SpanConverter {
         attributes['agent.id'] = agentAttrs.agentId;
         attributes['gen_ai.agent.id'] = agentAttrs.agentId;
       }
+      if (agentAttrs.agentName) {
+        attributes['gen_ai.agent.name'] = agentAttrs.agentName;
+      }
+      if (agentAttrs.conversationId) {
+        attributes['gen_ai.conversation.id'] = agentAttrs.conversationId;
+      }
       if (agentAttrs.maxSteps) {
         attributes['agent.max_steps'] = agentAttrs.maxSteps;
       }
       if (agentAttrs.availableTools) {
         attributes['agent.available_tools'] = JSON.stringify(agentAttrs.availableTools);
+      }
+
+      // Add system instructions if content attributes are enabled
+      if (this.includeContentAttributes && agentAttrs.instructions) {
+        attributes['gen_ai.system_instructions'] = agentAttrs.instructions;
       }
     }
 

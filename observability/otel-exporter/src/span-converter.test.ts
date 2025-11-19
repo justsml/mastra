@@ -102,7 +102,7 @@ describe('SpanConverter', () => {
       };
 
       const result = converter.convertSpan(span);
-      expect(result.name).toBe('agent.support-agent');
+      expect(result.name).toBe('invoke_agent support-agent');
     });
 
     it('should format workflow span names correctly', () => {
@@ -337,7 +337,7 @@ describe('SpanConverter', () => {
       const attrs = result.attributes;
 
       expect(attrs['gen_ai.request.model']).toBe('gpt-4');
-      expect(attrs['gen_ai.system']).toBe('openai');
+      expect(attrs['gen_ai.provider.name']).toBe('openai');
       expect(attrs['gen_ai.request.temperature']).toBe(0.7);
       expect(attrs['gen_ai.request.max_tokens']).toBe(2000);
       expect(attrs['gen_ai.request.top_p']).toBe(0.9);

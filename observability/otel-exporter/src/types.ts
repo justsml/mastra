@@ -73,6 +73,16 @@ export interface OtelExporterConfig extends BaseExporterConfig {
 
   // Override or provide a custom span exporter
   exporter?: SpanExporter;
+
+  // OpenTelemetry GenAI semantic conventions compliance options
+  genAiConventions?: {
+    /**
+     * Include content attributes (gen_ai.input.messages, gen_ai.output.messages, gen_ai.system_instructions)
+     * These attributes may contain sensitive information and should only be enabled with proper consent.
+     * @default false
+     */
+    includeContentAttributes?: boolean;
+  };
 }
 
 export interface SpanData {

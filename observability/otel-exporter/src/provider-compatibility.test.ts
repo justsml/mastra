@@ -292,7 +292,7 @@ describe('Provider Compatibility', () => {
       // Check OTEL semantic conventions
       expect(result.attributes['gen_ai.operation.name']).toBe('chat');
       expect(result.attributes['gen_ai.request.model']).toBe('gpt-4');
-      expect(result.attributes['gen_ai.system']).toBe('openai');
+      expect(result.attributes['gen_ai.provider.name']).toBe('openai');
       expect(result.attributes['gen_ai.usage.input_tokens']).toBe(100);
       expect(result.attributes['gen_ai.usage.output_tokens']).toBe(50);
       expect(result.attributes['gen_ai.usage.total_tokens']).toBe(150);

@@ -737,12 +737,42 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
       }
 
       const expectedIndexType = indexConfig.type === 'ivfflat' ? 'IvfPq' : 'IvfHnswPq';
-      const existingIndex = (await table.listIndices()).find(
-        index => index.columns.includes(columnToIndex) && index.indexType === expectedIndexType,
-      );
-      if (existingIndex) {
+      const buildOptions =
+        indexConfig.type === 'ivfflat'
+          ? {
+              numPartitions: indexConfig.numPartitions || 128,
+              numSubVectors: indexConfig.numSubVectors || 16,
+              distanceType: metricType,
+            }
+          : {
+              m: indexConfig.hnsw?.m || 16,
+              efConstruction: indexConfig.hnsw?.efConstruction || 100,
+              numPartitions: indexConfig.numPartitions || undefined,
+              numSubVectors: indexConfig.numSubVectors || undefined,
+              distanceType: metricType,
+            };
+      const configuration = JSON.stringify({ indexType: expectedIndexType, ...buildOptions });
+      const metadataKey = 'mastra.vector.indexConfig';
+      const lanceIndexName = `${columnToIndex}_idx`;
+      const findIndex = async () =>
+        (await table.listIndices()).find(
+          index =>
+            index.name === lanceIndexName &&
+            index.columns.length === 1 &&
+            index.columns[0] === columnToIndex &&
+            index.indexType === expectedIndexType,
+        );
+      const existingIndex = await findIndex();
+      if (existingIndex?.indexUuid) {
+        const schema = await table.schema();
+        const recordedConfiguration = schema.fields
+          .find(field => field.name === columnToIndex)
+          ?.metadata.get(metadataKey);
+        // Bind the configuration to the physical index: another client may have replaced
+        // an index with the same name. Unknown/legacy configurations rebuild once.
+        const expectedConfiguration = JSON.stringify({ indexUuid: existingIndex.indexUuid, configuration });
         const existingStats = await table.indexStats(existingIndex.name);
-        if (existingStats && this.lanceMetricToMastra(existingStats.distanceType) === metric) {
+        if (recordedConfiguration === expectedConfiguration && existingStats?.distanceType === metricType) {
           this.logger.debug(
             `Vector index ${existingIndex.name} already exists on ${resolvedTableName}.${columnToIndex}; skipping rebuild.`,
           );
@@ -750,24 +780,20 @@ export class LanceVectorStore extends MastraVector<LanceVectorFilter> {
         }
       }
 
-      if (indexConfig.type === 'ivfflat') {
-        await table.createIndex(columnToIndex, {
-          config: Index.ivfPq({
-            numPartitions: indexConfig.numPartitions || 128,
-            numSubVectors: indexConfig.numSubVectors || 16,
-            distanceType: metricType,
-          }),
-        });
-      } else {
-        // Default to HNSW PQ index
-        this.logger.debug('Creating HNSW PQ index with config:', indexConfig);
-        await table.createIndex(columnToIndex, {
-          config: Index.hnswPq({
-            m: indexConfig?.hnsw?.m || 16,
-            efConstruction: indexConfig?.hnsw?.efConstruction || 100,
-            distanceType: metricType,
-          }),
-        });
+      await table.createIndex(columnToIndex, {
+        name: lanceIndexName,
+        config: indexConfig.type === 'ivfflat' ? Index.ivfPq(buildOptions) : Index.hnswPq(buildOptions),
+      });
+      const createdIndex = await findIndex();
+      // Remote tables may not expose an index UUID. Without an identity, do not
+      // record or trust a configuration that could belong to a replaced index.
+      if (createdIndex?.indexUuid) {
+        await table.updateFieldMetadata([
+          {
+            path: columnToIndex,
+            metadata: { [metadataKey]: JSON.stringify({ indexUuid: createdIndex.indexUuid, configuration }) },
+          },
+        ]);
       }
     } catch (error: any) {
       throw new MastraError(

@@ -23,6 +23,12 @@ await vectorStore.createIndex({
 });
 ```
 
+Repeated `createIndex()` calls reuse an index only when its column, type, distance metric, and build settings match a configuration recorded by Mastra for that physical index. Build settings include `hnsw.m`, `hnsw.efConstruction`, `numPartitions`, and `numSubVectors`. The latter two settings are passed to both index builders. Omitted HNSW settings retain LanceDB's defaults for partitioning and compression, and Mastra's defaults of `m: 16` and `efConstruction: 100`.
+
+An existing index without recorded configuration is rebuilt once. The configuration is stored in vector-column metadata and tied to the index UUID, so it remains usable after reopening the database and is invalidated if another client replaces the index. Backends that do not expose an index UUID rebuild conservatively.
+
+Index reuse does not refresh the index with newly written rows. LanceDB normally searches unindexed rows through a fallback scan; index maintenance with `table.optimize()` is a separate operation. See [LanceDB's index management guidance](https://docs.lancedb.com/indexing/vector-index#managing-vector-indexes).
+
 ## Documentation
 
 - [LanceDB integration guide](https://mastra.ai/integrations/databases/lancedb)

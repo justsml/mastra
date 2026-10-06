@@ -1,5 +1,70 @@
 # @mastra/auth-workos
 
+## 1.6.6
+
+### Patch Changes
+
+- Fixed cookie sessions losing their organization on re-authentication. With `fetchMemberships: true`, a cookie session that has no selected organization now keeps the organization of the user's only membership. A selected session organization still takes precedence, and users with no memberships or several stay without an organization. ([#25264](https://github.com/mastra-ai/mastra/pull/25264))
+
+## 1.6.6-alpha.0
+
+### Patch Changes
+
+- Fixed cookie sessions losing their organization on re-authentication. With `fetchMemberships: true`, a cookie session that has no selected organization now keeps the organization of the user's only membership. A selected session organization still takes precedence, and users with no memberships or several stay without an organization. ([#25264](https://github.com/mastra-ai/mastra/pull/25264))
+
+## 1.6.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74), [`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3
+
+## 1.6.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74)]:
+  - @mastra/auth@1.1.3-alpha.1
+
+## 1.6.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3-alpha.0
+
+## 1.6.4
+
+### Patch Changes
+
+- dependencies updates: ([#19787](https://github.com/mastra-ai/mastra/pull/19787))
+  - Updated dependency [`@workos-inc/node@8.13.0` ↗︎](https://www.npmjs.com/package/@workos-inc/node/v/8.13.0) (from `8.8.0`, in `dependencies`)
+  - Updated dependency [`@workos/authkit-session@^0.7.1` ↗︎](https://www.npmjs.com/package/@workos/authkit-session/v/0.7.1) (from `^0.5.0`, in `dependencies`)
+
+- Added organization management and host integration to MastraAuthWorkos so it can be passed directly to a server host without a wrapper adapter. The provider now bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and resolves its redirect URI from the host public URL during init when not configured explicitly. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
+## 1.6.4-alpha.1
+
+### Patch Changes
+
+- dependencies updates: ([#19787](https://github.com/mastra-ai/mastra/pull/19787))
+  - Updated dependency [`@workos-inc/node@8.13.0` ↗︎](https://www.npmjs.com/package/@workos-inc/node/v/8.13.0) (from `8.8.0`, in `dependencies`)
+  - Updated dependency [`@workos/authkit-session@^0.7.1` ↗︎](https://www.npmjs.com/package/@workos/authkit-session/v/0.7.1) (from `^0.5.0`, in `dependencies`)
+
+## 1.6.4-alpha.0
+
+### Patch Changes
+
+- Added organization management and host integration to MastraAuthWorkos so it can be passed directly to a server host without a wrapper adapter. The provider now bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and resolves its redirect URI from the host public URL during init when not configured explicitly. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
 ## 1.6.3
 
 ### Patch Changes
@@ -325,9 +390,7 @@
   ```typescript
   import { MastraRBACWorkos } from '@mastra/auth-workos';
 
-  const rbac = new MastraRBACWorkos({
-    /* config */
-  });
+  const rbac = new MastraRBACWorkos({/* config */});
 
   // List all available roles
   const roles = await rbac.getAvailableRoles();
@@ -353,9 +416,7 @@
   ```typescript
   import { MastraRBACWorkos } from '@mastra/auth-workos';
 
-  const rbac = new MastraRBACWorkos({
-    /* config */
-  });
+  const rbac = new MastraRBACWorkos({/* config */});
 
   // List all available roles
   const roles = await rbac.getAvailableRoles();

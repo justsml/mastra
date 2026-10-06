@@ -246,13 +246,17 @@ const FILTER_OPERATORS: Record<OperatorType, OperatorFn> = {
     sql: `NOT (${key})`,
     needsValue: false,
   }),
-  $size: (key: string, paramIndex: number) => {
+  $size: (key: string, value: number) => {
     const jsonPath = getJsonPath(key);
     return {
+      // Anonymous placeholder like every other operator: the previous
+      // `$${paramIndex}` form misused the filter value as a parameter index,
+      // emitting named references ($2, $5, ...) that never matched the
+      // positional bindings collected by processOperator.
       sql: `(
     CASE
-      WHEN json_type(json_extract(metadata, ${jsonPath})) = 'array' THEN 
-        json_array_length(json_extract(metadata, ${jsonPath})) = $${paramIndex}
+      WHEN json_type(json_extract(metadata, ${jsonPath})) = 'array' THEN
+        json_array_length(json_extract(metadata, ${jsonPath})) = ?
       ELSE FALSE
     END
   )`,
@@ -494,14 +498,16 @@ function handleLogicalOperator(
   const values: InValue[] = [];
   const joinOperator = key === '$or' || key === '$nor' ? 'OR' : 'AND';
   const conditions = Array.isArray(value)
-    ? value.map(f => {
+    ? value.flatMap(f => {
         const entries = !!f ? Object.entries(f) : [];
-        return entries.map(([k, v]) => buildCondition(k, v, key));
+        const branch = entries.map(([k, v]) => buildCondition(k, v, key));
+        if (branch.length <= 1) return branch;
+        // The keys of one branch are an implicit AND: `{ a: 1, b: 2 }` matches only when both hold.
+        return [{ sql: `(${branch.map(c => c.sql).join(' AND ')})`, values: branch.flatMap(c => c.values) }];
       })
     : [buildCondition(key, value, parentPath)];
 
   const joined = conditions
-    .flat()
     .map(c => {
       values.push(...c.values);
       return c.sql;

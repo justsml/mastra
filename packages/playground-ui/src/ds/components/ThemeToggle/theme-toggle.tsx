@@ -1,11 +1,10 @@
-import { Radio as RadioPrimitive } from '@base-ui/react/radio';
-import { RadioGroup as RadioGroupPrimitive } from '@base-ui/react/radio-group';
 import { Monitor, Moon, Sun } from 'lucide-react';
 
+import { SegmentedControl, SegmentedControlItem } from '../SegmentedControl';
+import type { SegmentedControlProps } from '../SegmentedControl';
 import { useTheme } from '../ThemeProvider';
 import type { Theme } from '../ThemeProvider/theme-context';
-import { transitions } from '@/ds/primitives/transitions';
-import { cn } from '@/lib/utils';
+import type { ControlSize } from '@/ds/primitives/control-size';
 
 export interface ThemeToggleOption {
   value: Theme;
@@ -19,87 +18,60 @@ const DEFAULT_OPTIONS: ReadonlyArray<ThemeToggleOption> = [
   { value: 'dark', label: 'Dark', icon: <Moon /> },
 ];
 
-const ITEM_WIDTH = 28;
-const ITEM_GAP = 2;
-
-type RadioRootProps = Omit<
-  RadioGroupPrimitive.Props,
-  'value' | 'onChange' | 'onValueChange' | 'defaultValue' | 'className'
-> & {
-  className?: string;
-};
-
 type ControlledProps = { value: Theme; onChange: (next: Theme) => void };
 type UncontrolledProps = { value?: undefined; onChange?: undefined };
 
-export type ThemeToggleProps = RadioRootProps & {
+type ThemeToggleGroupProps = Omit<
+  SegmentedControlProps<Theme>,
+  'value' | 'onValueChange' | 'onChange' | 'aria-label' | 'size' | 'iconOnly' | 'children'
+>;
+
+export type ThemeToggleProps = ThemeToggleGroupProps & {
   options?: ReadonlyArray<ThemeToggleOption>;
+  /**
+   * Control rung, shared with Button and Select. `xs` is deprecated: the control can no longer
+   * be shorter than the smallest rung, so it renders as `sm`.
+   */
+  size?: ControlSize | 'xs';
+  'aria-label'?: string;
 } & (ControlledProps | UncontrolledProps);
 
+/** The theme to show as selected: the current one if it is an option, else the first option. */
+function pickSelectedTheme(options: ReadonlyArray<ThemeToggleOption>, current: Theme): Theme {
+  if (options.some(option => option.value === current)) return current;
+  const [first] = options;
+  if (first) return first.value;
+  return 'system';
+}
+
+/** Icon-only `SegmentedControl` bound to the active theme, or to `value`/`onChange` when controlled. */
 export const ThemeToggle = ({
   value,
   onChange,
   options = DEFAULT_OPTIONS,
-  className,
+  size = 'md',
   'aria-label': ariaLabel = 'Theme',
-  ...rest
+  ...groupProps
 }: ThemeToggleProps) => {
   const { theme, setTheme } = useTheme();
   const current = value ?? theme;
   const commit = onChange ?? setTheme;
-  const effectiveCurrent = options.some(option => option.value === current) ? current : (options[0]?.value ?? 'system');
-
-  const handleChange = (next: unknown) => {
-    const match = options.find(opt => opt.value === next);
-    if (match) commit(match.value);
-  };
-
-  const activeIndex = Math.max(
-    0,
-    options.findIndex(option => option.value === effectiveCurrent),
-  );
-  const indicatorOffset = activeIndex * (ITEM_WIDTH + ITEM_GAP);
+  const selected = pickSelectedTheme(options, current);
 
   return (
-    <RadioGroupPrimitive
-      {...rest}
-      value={effectiveCurrent}
-      onValueChange={handleChange}
+    <SegmentedControl
+      {...groupProps}
       aria-label={ariaLabel}
-      className={cn(
-        'relative inline-flex w-fit items-center gap-0.5 rounded-full border border-border1 bg-surface3 p-0.5',
-        className,
-      )}
+      iconOnly
+      size={size === 'xs' ? 'sm' : size}
+      value={selected}
+      onValueChange={commit}
     >
-      <span
-        aria-hidden="true"
-        className={cn(
-          'pointer-events-none absolute inset-y-0.5 left-0.5 rounded-full bg-surface5 motion-reduce:transition-none',
-          transitions.transform,
-        )}
-        style={{ width: ITEM_WIDTH, transform: `translateX(${indicatorOffset}px)` }}
-      />
       {options.map(option => (
-        <RadioPrimitive.Root
-          key={option.value}
-          value={option.value}
-          aria-label={option.label}
-          style={{ width: ITEM_WIDTH }}
-          className={cn(
-            'relative inline-flex h-6 cursor-pointer items-center justify-center rounded-full',
-            // Base UI exposes `data-checked` instead of Radix's `data-state="checked"`.
-            'text-icon3 hover:text-icon6 data-[checked]:text-icon6 [&_svg]:size-3.5',
-            'focus-visible:outline-hidden',
-            'active:scale-90 motion-reduce:transition-none',
-            transitions.colors,
-            transitions.transform,
-          )}
-        >
-          <span aria-hidden="true" className="pointer-events-none inline-flex items-center justify-center">
-            {option.icon}
-          </span>
-        </RadioPrimitive.Root>
+        <SegmentedControlItem key={option.value} value={option.value} aria-label={option.label}>
+          {option.icon}
+        </SegmentedControlItem>
       ))}
-    </RadioGroupPrimitive>
+    </SegmentedControl>
   );
 };

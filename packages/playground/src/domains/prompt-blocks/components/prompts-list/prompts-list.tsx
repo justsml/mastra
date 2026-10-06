@@ -1,20 +1,36 @@
 import type { StoredPromptBlockResponse } from '@mastra/client-js';
-import {
-  DataList as EntityList,
-  DataListSkeleton as EntityListSkeleton,
-} from '@mastra/playground-ui/components/DataList';
+import { DataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import type { DataListSort } from '@mastra/playground-ui/components/DataList';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
 import { truncateString } from '@mastra/playground-ui/utils/truncate-string';
 import { CheckIcon } from 'lucide-react';
 import { useMemo } from 'react';
-import { useLinkComponent } from '@/lib/framework';
 
 export interface PromptsListProps {
   promptBlocks: StoredPromptBlockResponse[];
   isLoading: boolean;
   search?: string;
+  currentPage?: number;
+  hasMore?: boolean;
+  onNextPage?: () => void;
+  onPrevPage?: () => void;
+  updatedSort?: DataListSort;
+  onSortChange?: (sort: DataListSort, key: string) => void;
 }
 
-export function PromptsList({ promptBlocks, isLoading, search = '' }: PromptsListProps) {
+const COLUMNS = 'auto 1fr auto auto auto';
+
+export function PromptsList({
+  promptBlocks,
+  isLoading,
+  search = '',
+  currentPage,
+  hasMore,
+  onNextPage,
+  onPrevPage,
+  updatedSort,
+  onSortChange,
+}: PromptsListProps) {
   const { paths, Link } = useLinkComponent();
 
   const filteredData = useMemo(() => {
@@ -24,38 +40,60 @@ export function PromptsList({ promptBlocks, isLoading, search = '' }: PromptsLis
     );
   }, [promptBlocks, search]);
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filteredData.length, global: true });
+
   if (isLoading) {
-    return <EntityListSkeleton columns="auto 1fr auto auto" />;
+    return <DataListSkeleton columns={COLUMNS} />;
   }
 
   return (
-    <EntityList columns="auto 1fr auto auto" variant="striped">
-      <EntityList.Top>
-        <EntityList.TopCell>Name</EntityList.TopCell>
-        <EntityList.TopCell>Description</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Has Draft</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Is Published</EntityList.TopCell>
-      </EntityList.Top>
+    <DataList columns={COLUMNS} scrollRef={containerRef}>
+      <DataList.Top>
+        <DataList.TopCell>Name</DataList.TopCell>
+        <DataList.TopCell>Description</DataList.TopCell>
+        <DataList.TopCell className="text-center">Has Draft</DataList.TopCell>
+        <DataList.TopCell className="text-center">Is Published</DataList.TopCell>
+        {onSortChange ? (
+          <DataList.SortableTopCell sortKey="updatedAt" sort={updatedSort} onSortChange={onSortChange}>
+            Updated
+          </DataList.SortableTopCell>
+        ) : (
+          <DataList.TopCell>Updated</DataList.TopCell>
+        )}
+      </DataList.Top>
 
-      {filteredData.length === 0 && search ? <EntityList.NoMatch message="No Prompts match your search" /> : null}
+      {filteredData.length === 0 && search ? <DataList.NoMatch message="No Prompts match your search" /> : null}
 
-      {filteredData.map(block => {
+      {filteredData.map((block, index) => {
         const name = truncateString(block.name, 50);
         const description = truncateString(block.description ?? '', 200);
 
         return (
-          <EntityList.RowLink key={block.id} to={paths.cmsPromptBlockEditLink(block.id)} LinkComponent={Link}>
-            <EntityList.NameCell>{name}</EntityList.NameCell>
-            <EntityList.DescriptionCell>{description}</EntityList.DescriptionCell>
-            <EntityList.TextCell className="text-center">
-              {(block.hasDraft || !block.activeVersionId) && <CheckIcon className="size-4 mx-auto" />}
-            </EntityList.TextCell>
-            <EntityList.TextCell className="text-center">
-              {block.activeVersionId && <CheckIcon className="size-4 mx-auto" />}
-            </EntityList.TextCell>
-          </EntityList.RowLink>
+          <DataList.RowLink
+            key={block.id}
+            to={paths.cmsPromptBlockEditLink(block.id)}
+            LinkComponent={Link}
+            {...getRowProps(index)}
+          >
+            <DataList.NameCell>{name}</DataList.NameCell>
+            <DataList.DescriptionCell>{description}</DataList.DescriptionCell>
+            <DataList.TextCell className="text-center">
+              {(block.hasDraft || !block.activeVersionId) && <CheckIcon className="mx-auto size-4" />}
+            </DataList.TextCell>
+            <DataList.TextCell className="text-center">
+              {block.activeVersionId && <CheckIcon className="mx-auto size-4" />}
+            </DataList.TextCell>
+            <DataList.DateCell timestamp={block.updatedAt} />
+          </DataList.RowLink>
         );
       })}
-    </EntityList>
+
+      <DataList.Pagination
+        currentPage={currentPage}
+        hasMore={hasMore}
+        onNextPage={onNextPage}
+        onPrevPage={onPrevPage}
+      />
+    </DataList>
   );
 }

@@ -3,7 +3,7 @@ import { createOpenAI as createOpenAIV5 } from '@ai-sdk/openai-v5';
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import type { LanguageModelV1 as LanguageModel } from '@internal/ai-sdk-v4';
 import { getLLMTestMode } from '@internal/llm-recorder';
-import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
+import { canonicalizeRequestJsonSchema, createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
 import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import { createOpenRouter as createOpenRouterV5 } from '@openrouter/ai-sdk-provider-v5';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -13,11 +13,12 @@ import { SpanType } from '../../observability';
 import type { AnySpan } from '../../observability';
 import { RequestContext } from '../../request-context';
 import { createTool } from '../../tools';
+import { resolveToolOutputValidationSchema } from '../validation';
 import { CoreToolBuilder } from './builder';
 
 setupDummyApiKeys(getLLMTestMode(), ['openai', 'openrouter']);
 
-const mock = createGatewayMock({ exactMatch: true });
+const mock = createGatewayMock({ exactMatch: true, transformRequest: canonicalizeRequestJsonSchema });
 beforeAll(() => mock.start());
 afterAll(() => mock.saveAndStop());
 
@@ -324,30 +325,28 @@ const TEST_TIMEOUT = 300000; // 5 minutes
 const openrouter = createOpenRouter({ apiKey: process.env.OPENROUTER_API_KEY });
 
 const modelsToTestV1 = [
-  // openrouter('anthropic/claude-3.7-sonnet'),
-  // openrouter('anthropic/claude-sonnet-4.5'),
+  openrouter('anthropic/claude-sonnet-4.5'),
   openrouter('anthropic/claude-haiku-4.5'),
-  // openrouter('openai/gpt-4o-mini'),
-  // openrouter('openai/gpt-4.1-mini'),
-  // openrouter_v5('openai/o3-mini'),
-  // openai('o3-mini'),
+  openrouter('openai/gpt-4o-mini'),
+  openrouter('openai/gpt-4.1-mini'),
+  openai('o3-mini'),
   openai('o4-mini'),
-  // openrouter('google/gemini-2.5-pro'),
-  // openrouter('google/gemini-2.5-flash'),
-  openrouter('google/gemini-2.0-flash-lite-001'),
+  openrouter('google/gemini-2.5-pro'),
+  openrouter('google/gemini-2.5-flash'),
+  // gemini-2.0-flash-lite-001 was delisted from OpenRouter; use the current lite tier
+  openrouter('google/gemini-3.1-flash-lite'),
 ];
 const modelsToTestV2 = [
-  // openrouter_v5('anthropic/claude-3.7-sonnet'),
-  // openrouter_v5('anthropic/claude-sonnet-4.5'),
+  openrouter_v5('anthropic/claude-sonnet-4.5'),
   openrouter_v5('anthropic/claude-haiku-4.5'),
-  // openrouter_v5('openai/gpt-4o-mini'),
-  // openrouter_v5('openai/gpt-4.1-mini'),
-  // openrouter_v5('openai/o3-mini'),
-  // openai_v5('o3-mini'),
+  openrouter_v5('openai/gpt-4o-mini'),
+  openrouter_v5('openai/gpt-4.1-mini'),
+  openrouter_v5('openai/o3-mini'),
+  openai_v5('o3-mini'),
   openai_v5('o4-mini'),
-  // openrouter_v5('google/gemini-2.5-pro'),
-  // openrouter_v5('google/gemini-2.5-flash'),
-  openrouter_v5('google/gemini-2.0-flash-lite-001'),
+  openrouter_v5('google/gemini-2.5-pro'),
+  openrouter_v5('google/gemini-2.5-flash'),
+  openrouter_v5('google/gemini-3.1-flash-lite'),
 ];
 
 // Specify which schemas to test - empty array means test all
@@ -554,8 +553,9 @@ describe('CoreToolBuilder ID Preservation', () => {
 });
 
 describe('Tool Tracing Context Injection', () => {
-  it('should inject tracingContext for Mastra tools when agentSpan is available', async () => {
+  it('should inject tracingContext and a span-backed observe helper for Mastra tools when agentSpan is available', async () => {
     let receivedTracingContext: any = null;
+    const info = vi.fn();
 
     const testTool = createTool({
       id: 'tracing-test-tool',
@@ -563,12 +563,23 @@ describe('Tool Tracing Context Injection', () => {
       inputSchema: z.object({ message: z.string() }),
       execute: async (inputData, context) => {
         receivedTracingContext = context?.tracingContext;
+        context?.observe.log('info', 'tool executed', { message: inputData.message });
         return { result: `processed: ${inputData.message}` };
       },
     });
 
     // Mock agent span
     const mockToolSpan = {
+      isValid: true,
+      observabilityInstance: {
+        getLoggerContext: vi.fn(() => ({
+          debug: vi.fn(),
+          info,
+          warn: vi.fn(),
+          error: vi.fn(),
+          fatal: vi.fn(),
+        })),
+      },
       end: vi.fn(),
       error: vi.fn(),
     };
@@ -603,6 +614,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'tracing-test-tool'",
       input: { message: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Test tool that captures tracing context',
         toolType: 'tool',
       },
@@ -618,6 +630,7 @@ describe('Tool Tracing Context Injection', () => {
     // Verify tracingContext was injected with the tool span
     expect(receivedTracingContext).toBeTruthy();
     expect(receivedTracingContext.currentSpan).toBe(mockToolSpan);
+    expect(info).toHaveBeenCalledWith('tool executed', { message: 'test' });
 
     // Verify tool span was ended with result and success attribute
     expect(mockToolSpan.end).toHaveBeenCalledWith({
@@ -712,6 +725,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'vercel-tool'",
       input: { input: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Vercel tool test',
         toolType: 'tool',
       },
@@ -966,6 +980,71 @@ describe('Tool Tracing Context Injection', () => {
     expect(mockToolSpan.error).not.toHaveBeenCalled();
   });
 
+  it('should end span with failure when Mastra tool output validation fails', async () => {
+    const mastraTool = createTool({
+      id: 'mastra-output-fail-tool',
+      description: 'Mastra tool with output schema',
+      inputSchema: z.object({ input: z.string() }),
+      outputSchema: z.object({ count: z.number() }),
+      // @ts-expect-error intentionally incorrect output
+      execute: async () => ({ count: 'not-a-number' }),
+    });
+
+    const mockToolSpan = { end: vi.fn(), error: vi.fn() };
+    const mockAgentSpan = {
+      createChildSpan: vi.fn().mockReturnValue(mockToolSpan),
+    } as unknown as AnySpan;
+
+    const builtTool = new CoreToolBuilder({
+      originalTool: mastraTool,
+      options: {
+        name: 'mastra-output-fail-tool',
+        description: 'Mastra tool with output schema',
+        requestContext: new RequestContext(),
+        tracingContext: { currentSpan: mockAgentSpan },
+      },
+    }).build();
+
+    const result: any = await builtTool.execute!({ input: 'test' }, { toolCallId: 'test-call-id', messages: [] });
+
+    expect(result).toHaveProperty('error', true);
+    expect(result.message).toContain('Tool output validation failed');
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: result, attributes: { success: false } });
+    expect(mockToolSpan.error).not.toHaveBeenCalled();
+  });
+
+  it("should end span with success and the raw output when a Mastra tool uses outputValidation: 'warn'", async () => {
+    const mastraTool = createTool({
+      id: 'mastra-output-warn-tool',
+      description: 'Mastra tool with output schema',
+      inputSchema: z.object({ input: z.string() }),
+      outputSchema: z.object({ count: z.number() }),
+      outputValidation: 'warn',
+      // @ts-expect-error intentionally incorrect output
+      execute: async () => ({ count: 'not-a-number' }),
+    });
+
+    const mockToolSpan = { end: vi.fn(), error: vi.fn() };
+    const mockAgentSpan = {
+      createChildSpan: vi.fn().mockReturnValue(mockToolSpan),
+    } as unknown as AnySpan;
+
+    const builtTool = new CoreToolBuilder({
+      originalTool: mastraTool,
+      options: {
+        name: 'mastra-output-warn-tool',
+        description: 'Mastra tool with output schema',
+        requestContext: new RequestContext(),
+        tracingContext: { currentSpan: mockAgentSpan },
+      },
+    }).build();
+
+    const result = await builtTool.execute!({ input: 'test' }, { toolCallId: 'test-call-id', messages: [] });
+
+    expect(result).toEqual({ count: 'not-a-number' });
+    expect(mockToolSpan.end).toHaveBeenCalledWith({ output: result, attributes: { success: true } });
+  });
+
   it('should create child span with correct logType attribute', async () => {
     const testTool = createTool({
       id: 'toolset-tool',
@@ -1010,6 +1089,7 @@ describe('Tool Tracing Context Injection', () => {
       name: "tool: 'toolset-tool'",
       input: { message: 'test' },
       attributes: {
+        toolCallId: 'test-call-id',
         toolDescription: 'Tool from a toolset',
         toolType: 'toolset',
       },
@@ -1468,6 +1548,7 @@ describe('CoreToolBuilder Output Schema', () => {
 
     const builtTool = builder.build();
     expect(builtTool.outputSchema).toBeDefined();
+    expect(resolveToolOutputValidationSchema(builtTool)).toBe(toolWithTupleOutput.outputSchema);
   });
 
   describe('agent-as-tools schema serialization (#13324)', () => {

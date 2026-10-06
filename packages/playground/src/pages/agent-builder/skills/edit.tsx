@@ -1,4 +1,5 @@
 import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { useAuthCapabilities, useCurrentUser } from '@mastra/react/hooks/auth';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { FormProvider, useForm, useFormContext, useWatch } from 'react-hook-form';
 import { Navigate, useParams } from 'react-router';
@@ -14,8 +15,6 @@ import { useStoredSkill } from '@/domains/agent-builder/hooks/use-stored-skill';
 import { SkillWorkspaceLayout } from '@/domains/agent-builder/layouts/skill-workspace-layout';
 import { SkillChatComposer } from '@/domains/agents/components/agent-cms-pages/skill-chat-composer';
 import { SkillSimpleForm } from '@/domains/agents/components/agent-cms-pages/skill-simple-form';
-import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
-import { useCurrentUser } from '@/domains/auth/hooks/use-current-user';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
 
 export default function AgentBuilderSkillsEdit() {
@@ -46,7 +45,7 @@ export default function AgentBuilderSkillsEdit() {
 }
 
 const AgentBuilderSkillEditSkeleton = () => (
-  <div className="h-screen w-screen flex items-center justify-center">
+  <div className="flex h-screen w-screen items-center justify-center">
     <Spinner />
   </div>
 );
@@ -138,7 +137,7 @@ const AgentBuilderSkillEditReady = ({ id, initialUserMessage }: ReadyProps) => {
         <AutosaveIndicator status={autosave.status} lastError={autosave.lastError} onRetry={autosave.retry} />
       }
       primaryAction={
-        <div className="hidden lg:flex items-center gap-2">
+        <div className="hidden items-center gap-2 lg:flex">
           <VisibilitySelectConnected skillId={id} />
         </div>
       }
@@ -160,7 +159,7 @@ const AgentBuilderSkillEditReady = ({ id, initialUserMessage }: ReadyProps) => {
         />
       }
       form={
-        <div className="h-full min-h-0 overflow-y-auto p-4 md:p-6">
+        <div className="h-full min-h-0 overflow-y-auto p-4 md:p-4">
           <SkillSimpleForm
             name={name}
             onNameChange={setName}

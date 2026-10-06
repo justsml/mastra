@@ -3,9 +3,26 @@ import { Button } from '@mastra/playground-ui/components/Button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
 import { SideDialog } from '@mastra/playground-ui/components/SideDialog';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
+import { Txt } from '@mastra/playground-ui/components/Txt';
 import { Icon } from '@mastra/playground-ui/icons/Icon';
+import { SkillIcon } from '@mastra/playground-ui/icons/SkillIcon';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { toast } from '@mastra/playground-ui/utils/toast';
-import { AlertTriangle, ChevronDown, ChevronRight, CopyIcon, Globe, LockIcon, Pencil, Settings2 } from 'lucide-react';
+import { useAuthCapabilities } from '@mastra/react/hooks/auth';
+import { useWorkspaceInfo, useStoredWorkspaces } from '@mastra/react/hooks/workspace';
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  CopyIcon,
+  Globe,
+  LockIcon,
+  Pencil,
+  Settings2,
+  Check,
+} from 'lucide-react';
 import { nanoid } from 'nanoid';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 
@@ -23,10 +40,7 @@ import { SkillFolder } from './skill-folder';
 import { SkillSimpleForm } from './skill-simple-form';
 import { AgentColorProvider } from '@/domains/agent-builder/contexts/agent-color-context';
 import { useBuilderSettings } from '@/domains/agent-builder/hooks/use-builder-settings';
-import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
 import { useDefaultVisibility } from '@/domains/auth/hooks/use-default-visibility';
-import { useWorkspaceInfo } from '@/domains/workspace/hooks';
-import { useStoredWorkspaces } from '@/domains/workspace/hooks/use-stored-workspaces';
 
 type DialogMode = 'simple' | 'advanced';
 
@@ -85,7 +99,10 @@ export function SkillEditDialog({
         .map(ws => ({ value: ws.id, label: ws.name })),
     [workspacesData],
   );
-  const { data: workspaceInfo } = useWorkspaceInfo(workspaceId || undefined);
+  const { data: workspaceInfo } = useWorkspaceInfo({
+    workspaceId: workspaceId || undefined,
+    queryOptions: { enabled: !!workspaceId },
+  });
   const hasFilesystem = workspaceInfo?.capabilities?.hasFilesystem ?? true;
 
   const builderDefaultWorkspaceId = useMemo(() => {
@@ -254,13 +271,13 @@ export function SkillEditDialog({
       className="h-full"
     >
       <SideDialog.Top>
-        <span className="flex-1 flex items-center gap-2">
+        <SideDialog.Heading as="h2" className="flex-1 items-center">
           {dialogTitle}
           {isViewMode && skill?.visibility === 'private' && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="text-neutral3 shrink-0" aria-label="Private skill">
-                  <Icon size="sm">
+                <span className="shrink-0 text-muted-foreground" aria-label="Private skill">
+                  <Icon size="xs">
                     <LockIcon />
                   </Icon>
                 </span>
@@ -268,18 +285,18 @@ export function SkillEditDialog({
               <TooltipContent>Only visible to you</TooltipContent>
             </Tooltip>
           )}
-        </span>
-        <div className="flex items-center gap-2 mr-6">
+        </SideDialog.Heading>
+        <div className="mr-6 flex items-center gap-2">
           {isViewMode && isOwner && (
-            <Button variant="outline" size="sm" onClick={() => setIsEditing(true)}>
-              <Pencil className="h-3.5 w-3.5" /> Edit
+            <Button size="sm" onClick={() => setIsEditing(true)} icon={<Pencil />}>
+              Edit
             </Button>
           )}
           {isViewMode && !isOwner && onCopy && skill && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" onClick={() => onCopy(skill)}>
-                  <CopyIcon className="h-3.5 w-3.5" /> Copy
+                <Button size="sm" onClick={() => onCopy(skill)} icon={<CopyIcon />}>
+                  Copy
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Make your own private copy you can edit</TooltipContent>
@@ -308,7 +325,13 @@ export function SkillEditDialog({
                   </SelectContent>
                 </Select>
               )}
-              <Button variant="primary" size="sm" onClick={handleSave} disabled={!name.trim() || isPending}>
+              <Button
+                icon={isExistingSkill ? <Check /> : <SkillIcon />}
+                variant="primary"
+                size="sm"
+                onClick={handleSave}
+                disabled={!name.trim() || isPending}
+              >
                 {isPending ? 'Saving...' : isExistingSkill ? 'Save' : 'Create'}
               </Button>
             </>
@@ -346,23 +369,25 @@ export function SkillEditDialog({
 
             {/* Form section — revealed after agent populates or user expands */}
             {showForm ? (
-              <div className="border-t border-border1 pt-4">
+              <div className="border-t border-border pt-4">
                 <button
                   onClick={() => setShowForm(false)}
-                  className="flex items-center gap-1.5 text-xs text-neutral3 hover:text-neutral5 transition-colors mb-3"
+                  className={cn('mb-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
                 >
                   <ChevronDown className="h-3 w-3" />
-                  Hide skill details
+                  <Txt as="span" variant="caption" className="block">
+                    Hide skill details
+                  </Txt>
                 </button>
 
                 {isAdmin && (!hasFilesystem || !workspaceId) && (
-                  <div className="mb-4 flex items-start gap-2 rounded-lg bg-yellow-500/10 p-3 text-xs text-yellow-600">
-                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
-                    <span>
+                  <div className="mb-4 flex items-start gap-2 rounded-lg bg-warning-subtle p-3 text-warning-subtle-foreground">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <Txt as="span" variant="caption">
                       {!workspaceId
                         ? 'No workspace available. The skill will be saved to the database only.'
                         : 'No workspace filesystem configured. The skill will be saved to the database only.'}
-                    </span>
+                    </Txt>
                   </div>
                 )}
 
@@ -393,10 +418,12 @@ export function SkillEditDialog({
                           }
                           setMode('advanced');
                         }}
-                        className="mt-3 flex items-center gap-1.5 text-xs text-neutral3 hover:text-neutral5 transition-colors"
+                        className={cn('mt-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
                       >
                         <Settings2 className="h-3.5 w-3.5" />
-                        Advanced mode
+                        <Txt as="span" variant="caption" className="block">
+                          Advanced mode
+                        </Txt>
                         <ChevronRight className="h-3 w-3" />
                       </button>
                     )}
@@ -413,10 +440,12 @@ export function SkillEditDialog({
                           }
                           setMode('simple');
                         }}
-                        className="mb-3 flex items-center gap-1.5 text-xs text-neutral3 hover:text-neutral5 transition-colors"
+                        className={cn('mb-3 flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
                       >
                         <Pencil className="h-3.5 w-3.5" />
-                        Simple mode
+                        <Txt as="span" variant="caption" className="block">
+                          Simple mode
+                        </Txt>
                         <ChevronRight className="h-3 w-3" />
                       </button>
                     )}
@@ -432,13 +461,15 @@ export function SkillEditDialog({
                 )}
               </div>
             ) : (
-              <div className="border-t border-border1 pt-3">
+              <div className="border-t border-border pt-3">
                 <button
                   onClick={() => setShowForm(true)}
-                  className="flex items-center gap-1.5 text-xs text-neutral3 hover:text-neutral5 transition-colors"
+                  className={cn('flex items-center gap-1.5', quietTextHover, controlStateColorTransition)}
                 >
                   <ChevronRight className="h-3 w-3" />
-                  {hasFields ? 'Show skill details' : 'or fill in manually'}
+                  <Txt as="span" variant="caption" className="block">
+                    {hasFields ? 'Show skill details' : 'or fill in manually'}
+                  </Txt>
                 </button>
               </div>
             )}

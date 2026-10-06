@@ -11,10 +11,28 @@ vi.mock('node:fs/promises', () => ({
 vi.mock('./analyze', () => ({
   analyzeBundle: vi.fn().mockResolvedValue({
     dependencies: new Map([
-      ['@mastra/core', { exports: ['Mastra'], rootPath: '/workspace/packages/core', isWorkspace: true }],
-      ['lodash', { exports: ['map'], rootPath: '/node_modules/lodash', isWorkspace: false }],
+      ['@mastra/core', 'packages/core/node_modules/.cache/@mastra__core.mjs'],
+      ['lodash', 'node_modules/lodash/index.js'],
     ]),
+    depsToOptimize: new Map([
+      [
+        '@mastra/core',
+        {
+          exports: ['Mastra'],
+          rootPath: '/workspace/packages/core',
+          isWorkspace: true,
+        },
+      ],
+    ]),
+    workspaceMap: new Map([
+      ['@mastra/core', { location: '/workspace/packages/core', dependencies: {}, version: '1.0.0' }],
+    ]),
+    workspaceRoot: '/workspace',
+    outputDir: '/workspace/.mastra/.build',
   }),
+}));
+vi.mock('./plugins/workspace-deps-watcher', () => ({
+  workspaceDepsWatcher: vi.fn(() => ({ name: 'workspace-deps-watcher' })),
 }));
 vi.mock('../bundler/workspaceDependencies', () => ({
   getWorkspaceInformation: vi.fn().mockResolvedValue({
@@ -42,11 +60,18 @@ describe('watcher', () => {
       // Arrange
       const env = { 'process.env.NODE_ENV': JSON.stringify('test') };
       const bundlerGetInputOptions = vi.mocked(await import('./bundler')).getInputOptions;
+      const analyzeBundle = vi.mocked(await import('./analyze')).analyzeBundle;
 
       // Act
       await getInputOptions('test-entry.js', 'node', env);
 
       // Assert
+      expect(analyzeBundle).toHaveBeenCalledWith(
+        ['test-entry.js'],
+        'test-entry.js',
+        expect.objectContaining({ env }),
+        expect.anything(),
+      );
       expect(bundlerGetInputOptions).toHaveBeenCalledWith(
         // expect.stringMatching(/\.mastra\/\.build\/entry-0\.mjs$/),
         expect.stringMatching('test-entry.js'),
@@ -134,6 +159,26 @@ describe('watcher', () => {
           }),
         );
       });
+    });
+
+    it('installs workspace-deps-watcher when optimized workspace deps exist', async () => {
+      const { workspaceDepsWatcher } = await import('./plugins/workspace-deps-watcher');
+      const bundlerGetInputOptions = vi.mocked(await import('./bundler')).getInputOptions;
+      bundlerGetInputOptions.mockResolvedValueOnce({ plugins: [] });
+
+      const inputOptions = await getInputOptions('test-entry.js', 'node');
+
+      expect(workspaceDepsWatcher).toHaveBeenCalledWith(
+        expect.objectContaining({
+          depsToOptimize: expect.any(Map),
+          optimizedDependencyFiles: expect.any(Map),
+          workspaceRoot: '/workspace',
+          platform: 'node',
+        }),
+      );
+      expect(
+        inputOptions.plugins?.some(plugin => (plugin as { name?: string })?.name === 'workspace-deps-watcher'),
+      ).toBe(true);
     });
   });
 });

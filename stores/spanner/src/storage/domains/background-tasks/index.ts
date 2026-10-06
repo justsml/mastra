@@ -5,6 +5,7 @@ import type {
   TaskFilter,
   TaskListResult,
   UpdateBackgroundTask,
+  UpdateBackgroundTaskOptions,
 } from '@mastra/core/background-tasks';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { CreateIndexOptions } from '@mastra/core/storage';
@@ -87,6 +88,12 @@ function rowToTask(row: Record<string, any>): BackgroundTask {
         ? transformed.completedAt
         : new Date(transformed.completedAt)
       : undefined,
+    ownerId: transformed.ownerId != null ? String(transformed.ownerId) : undefined,
+    leaseExpiresAt: transformed.leaseExpiresAt
+      ? transformed.leaseExpiresAt instanceof Date
+        ? transformed.leaseExpiresAt
+        : new Date(transformed.leaseExpiresAt)
+      : undefined,
   };
 }
 
@@ -113,6 +120,12 @@ export class BackgroundTasksSpanner extends BackgroundTasksStorage {
     await this.db.createTable({
       tableName: TABLE_BACKGROUND_TASKS,
       schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
+    });
+    // Backfill columns added after the initial schema shipped.
+    await this.db.alterTable({
+      tableName: TABLE_BACKGROUND_TASKS,
+      schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
+      ifNotExists: ['suspend_payload', 'suspendedAt', 'ownerId', 'leaseExpiresAt'],
     });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
@@ -208,11 +221,17 @@ export class BackgroundTasksSpanner extends BackgroundTasksStorage {
         startedAt: task.startedAt ?? null,
         suspendedAt: task.suspendedAt ?? null,
         completedAt: task.completedAt ?? null,
+        ownerId: task.ownerId ?? null,
+        leaseExpiresAt: task.leaseExpiresAt ?? null,
       },
     });
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
+  async updateTask(
+    taskId: string,
+    update: UpdateBackgroundTask,
+    options?: UpdateBackgroundTaskOptions,
+  ): Promise<boolean> {
     const data: Record<string, any> = {};
     if ('status' in update) data.status = update.status;
     if ('result' in update) data.result = update.result ?? null;
@@ -222,10 +241,39 @@ export class BackgroundTasksSpanner extends BackgroundTasksStorage {
     if ('startedAt' in update) data.startedAt = update.startedAt ?? null;
     if ('suspendedAt' in update) data.suspendedAt = update.suspendedAt ?? null;
     if ('completedAt' in update) data.completedAt = update.completedAt ?? null;
-    if (Object.keys(data).length === 0) return;
-    await this.db.update({ tableName: TABLE_BACKGROUND_TASKS, keys: { id: taskId }, data });
+    if ('ownerId' in update) data.ownerId = update.ownerId ?? null;
+    if ('leaseExpiresAt' in update) data.leaseExpiresAt = update.leaseExpiresAt ?? null;
+    if (Object.keys(data).length === 0) return false;
+    const setClauses = Object.keys(data).map(field => `${quoteIdent(field, 'column name')} = @${field}`);
+    const params: Record<string, any> = { ...data, id: taskId };
+    const predicates: string[] = [];
+    if (options?.expectedStatus) {
+      predicates.push('status = @expectedStatus');
+      params.expectedStatus = options.expectedStatus;
+    }
+    if (options?.expectedOwnerId !== undefined) {
+      if (options.expectedOwnerId === null) {
+        predicates.push('ownerId IS NULL');
+      } else {
+        predicates.push('ownerId = @expectedOwnerId');
+        params.expectedOwnerId = options.expectedOwnerId;
+      }
+    }
+    if (options?.expectedLeaseExpiresAt !== undefined) {
+      if (options.expectedLeaseExpiresAt === null) {
+        predicates.push('leaseExpiresAt IS NULL');
+      } else {
+        predicates.push('leaseExpiresAt = @expectedLeaseExpiresAt');
+        params.expectedLeaseExpiresAt = options.expectedLeaseExpiresAt;
+      }
+    }
+    const predicateSql = predicates.length > 0 ? ` AND ${predicates.join(' AND ')}` : '';
+    const [rowCount] = await this.database.runUpdate({
+      sql: `UPDATE ${this.tableName()} SET ${setClauses.join(', ')} WHERE id = @id${predicateSql}`,
+      params,
+    });
+    return rowCount > 0;
   }
-
   async getTask(taskId: string): Promise<BackgroundTask | null> {
     const [rows] = await this.database.run({
       sql: `SELECT * FROM ${this.tableName()} WHERE id = @id LIMIT 1`,

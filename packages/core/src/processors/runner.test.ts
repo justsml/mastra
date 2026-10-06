@@ -1,5 +1,6 @@
 import type { TextPart } from '@internal/ai-sdk-v4';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { MastraDBMessage } from '../agent/message-list';
 import { MessageList } from '../agent/message-list';
 import { createSignal } from '../agent/signals';
 import { TripWire } from '../agent/trip-wire';
@@ -557,6 +558,55 @@ describe('ProcessorRunner', () => {
       expect(assistantTexts).toEqual(['initial response', 'extra message A', 'extra message B']);
     });
 
+    it('should still pass response messages after drainUnsavedMessages clears the live set', async () => {
+      let receivedMessages: MastraDBMessage[] = [];
+      const outputProcessors: Processor[] = [
+        {
+          id: 'processor1',
+          name: 'Processor 1',
+          processOutputResult: async ({ messages }) => {
+            receivedMessages = messages;
+            return messages.map(message => ({
+              ...message,
+              content: {
+                ...message.content,
+                parts: [{ type: 'text' as const, text: 'rewritten' }],
+                content: 'rewritten',
+              },
+            }));
+          },
+        },
+      ];
+
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors,
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      messageList.add([createMessage('initial response', 'assistant')], 'response');
+      expect(messageList.drainUnsavedMessages()).toHaveLength(1);
+      expect(messageList.get.response.db()).toHaveLength(0);
+      expect(messageList.getPersisted.response.db()).toHaveLength(1);
+
+      await runner.runOutputProcessors(messageList);
+
+      expect(receivedMessages).toHaveLength(1);
+      expect(receivedMessages[0]?.content.parts?.[0]).toMatchObject({
+        type: 'text',
+        text: 'initial response',
+      });
+
+      const messages = await messageList.get.all.prompt();
+      const assistantTexts = messages
+        .filter(m => m.role === 'assistant')
+        .flatMap(m => (Array.isArray(m.content) ? m.content : [{ type: 'text' as const, text: m.content }]))
+        .map(part => (part as TextPart).text);
+
+      expect(assistantTexts).toEqual(['rewritten']);
+    });
+
     it('should abort if tripwire is triggered in output processor', async () => {
       const outputProcessors: Processor[] = [
         {
@@ -696,7 +746,7 @@ describe('ProcessorRunner', () => {
       expect(result.reason).toBe('Content blocked');
     });
 
-    it('should handle processor errors gracefully', async () => {
+    it('should fail when a processor throws', async () => {
       const outputProcessors: Processor[] = [
         {
           id: 'processor1',
@@ -715,12 +765,17 @@ describe('ProcessorRunner', () => {
       });
 
       const processorStates = new Map();
-      const result = await runner.processPart(
-        { type: 'text-delta', payload: { text: 'test content', id: 'text-1' }, runId: '1', from: ChunkFrom.AGENT },
-        processorStates,
-      );
-      expect(result.part?.type === 'text-delta' ? result.part?.payload.text : '').toBe('test content'); // Should return original text on error
-      expect(result.blocked).toBe(false);
+      await expect(
+        runner.processPart(
+          {
+            type: 'text-delta',
+            payload: { text: 'test content', id: 'text-1' },
+            runId: '1',
+            from: ChunkFrom.AGENT,
+          },
+          processorStates,
+        ),
+      ).rejects.toThrow('Processor error');
     });
 
     it('should skip processors that do not implement processOutputStream', async () => {
@@ -2828,10 +2883,16 @@ describe('ProcessorRunner', () => {
         cacheKey: 'workflow-state-cache-key',
         contents: 'workflow state',
       }));
-      const processor: Processor = {
+      const firstProcessInputStep = vi.fn(() => ({ runId: 'processor-overwrite-attempt' }) as any);
+      const secondProcessInputStep = vi.fn(() => undefined);
+      const firstProcessor: Processor = {
         id: 'workflow-state-processor',
-        processInputStep: () => undefined,
+        processInputStep: firstProcessInputStep,
         computeStateSignal,
+      };
+      const secondProcessor: Processor = {
+        id: 'workflow-run-id-processor',
+        processInputStep: secondProcessInputStep,
       };
       const workflow = createWorkflow({
         id: 'workflow-state-test',
@@ -2840,9 +2901,10 @@ describe('ProcessorRunner', () => {
         type: 'processor',
         options: { validateInputs: false },
       })
-        .then(createStep(processor as any))
+        .then(createStep(firstProcessor as any))
+        .then(createStep(secondProcessor as any))
         .commit() as ProcessorWorkflow;
-      workflow.__stateSignalProcessors = [processor];
+      workflow.__stateSignalProcessors = [firstProcessor];
       const chunks: unknown[] = [];
 
       runner = new ProcessorRunner({
@@ -2859,6 +2921,7 @@ describe('ProcessorRunner', () => {
         model: {} as any,
         tools: {},
         retryCount: 0,
+        runId: 'run-workflow-processor',
         requestContext,
         memory: memory as any,
         writer: {
@@ -2868,6 +2931,8 @@ describe('ProcessorRunner', () => {
         },
       });
 
+      expect(firstProcessInputStep).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-workflow-processor' }));
+      expect(secondProcessInputStep).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-workflow-processor' }));
       expect(computeStateSignal).toHaveBeenCalledTimes(1);
       expect(messageList.get.all.db().at(-1)?.content.metadata?.signal).toEqual(
         expect.objectContaining({
@@ -2879,6 +2944,46 @@ describe('ProcessorRunner', () => {
       );
       expect(chunks).toHaveLength(1);
       expect(memory.saveThread).toHaveBeenCalledTimes(1);
+    });
+
+    it('forwards the abort signal to output-stream workflow processors', async () => {
+      const processOutputStream = vi.fn(async ({ part }: any) => part);
+      const workflow = createWorkflow({
+        id: 'output-stream-abort-test',
+        inputSchema: ProcessorStepSchema,
+        outputSchema: ProcessorStepSchema,
+        type: 'processor',
+        options: { validateInputs: false },
+      })
+        .then(createStep({ id: 'abort-aware-processor', processOutputStream } as any))
+        .commit() as ProcessorWorkflow;
+
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      const controller = new AbortController();
+      controller.abort();
+      await runner.processPart(
+        {
+          type: 'text-delta',
+          runId: 'run-1',
+          from: ChunkFrom.AGENT,
+          payload: { id: 'text-1', text: 'hi' },
+        } as ChunkType,
+        new Map(),
+        undefined,
+        undefined,
+        messageList,
+        0,
+        undefined,
+        controller.signal,
+      );
+
+      expect(processOutputStream).toHaveBeenCalledWith(expect.objectContaining({ abortSignal: controller.signal }));
     });
 
     it('passes empty state history to computeStateSignal before any state exists', async () => {
@@ -3500,6 +3605,37 @@ describe('ProcessorRunner', () => {
       ).rejects.toThrow('computeStateSignal requires Mastra memory');
     });
 
+    it('skips computeStateSignal when memory is present but no threadId/resourceId resolves', async () => {
+      const compute = vi.fn(() => ({ cacheKey: 'state', contents: 'state' }));
+      const memory = {
+        getThreadById: vi.fn(),
+        saveThread: vi.fn(),
+      };
+      runner = new ProcessorRunner({
+        inputProcessors: [{ id: 'state-processor', computeStateSignal: compute }],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      // Ephemeral invocation (e.g. workflow agent step): memory is configured
+      // but there is no thread/resource identity for this run.
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 0,
+        steps: [],
+        model: {} as any,
+        tools: {},
+        retryCount: 0,
+        requestContext: new RequestContext(),
+        memory: memory as any,
+      });
+
+      expect(compute).not.toHaveBeenCalled();
+      expect(messageList.get.all.db().filter(m => m.role === 'signal')).toHaveLength(0);
+      expect(memory.saveThread).not.toHaveBeenCalled();
+    });
+
     it('honors processor.stateId over processor.id in computeStateSignal', async () => {
       messageList = new MessageList({ threadId: 'thread-1' });
       const requestContext = new RequestContext();
@@ -3655,6 +3791,78 @@ describe('ProcessorRunner', () => {
       expect(firstTracking?.version).toBe(1);
       expect(secondTracking?.version).toBe(2);
       expect(secondTracking?.lastSignalId).not.toBe(firstTracking?.lastSignalId);
+    });
+  });
+
+  describe('applyMessagesToMessageList', () => {
+    it('preserves a message promoted from memory to response after source capture', () => {
+      const message = createMessage('final response', 'assistant');
+      messageList.add(message, 'memory');
+      const idsBeforeProcessing = messageList.get.all.db().map(({ id }) => id);
+      const check = messageList.makeMessageSourceChecker();
+
+      messageList.add(message, 'response');
+      ProcessorRunner.applyMessagesToMessageList([message], messageList, idsBeforeProcessing, check, 'response');
+
+      expect(messageList.get.response.db()).toEqual([message]);
+      expect(messageList.get.remembered.db()).toEqual([]);
+    });
+
+    it('preserves exact-reference messages without changing identity, order, or source', () => {
+      const inputMessage = createMessage('input');
+      const responseMessage = createMessage('response', 'assistant');
+      messageList.add(inputMessage, 'input').add(responseMessage, 'response');
+      const idsBeforeProcessing = messageList.get.all.db().map(({ id }) => id);
+      const check = messageList.makeMessageSourceChecker();
+
+      ProcessorRunner.applyMessagesToMessageList(
+        [inputMessage, responseMessage],
+        messageList,
+        idsBeforeProcessing,
+        check,
+      );
+
+      expect(messageList.get.all.db()).toEqual([inputMessage, responseMessage]);
+      expect(messageList.get.input.db()).toEqual([inputMessage]);
+      expect(messageList.get.response.db()).toEqual([responseMessage]);
+    });
+
+    it('replaces a distinct message with the same id using the captured source', () => {
+      const original = createMessage('original');
+      const replacement = {
+        ...original,
+        content: { ...original.content, parts: [{ type: 'text' as const, text: 'updated' }] },
+      };
+      messageList.add(original, 'input');
+      const idsBeforeProcessing = [original.id];
+      const check = messageList.makeMessageSourceChecker();
+
+      ProcessorRunner.applyMessagesToMessageList([replacement], messageList, idsBeforeProcessing, check, 'response');
+
+      expect(messageList.get.all.db()).toEqual([replacement]);
+      expect(messageList.get.input.db()).toEqual([replacement]);
+      expect(messageList.get.response.db()).toEqual([]);
+    });
+
+    it('removes omitted messages and assigns the default source to new messages', () => {
+      const omitted = createMessage('omitted');
+      const retained = createMessage('retained');
+      const added = createMessage('added', 'assistant');
+      messageList.add([omitted, retained], 'input');
+      const idsBeforeProcessing = messageList.get.all.db().map(({ id }) => id);
+      const check = messageList.makeMessageSourceChecker();
+
+      ProcessorRunner.applyMessagesToMessageList(
+        [retained, added],
+        messageList,
+        idsBeforeProcessing,
+        check,
+        'response',
+      );
+
+      expect(messageList.get.all.db()).toEqual([retained, added]);
+      expect(messageList.get.input.db()).toEqual([retained]);
+      expect(messageList.get.response.db()).toEqual([added]);
     });
   });
 

@@ -1,13 +1,13 @@
 ---
 title: "Workflow state | Workflows"
-description: "Share values across workflow steps using global state that persists through the entire workflow run."
+description: "Share typed global state across Mastra workflow steps, initialize and update values, preserve state through suspension, and pass it into nested workflows."
 packages:
   - "@mastra/core"
 ---
 
 # Workflow state
 
-Workflow state lets you share values across steps without passing them through every step's inputSchema and outputSchema. This is useful for tracking progress, accumulating results, or sharing configuration across the entire workflow.
+Workflow state lets you share values across steps without passing them through every step's inputSchema and outputSchema. This is useful for tracking progress or accumulating results, or alternatively sharing configuration across the entire workflow.
 
 ## State vs step input/output
 

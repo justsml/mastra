@@ -1,10 +1,11 @@
 import type { DatasetItem } from '@mastra/client-js';
-import { Chip } from '@mastra/playground-ui/components/Chip';
-import { ItemList } from '@mastra/playground-ui/components/ItemList';
+import { Badge } from '@mastra/playground-ui/components/Badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
+import { focusRing, transitions } from '@mastra/playground-ui/primitives/transitions';
 import { cn } from '@mastra/playground-ui/utils/cn';
 import { BanIcon, EqualIcon, PenIcon, PlusIcon } from 'lucide-react';
-import { useLinkComponent } from '@/lib/framework';
 
 export interface DatasetCompareVersionsListProps {
   datasetId: string;
@@ -13,79 +14,131 @@ export interface DatasetCompareVersionsListProps {
   allItems: Array<{ id: string; createdAt: Date }>;
   itemsAMap: Map<string, DatasetItem>;
   itemsBMap: Map<string, DatasetItem>;
-  onItemClick?: (itemId: string, itemA?: DatasetItem, itemB?: DatasetItem) => void;
 }
-
-const columns = [
-  { name: 'id', label: 'ID', size: '1fr' },
-  { name: 'versionA', label: 'Version A', size: '1fr' },
-  { name: 'versionB', label: 'Version B', size: '1fr' },
-  { name: 'compare', label: 'Compare', size: '10rem' },
-];
 
 const versionInfoConfig = {
   added: {
-    color: 'blue' as const,
-    borderColor: 'border-blue-900',
+    badgeVariant: 'info' as const,
+    borderColor: 'border-info-edge',
     icon: <PlusIcon />,
     tooltip: 'Added in this version',
   },
   changed: {
-    color: 'orange' as const,
-    borderColor: 'border-yellow-900',
+    badgeVariant: 'warning' as const,
+    borderColor: 'border-warning-edge',
     icon: <PenIcon />,
     tooltip: 'Changed in this version',
   },
   same: {
-    color: 'green' as const,
-    borderColor: 'border-green-900',
+    badgeVariant: 'success' as const,
+    borderColor: 'border-success-edge',
     icon: <EqualIcon />,
     tooltip: 'Same in both versions',
   },
 };
 
-function EmptyCell({ red = false, tooltip }: { red?: boolean; tooltip?: React.ReactNode }) {
+type VersionInfoVariant = keyof typeof versionInfoConfig;
+type VersionStatus = 'same' | 'changed' | 'added' | 'removed';
+
+function EmptyCell({ red = false, tooltip }: { red?: boolean; tooltip: string }) {
   return (
     <Tooltip>
-      <TooltipTrigger asChild>
+      <TooltipTrigger
+        render={<span />}
+        role="img"
+        tabIndex={0}
+        aria-label={tooltip}
+        className={cn('rounded', focusRing)}
+      >
         <BanIcon
-          className={cn('text-neutral3/40 w-5 h-5 ', {
-            'text-red-900': red,
+          className={cn('h-5 w-5 text-muted-foreground/40', {
+            'text-destructive-foreground': red,
           })}
         />
-      </TooltipTrigger>
-      {tooltip && <TooltipContent>{tooltip}</TooltipContent>}
-    </Tooltip>
-  );
-}
-
-function VersionInfo({ variant, version }: { variant?: keyof typeof versionInfoConfig; version?: number }) {
-  if (!variant) {
-    return <span className="text-ui-md text-neutral4">v. {version}</span>;
-  }
-  const { color, icon, tooltip } = versionInfoConfig[variant];
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div className="grid grid-cols-[1fr_auto]">
-          {version !== undefined && (
-            <span className="pr-3 text-ui-md text-neutral4 min-w-16 flex justify-end">v. {version}</span>
-          )}
-          <Chip color={color} size="small">
-            {icon}
-          </Chip>
-        </div>
       </TooltipTrigger>
       <TooltipContent>{tooltip}</TooltipContent>
     </Tooltip>
   );
 }
 
-function getStatus(itemA?: DatasetItem, itemB?: DatasetItem): string {
+function LinkCell({
+  href,
+  tooltip,
+  className,
+  children,
+}: {
+  href: string;
+  tooltip?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const { Link } = useLinkComponent();
+  const link = (
+    <Link
+      href={href}
+      className={cn(
+        'flex w-full items-center justify-center gap-4 rounded-lg px-3 py-2 text-left hover:bg-fill-subtle',
+        transitions.colors,
+        focusRing,
+        className,
+      )}
+    >
+      {children}
+    </Link>
+  );
+
+  if (tooltip === undefined) return link;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger render={link} />
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function VersionInfo({ variant, version }: { variant?: VersionInfoVariant; version?: number }) {
+  if (!variant) {
+    return (
+      <Txt as="span" tone="muted">
+        v. {version}
+      </Txt>
+    );
+  }
+  const { badgeVariant, icon, tooltip } = versionInfoConfig[variant];
+  return (
+    <div className="grid grid-cols-[1fr_auto]">
+      {version !== undefined && (
+        <Txt as="span" tone="muted" className="flex min-w-16 justify-end pr-3">
+          v. {version}
+        </Txt>
+      )}
+      <span className="inline-flex" role="img" aria-label={tooltip}>
+        <Badge variant={badgeVariant} size="xs" icon={icon} />
+      </span>
+    </div>
+  );
+}
+
+function getStatus(itemA?: DatasetItem, itemB?: DatasetItem): VersionStatus {
   if (itemA && itemB && itemA.datasetVersion === itemB.datasetVersion) return 'same';
   if (itemA && itemB && itemA.datasetVersion !== itemB.datasetVersion) return 'changed';
   if (itemA) return 'added';
   return 'removed';
+}
+
+function getVersionInfoVariant({
+  otherVersionExists,
+  status,
+  isNewer,
+}: {
+  otherVersionExists: boolean;
+  status: VersionStatus;
+  isNewer: boolean;
+}): VersionInfoVariant | undefined {
+  if (!otherVersionExists && isNewer) return 'added';
+  if (status === 'changed' && isNewer) return 'changed';
+  return undefined;
 }
 
 export function DatasetCompareVersionsList({
@@ -96,101 +149,97 @@ export function DatasetCompareVersionsList({
   itemsAMap,
   itemsBMap,
 }: DatasetCompareVersionsListProps) {
-  const { Link } = useLinkComponent();
   const isANewer = versionA > versionB;
   return (
-    <ItemList>
-      <ItemList.Scroller>
-        <ItemList.Items>
-          {allItems.map(({ id }) => {
-            const itemA = itemsAMap.get(id);
-            const itemB = itemsBMap.get(id);
-            const status = getStatus(itemA, itemB);
+    <div className="overflow-y-auto">
+      <ul className="grid content-start">
+        {allItems.map(({ id }) => {
+          const itemA = itemsAMap.get(id);
+          const itemB = itemsBMap.get(id);
+          const status = getStatus(itemA, itemB);
+          const versionAVariant = getVersionInfoVariant({
+            otherVersionExists: itemB !== undefined,
+            status,
+            isNewer: isANewer,
+          });
+          const versionBVariant = getVersionInfoVariant({
+            otherVersionExists: itemA !== undefined,
+            status,
+            isNewer: !isANewer,
+          });
 
-            return (
-              <ItemList.Row key={id} columns={columns}>
-                <ItemList.IdCell id={id} isShortened={false} />
-                {status !== 'same' ? (
-                  <>
-                    {itemA?.datasetVersion ? (
-                      <ItemList.LinkCell
-                        LinkComponent={Link}
-                        href={`/datasets/${datasetId}/items/${id}`}
-                        className="gap-2"
-                      >
-                        {!itemB && isANewer ? (
-                          <VersionInfo variant="added" version={itemA.datasetVersion} />
-                        ) : status === 'changed' && isANewer ? (
-                          <VersionInfo variant="changed" version={itemA.datasetVersion} />
-                        ) : (
-                          <VersionInfo version={itemA.datasetVersion} />
-                        )}
-                      </ItemList.LinkCell>
-                    ) : (
-                      <ItemList.Cell className={'justify-center flex  items-center'}>
-                        <EmptyCell
-                          red={isANewer}
-                          tooltip={isANewer ? 'Deleted in this version' : 'Not present in this version'}
-                        />
-                      </ItemList.Cell>
-                    )}
-                    {itemB?.datasetVersion ? (
-                      <ItemList.LinkCell
-                        LinkComponent={Link}
-                        href={`/datasets/${datasetId}/items/${id}`}
-                        className="gap-2"
-                      >
-                        {!itemA && !isANewer ? (
-                          <VersionInfo variant="added" version={itemB.datasetVersion} />
-                        ) : status === 'changed' && !isANewer ? (
-                          <VersionInfo variant="changed" version={itemB.datasetVersion} />
-                        ) : (
-                          <VersionInfo version={itemB.datasetVersion} />
-                        )}
-                      </ItemList.LinkCell>
-                    ) : (
-                      <ItemList.Cell className={'justify-center flex items-center'}>
-                        <EmptyCell
-                          red={!isANewer}
-                          tooltip={!isANewer ? 'Deleted in this version' : 'Not present in this version'}
-                        />
-                      </ItemList.Cell>
-                    )}
-                  </>
-                ) : (
-                  <ItemList.LinkCell
-                    LinkComponent={Link}
-                    href={`/datasets/${datasetId}/items/${id}`}
-                    className="col-span-2 gap-2"
-                  >
-                    <VersionInfo variant="same" version={itemB?.datasetVersion} />
-                  </ItemList.LinkCell>
-                )}
+          return (
+            <li
+              key={id}
+              className={cn(
+                'text-foreground',
+                'grid grid-cols-[1fr_1fr_1fr_10rem] gap-3 overflow-hidden rounded-lg border border-transparent border-t-border px-3 py-[3px] pb-[2px] first:border-t-transparent',
+                transitions.colors,
+              )}
+            >
+              <Txt as="p" variant="body" tone="faint" className="truncate py-[0.6rem]">
+                {id}
+              </Txt>
+              {status !== 'same' ? (
+                <>
+                  {itemA?.datasetVersion ? (
+                    <LinkCell
+                      href={`/datasets/${datasetId}/items/${id}`}
+                      className="gap-2"
+                      tooltip={versionAVariant ? versionInfoConfig[versionAVariant].tooltip : undefined}
+                    >
+                      <VersionInfo variant={versionAVariant} version={itemA.datasetVersion} />
+                    </LinkCell>
+                  ) : (
+                    <div className="flex items-center justify-center">
+                      <EmptyCell
+                        red={isANewer}
+                        tooltip={isANewer ? 'Deleted in this version' : 'Not present in this version'}
+                      />
+                    </div>
+                  )}
+                  {itemB?.datasetVersion ? (
+                    <LinkCell
+                      href={`/datasets/${datasetId}/items/${id}`}
+                      className="gap-2"
+                      tooltip={versionBVariant ? versionInfoConfig[versionBVariant].tooltip : undefined}
+                    >
+                      <VersionInfo variant={versionBVariant} version={itemB.datasetVersion} />
+                    </LinkCell>
+                  ) : (
+                    <div className="flex items-center justify-center">
+                      <EmptyCell
+                        red={!isANewer}
+                        tooltip={!isANewer ? 'Deleted in this version' : 'Not present in this version'}
+                      />
+                    </div>
+                  )}
+                </>
+              ) : (
+                <LinkCell
+                  href={`/datasets/${datasetId}/items/${id}`}
+                  className="col-span-2 gap-2"
+                  tooltip={versionInfoConfig.same.tooltip}
+                >
+                  <VersionInfo variant="same" version={itemB?.datasetVersion} />
+                </LinkCell>
+              )}
 
-                {status === 'changed' ? (
-                  <ItemList.LinkCell
-                    LinkComponent={Link}
-                    href={`/datasets/${datasetId}/items/${id}/versions?ids=${itemA?.datasetVersion},${itemB?.datasetVersion}`}
-                  >
-                    Compare
-                  </ItemList.LinkCell>
-                ) : (
-                  <ItemList.Cell>
-                    <EmptyCell
-                      tooltip={
-                        <>
-                          Comparing is available
-                          <br /> only for changed items
-                        </>
-                      }
-                    />
-                  </ItemList.Cell>
-                )}
-              </ItemList.Row>
-            );
-          })}
-        </ItemList.Items>
-      </ItemList.Scroller>
-    </ItemList>
+              {status === 'changed' ? (
+                <LinkCell
+                  href={`/datasets/${datasetId}/items/${id}/versions?version=${itemA?.datasetVersion}&compare=${itemB?.datasetVersion}`}
+                >
+                  Compare
+                </LinkCell>
+              ) : (
+                <div>
+                  <EmptyCell tooltip="Comparing is available only for changed items" />
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }

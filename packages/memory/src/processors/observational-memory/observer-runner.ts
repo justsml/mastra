@@ -1,6 +1,7 @@
 import { Agent } from '@mastra/core/agent';
-import type { MastraDBMessage } from '@mastra/core/agent';
+import type { AgentMemoryOption, MastraDBMessage } from '@mastra/core/agent';
 import { modelSupportsAttachments } from '@mastra/core/llm';
+import type { WidenModelId } from '@mastra/core/llm';
 import type { Mastra } from '@mastra/core/mastra';
 import type { MastraMemory } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
@@ -10,6 +11,7 @@ import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Memory } from '../..';
 import { omDebug } from './debug';
+import { formatOmError, isOmModelExecutionFailure, OmModelExecutionError } from './error';
 import { getBuiltInExtractedValues, mergeExtractedValues, mergeExtractionFailures } from './extracted-values';
 import { extractStructuredValues } from './extraction-runner';
 import type { Extractor } from './extractor';
@@ -19,18 +21,18 @@ import type { ModelByInputTokens } from './model-by-input-tokens';
 import type { ObserverAttachmentFilter } from './observer-agent';
 import {
   buildObserverSystemPrompt,
-  buildObserverTaskPrompt,
-  buildObserverHistoryMessage,
-  buildMultiThreadObserverTaskPrompt,
-  buildMultiThreadObserverHistoryMessage,
+  buildObserverRequestMessage,
+  buildMultiThreadObserverRequestMessage,
   parseObserverOutput,
   parseMultiThreadObserverOutput,
+  describeDegenerateOutput,
 } from './observer-agent';
-import { withRetry } from './retry';
+import { assertCompleteModelResponse, withRetry } from './retry';
 import { createTemporaryOmMemoryContext } from './temporary-memory';
 import type { TokenCounter } from './token-counter';
 import { withOmTracingSpan } from './tracing';
-import type { ResolvedObservationConfig } from './types';
+import { applyBeforeObservation, applyTextTransform } from './transform-hooks';
+import type { ObserveTransformHooks, ObserveTrigger, ResolvedObservationConfig } from './types';
 
 type ConcreteObservationModel = Exclude<ResolvedObservationConfig['model'], ModelByInputTokens>;
 
@@ -64,6 +66,47 @@ export interface ObserverExchange {
   retriedDueToDegenerate: boolean;
 }
 
+interface ObserverCallOptions {
+  skipContinuationHints?: boolean;
+  requestContext?: RequestContext;
+  observabilityContext?: ObservabilityContext;
+  priorCurrentTask?: string;
+  priorSuggestedResponse?: string;
+  priorThreadTitle?: string;
+  priorExtractedValues?: Record<string, unknown>;
+  wasTruncated?: boolean;
+  model?: ConcreteObservationModel;
+  threadId?: string;
+  resourceId?: string;
+  /** Which pipeline path initiated this cycle; passed to transform hooks. */
+  trigger?: ObserveTrigger;
+  mainAgent?: ProcessorContext['agent'];
+  /** Zone the Observer sees message dates in: the record's `observedTimezone`. */
+  timeZone?: string;
+}
+
+interface ObserverCallResult {
+  observations: string;
+  currentTask?: string;
+  suggestedContinuation?: string;
+  threadTitle?: string;
+  extractedValues?: Record<string, unknown>;
+  extractionFailures?: Array<{ slug: string; error: string }>;
+  extractors?: readonly Extractor<any>[];
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  providerMetadata?: ProviderMetadata;
+}
+
+interface MultiThreadObserverResult {
+  observations: string;
+  currentTask?: string;
+  suggestedContinuation?: string;
+  threadTitle?: string;
+  extractedValues?: Record<string, unknown>;
+  extractionFailures?: Array<{ slug: string; error: string }>;
+  extractors?: readonly Extractor<any>[];
+}
+
 function filterObserverExtractors(
   extractors: ResolvedObservationConfig['extractors'] | undefined,
   skipContinuationHints?: boolean,
@@ -83,6 +126,7 @@ export class ObserverRunner {
   private readonly resolveModel: ObservationModelResolver;
   private readonly tokenCounter: TokenCounter;
   private readonly memory?: Memory;
+  private readonly hooks?: ObserveTransformHooks;
   private mastra?: Mastra;
 
   /** Captured prompt/response from the last observer call (for repro capture). */
@@ -95,6 +139,7 @@ export class ObserverRunner {
     tokenCounter: TokenCounter;
     mastra?: Mastra;
     memory?: Memory;
+    hooks?: ObserveTransformHooks;
   }) {
     this.observationConfig = opts.observationConfig;
     this.observedMessageIds = opts.observedMessageIds;
@@ -102,6 +147,7 @@ export class ObserverRunner {
     this.tokenCounter = opts.tokenCounter;
     this.mastra = opts.mastra;
     this.memory = opts.memory;
+    this.hooks = opts.hooks;
   }
 
   __registerMastra(mastra: Mastra): void {
@@ -114,21 +160,37 @@ export class ObserverRunner {
     memory?: MastraMemory,
     extractors = this.observationConfig.extractors ?? [],
   ): Agent {
+    // Read the model into the widened type before branching on it so the
+    // conditional does not force TypeScript to enumerate every model-id literal.
+    let agentModel: WidenModelId<ConcreteObservationModel> = model;
+    if (Array.isArray(agentModel)) {
+      agentModel = agentModel.map(fallback => ({ ...fallback, maxRetries: 0 }));
+    } else if (typeof agentModel === 'function') {
+      const resolveDynamicModel = agentModel;
+      agentModel = (async args => {
+        const resolvedModel = await resolveDynamicModel(args);
+        return Array.isArray(resolvedModel)
+          ? resolvedModel.map(fallback => ({ ...fallback, maxRetries: 0 }))
+          : resolvedModel;
+      }) as typeof agentModel;
+    }
     const agent = new Agent({
       id: isMultiThread ? 'multi-thread-observer' : 'observational-memory-observer',
       name: isMultiThread ? 'multi-thread-observer' : 'Observer',
+      maxRetries: 0,
+      // withRetry owns retries and restarts each attempt from a clean prompt.
+      // Processor retries would continue from the failed attempt instead.
+      errorProcessorDefaults: false,
       instructions: buildObserverSystemPrompt(
         isMultiThread,
         this.observationConfig.instruction,
         this.observationConfig.threadTitle,
         extractors,
       ),
-      model,
+      model: agentModel,
       ...(memory ? { memory } : {}),
+      ...(this.mastra ? { mastra: this.mastra } : {}),
     });
-    if (this.mastra) {
-      agent.__registerMastra(this.mastra);
-    }
     return agent;
   }
 
@@ -191,38 +253,50 @@ export class ObserverRunner {
   }
 
   /**
-   * Call the Observer agent for a single thread.
+   * Call the Observer agent for a single thread, running the config-level
+   * `beforeObservation` / `afterObservation` transform hooks around it.
    */
   async call(
     existingObservations: string | undefined,
     messagesToObserve: MastraDBMessage[],
     abortSignal?: AbortSignal,
-    options?: {
-      skipContinuationHints?: boolean;
-      requestContext?: RequestContext;
-      observabilityContext?: ObservabilityContext;
-      priorCurrentTask?: string;
-      priorSuggestedResponse?: string;
-      priorThreadTitle?: string;
-      priorExtractedValues?: Record<string, unknown>;
-      wasTruncated?: boolean;
-      model?: ConcreteObservationModel;
-      resourceId?: string;
-      mainAgent?: ProcessorContext['agent'];
-    },
-  ): Promise<{
-    observations: string;
-    currentTask?: string;
-    suggestedContinuation?: string;
-    threadTitle?: string;
-    extractedValues?: Record<string, unknown>;
-    extractionFailures?: Array<{ slug: string; error: string }>;
-    extractors?: readonly Extractor<any>[];
-    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
-    providerMetadata?: ProviderMetadata;
-  }> {
+    options?: ObserverCallOptions,
+  ): Promise<ObserverCallResult> {
+    const context = {
+      threadId: options?.threadId ?? messagesToObserve[0]?.threadId,
+      resourceId: options?.resourceId,
+      trigger: options?.trigger,
+    };
+    const messages = await applyBeforeObservation(this.hooks, messagesToObserve, context);
+    if (messages.length === 0) {
+      omDebug('[OM:callObserver] beforeObservation returned no messages, skipping observer call');
+      return { observations: '' };
+    }
+    const result = await this.callObserver(existingObservations, messages, abortSignal, options);
+    result.observations = await applyTextTransform(this.hooks, 'afterObservation', result.observations, context);
+    return result;
+  }
+
+  private async callObserver(
+    existingObservations: string | undefined,
+    messagesToObserve: MastraDBMessage[],
+    abortSignal?: AbortSignal,
+    options?: ObserverCallOptions,
+  ): Promise<ObserverCallResult> {
     const inputTokens = this.tokenCounter.countMessages(messagesToObserve);
-    const resolvedModel = options?.model ? { model: options.model } : this.resolveModel(inputTokens);
+    const resolvedModel = (() => {
+      try {
+        return options?.model ? { model: options.model } : this.resolveModel(inputTokens);
+      } catch (error) {
+        this.mastra?.getLogger?.().error('OM observer model resolution failed', {
+          diagnostic: formatOmError(error),
+          inputTokens,
+          threadId: messagesToObserve[0]?.threadId,
+          hasRequestContext: Boolean(options?.requestContext),
+        });
+        throw error;
+      }
+    })();
     const activeExtractors = await resolveExtractors(
       filterObserverExtractors(this.observationConfig.extractors, options?.skipContinuationHints),
       {
@@ -241,21 +315,21 @@ export class ObserverRunner {
       ? this.createAgent(resolvedModel.model, false, temporaryMemory.memory, activeExtractors)
       : this.createAgent(resolvedModel.model, false, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(options?.requestContext, agent.id);
+    let attemptMemory: AgentMemoryOption | undefined;
 
     const attachmentFilter = this.resolveAttachmentFilter(resolvedModel.model, options?.requestContext);
 
     const observerMessages = [
-      {
-        role: 'user' as const,
-        content: buildObserverTaskPrompt(existingObservations, {
+      buildObserverRequestMessage(
+        existingObservations,
+        messagesToObserve,
+        {
           ...options,
           includeThreadTitle: this.observationConfig.threadTitle,
           extractors: activeExtractors,
-        }),
-      },
-      buildObserverHistoryMessage(messagesToObserve, {
-        attachmentFilter,
-      }),
+        },
+        { attachmentFilter, timeZone: options?.timeZone },
+      ),
     ];
 
     const doGenerate = async () => {
@@ -280,18 +354,45 @@ export class ObserverRunner {
             },
             callback: childObservabilityContext =>
               this.withAbortCheck(async () => {
-                const streamResult = await agent.stream(observerMessages, {
-                  modelSettings: { ...this.observationConfig.modelSettings },
-                  providerOptions: this.observationConfig.providerOptions as any,
-                  ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
-                  ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
-                  ...childObservabilityContext,
-                });
-                return streamResult.getFullOutput();
+                try {
+                  attemptMemory = temporaryMemory?.newThread();
+                  const streamResult = await agent.stream(observerMessages, {
+                    // One prompt, one reply. Without this cap, a reply cut off with finishReason
+                    // "other" or "unknown" makes the loop continue from the partial text, and
+                    // assertCompleteModelResponse would only see the final step's "stop".
+                    maxSteps: 1,
+                    modelSettings: { ...this.observationConfig.modelSettings },
+                    providerOptions: this.observationConfig.providerOptions as any,
+                    ...(attemptMemory ? { memory: attemptMemory } : {}),
+                    ...(abortSignal ? { abortSignal } : {}),
+                    ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
+                    ...childObservabilityContext,
+                  });
+                  return assertCompleteModelResponse(await streamResult.getFullOutput(), 'OM observer');
+                } catch (error) {
+                  this.mastra?.getLogger?.().error('OM observer provider call failed', {
+                    diagnostic: formatOmError(error),
+                    model:
+                      typeof resolvedModel.model === 'function'
+                        ? '(dynamic-model)'
+                        : this.extractModelRouterId(resolvedModel.model, internalRequestContext),
+                    inputTokens,
+                    threadId: messagesToObserve[0]?.threadId,
+                    observedMessageCount: messagesToObserve.length,
+                    providerOptionProviders: Object.keys(this.observationConfig.providerOptions ?? {}),
+                    hasRequestContext: Boolean(internalRequestContext),
+                    aborted: abortSignal?.aborted ?? false,
+                  });
+                  if (abortSignal?.aborted || !isOmModelExecutionFailure(error)) throw error;
+                  throw new OmModelExecutionError('observer-model', error);
+                }
               }, abortSignal),
           }),
-        { label: 'observer', abortSignal },
+        {
+          label: 'observer',
+          abortSignal,
+          maxRetries: this.observationConfig.maxRetries,
+        },
       );
     };
 
@@ -300,13 +401,17 @@ export class ObserverRunner {
     let retriedDueToDegenerate = false;
 
     if (parsed.degenerate) {
-      omDebug(`[OM:callObserver] degenerate repetition detected, retrying once`);
+      omDebug(
+        `[OM:callObserver] degenerate repetition detected, retrying once. ${describeDegenerateOutput(result.text, 2000)}`,
+      );
       result = await doGenerate();
       parsed = parseObserverOutput(result.text, activeExtractors);
       retriedDueToDegenerate = true;
       if (parsed.degenerate) {
-        omDebug(`[OM:callObserver] degenerate repetition on retry, failing`);
-        throw new Error('Observer produced degenerate output after retry');
+        omDebug(
+          `[OM:callObserver] degenerate repetition on retry, failing. ${describeDegenerateOutput(result.text, 2000)}`,
+        );
+        throw new Error(`Observer produced degenerate output after retry. ${describeDegenerateOutput(result.text)}`);
       }
     }
 
@@ -314,9 +419,9 @@ export class ObserverRunner {
       agent,
       source: 'observer',
       extractors: activeExtractors,
-      memory: temporaryMemory?.options,
+      memory: attemptMemory,
       priorExtractedValues: options?.priorExtractedValues,
-      requestContext: options?.requestContext,
+      requestContext: internalRequestContext,
       observabilityContext: options?.observabilityContext,
       abortSignal,
     });
@@ -371,6 +476,69 @@ export class ObserverRunner {
    */
   async callMultiThread(
     existingObservations: string | undefined,
+    allMessagesByThread: Map<string, MastraDBMessage[]>,
+    allThreadOrder: string[],
+    abortSignal?: AbortSignal,
+    requestContext?: RequestContext,
+    priorMetadataByThread?: Map<
+      string,
+      { currentTask?: string; suggestedResponse?: string; threadTitle?: string; extracted?: Record<string, unknown> }
+    >,
+    observabilityContext?: ObservabilityContext,
+    model?: ConcreteObservationModel,
+    hookContext?: { resourceId?: string; trigger?: ObserveTrigger },
+    timeZone?: string,
+  ): Promise<{
+    results: Map<string, MultiThreadObserverResult>;
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+    providerMetadata?: ProviderMetadata;
+  }> {
+    const contextFor = (threadId: string) => ({ threadId, ...hookContext });
+
+    // Apply beforeObservation per thread; threads left with no messages are
+    // excluded from the observer call but still get an empty result.
+    const messagesByThread = new Map<string, MastraDBMessage[]>();
+    for (const threadId of allThreadOrder) {
+      const filtered = await applyBeforeObservation(
+        this.hooks,
+        allMessagesByThread.get(threadId) ?? [],
+        contextFor(threadId),
+      );
+      if (filtered.length > 0) messagesByThread.set(threadId, filtered);
+    }
+    const threadOrder = allThreadOrder.filter(threadId => messagesByThread.has(threadId));
+
+    const output = await this.callMultiThreadObserver(
+      existingObservations,
+      messagesByThread,
+      threadOrder,
+      abortSignal,
+      requestContext,
+      priorMetadataByThread,
+      observabilityContext,
+      model,
+      timeZone,
+    );
+
+    for (const threadId of allThreadOrder) {
+      const threadResult = output.results.get(threadId);
+      if (!threadResult) {
+        output.results.set(threadId, { observations: '' });
+        continue;
+      }
+      threadResult.observations = await applyTextTransform(
+        this.hooks,
+        'afterObservation',
+        threadResult.observations,
+        contextFor(threadId),
+      );
+    }
+
+    return output;
+  }
+
+  private async callMultiThreadObserver(
+    existingObservations: string | undefined,
     messagesByThread: Map<string, MastraDBMessage[]>,
     threadOrder: string[],
     abortSignal?: AbortSignal,
@@ -381,27 +549,36 @@ export class ObserverRunner {
     >,
     observabilityContext?: ObservabilityContext,
     model?: ConcreteObservationModel,
+    timeZone?: string,
   ): Promise<{
-    results: Map<
-      string,
-      {
-        observations: string;
-        currentTask?: string;
-        suggestedContinuation?: string;
-        threadTitle?: string;
-        extractedValues?: Record<string, unknown>;
-        extractionFailures?: Array<{ slug: string; error: string }>;
-        extractors?: readonly Extractor<any>[];
-      }
-    >;
+    results: Map<string, MultiThreadObserverResult>;
     usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
     providerMetadata?: ProviderMetadata;
   }> {
+    if (threadOrder.length === 0) {
+      return { results: new Map() };
+    }
+
     const inputTokens = Array.from(messagesByThread.values()).reduce(
       (total, messages) => total + this.tokenCounter.countMessages(messages),
       0,
     );
-    const resolvedModel = model ? { model } : this.resolveModel(inputTokens);
+    const resolvedModel = (() => {
+      try {
+        return model ? { model } : this.resolveModel(inputTokens);
+      } catch (error) {
+        this.mastra?.getLogger?.().error('OM multi-thread observer model resolution failed', {
+          diagnostic: formatOmError(error),
+          inputTokens,
+          threadIds: {
+            sample: threadOrder.slice(0, 10).map(threadId => threadId.slice(0, 128)),
+            total: threadOrder.length,
+          },
+          hasRequestContext: Boolean(requestContext),
+        });
+        throw error;
+      }
+    })();
     const firstThreadMessages = messagesByThread.get(threadOrder[0] ?? '') ?? [];
     const activeExtractors = await resolveExtractors(this.observationConfig.extractors ?? [], {
       source: 'observer',
@@ -413,29 +590,24 @@ export class ObserverRunner {
     const structuredExtractors = activeExtractors.filter(extractor => extractor.mode === 'structured');
 
     if (structuredExtractors.length > 0) {
-      const results = new Map<
-        string,
-        {
-          observations: string;
-          currentTask?: string;
-          suggestedContinuation?: string;
-          threadTitle?: string;
-          extractedValues?: Record<string, unknown>;
-          extractionFailures?: Array<{ slug: string; error: string }>;
-          extractors?: readonly Extractor<any>[];
-        }
-      >();
+      const results = new Map<string, MultiThreadObserverResult>();
       let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       for (const threadId of threadOrder) {
-        const threadResult = await this.call(existingObservations, messagesByThread.get(threadId) ?? [], abortSignal, {
-          requestContext,
-          observabilityContext,
-          priorCurrentTask: priorMetadataByThread?.get(threadId)?.currentTask,
-          priorSuggestedResponse: priorMetadataByThread?.get(threadId)?.suggestedResponse,
-          priorThreadTitle: priorMetadataByThread?.get(threadId)?.threadTitle,
-          priorExtractedValues: priorMetadataByThread?.get(threadId)?.extracted,
-          model: resolvedModel.model,
-        });
+        const threadResult = await this.callObserver(
+          existingObservations,
+          messagesByThread.get(threadId) ?? [],
+          abortSignal,
+          {
+            requestContext,
+            observabilityContext,
+            priorCurrentTask: priorMetadataByThread?.get(threadId)?.currentTask,
+            priorSuggestedResponse: priorMetadataByThread?.get(threadId)?.suggestedResponse,
+            priorThreadTitle: priorMetadataByThread?.get(threadId)?.threadTitle,
+            priorExtractedValues: priorMetadataByThread?.get(threadId)?.extracted,
+            model: resolvedModel.model,
+            timeZone,
+          },
+        );
         results.set(threadId, {
           observations: threadResult.observations,
           currentTask: threadResult.currentTask,
@@ -451,38 +623,35 @@ export class ObserverRunner {
           totalUsage.totalTokens += threadResult.usage.totalTokens ?? 0;
         }
       }
+      // Same contract as the single-call branch below: mark only after every
+      // per-thread observer call succeeded, so a failure leaves the messages
+      // eligible for a later cycle.
+      for (const msgs of messagesByThread.values()) {
+        for (const msg of msgs) {
+          this.observedMessageIds.add(msg.id);
+        }
+      }
+
       return { results, usage: totalUsage };
     }
 
-    let temporaryMemory: Awaited<ReturnType<typeof createTemporaryOmMemoryContext>> | undefined;
     const agent = this.createAgent(resolvedModel.model, true, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(requestContext, agent.id);
 
     const multiThreadAttachmentFilter = this.resolveAttachmentFilter(resolvedModel.model, requestContext);
 
     const observerMessages = [
-      {
-        role: 'user' as const,
-        content: buildMultiThreadObserverTaskPrompt(
-          existingObservations,
-          threadOrder,
-          priorMetadataByThread,
-          undefined,
-          this.observationConfig.threadTitle,
-          activeExtractors,
-        ),
-      },
-      buildMultiThreadObserverHistoryMessage(messagesByThread, threadOrder, {
-        attachmentFilter: multiThreadAttachmentFilter,
-      }),
+      buildMultiThreadObserverRequestMessage(
+        existingObservations,
+        messagesByThread,
+        threadOrder,
+        priorMetadataByThread,
+        undefined,
+        this.observationConfig.threadTitle,
+        activeExtractors,
+        { attachmentFilter: multiThreadAttachmentFilter, timeZone },
+      ),
     ];
-
-    // Mark all messages as observed
-    for (const msgs of messagesByThread.values()) {
-      for (const msg of msgs) {
-        this.observedMessageIds.add(msg.id);
-      }
-    }
 
     const doGenerate = async () => {
       return withRetry(
@@ -505,18 +674,45 @@ export class ObserverRunner {
             },
             callback: childObservabilityContext =>
               this.withAbortCheck(async () => {
-                const streamResult = await agent.stream(observerMessages, {
-                  modelSettings: { ...this.observationConfig.modelSettings },
-                  providerOptions: this.observationConfig.providerOptions as any,
-                  ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
-                  ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
-                  ...childObservabilityContext,
-                });
-                return streamResult.getFullOutput();
+                try {
+                  const streamResult = await agent.stream(observerMessages, {
+                    // One prompt, one reply. Without this cap, a reply cut off with finishReason
+                    // "other" or "unknown" makes the loop continue from the partial text, and
+                    // assertCompleteModelResponse would only see the final step's "stop".
+                    maxSteps: 1,
+                    modelSettings: { ...this.observationConfig.modelSettings },
+                    providerOptions: this.observationConfig.providerOptions as any,
+                    ...(abortSignal ? { abortSignal } : {}),
+                    ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
+                    ...childObservabilityContext,
+                  });
+                  return assertCompleteModelResponse(await streamResult.getFullOutput(), 'OM multi-thread observer');
+                } catch (error) {
+                  this.mastra?.getLogger?.().error('OM multi-thread observer provider call failed', {
+                    diagnostic: formatOmError(error),
+                    model:
+                      typeof resolvedModel.model === 'function'
+                        ? '(dynamic-model)'
+                        : this.extractModelRouterId(resolvedModel.model, internalRequestContext),
+                    inputTokens,
+                    threadIds: {
+                      sample: threadOrder.slice(0, 10).map(threadId => threadId.slice(0, 128)),
+                      total: threadOrder.length,
+                    },
+                    providerOptionProviders: Object.keys(this.observationConfig.providerOptions ?? {}),
+                    hasRequestContext: Boolean(internalRequestContext),
+                    aborted: abortSignal?.aborted ?? false,
+                  });
+                  if (abortSignal?.aborted || !isOmModelExecutionFailure(error)) throw error;
+                  throw new OmModelExecutionError('observer-model', error);
+                }
               }, abortSignal),
           }),
-        { label: 'observer-multi-thread', abortSignal },
+        {
+          label: 'observer-multi-thread',
+          abortSignal,
+          maxRetries: this.observationConfig.maxRetries,
+        },
       );
     };
 
@@ -525,13 +721,19 @@ export class ObserverRunner {
     let retriedDueToDegenerate = false;
 
     if (parsed.degenerate) {
-      omDebug(`[OM:callMultiThreadObserver] degenerate repetition detected, retrying once`);
+      omDebug(
+        `[OM:callMultiThreadObserver] degenerate repetition detected, retrying once. ${describeDegenerateOutput(result.text, 2000)}`,
+      );
       result = await doGenerate();
       parsed = parseMultiThreadObserverOutput(result.text, activeExtractors);
       retriedDueToDegenerate = true;
       if (parsed.degenerate) {
-        omDebug(`[OM:callMultiThreadObserver] degenerate repetition on retry, failing`);
-        throw new Error('Multi-thread observer produced degenerate output after retry');
+        omDebug(
+          `[OM:callMultiThreadObserver] degenerate repetition on retry, failing. ${describeDegenerateOutput(result.text, 2000)}`,
+        );
+        throw new Error(
+          `Multi-thread observer produced degenerate output after retry. ${describeDegenerateOutput(result.text)}`,
+        );
       }
     }
 
@@ -580,18 +782,7 @@ export class ObserverRunner {
       retriedDueToDegenerate,
     };
 
-    const results = new Map<
-      string,
-      {
-        observations: string;
-        currentTask?: string;
-        suggestedContinuation?: string;
-        threadTitle?: string;
-        extractedValues?: Record<string, unknown>;
-        extractionFailures?: Array<{ slug: string; error: string }>;
-        extractors?: readonly Extractor<any>[];
-      }
-    >();
+    const results = new Map<string, MultiThreadObserverResult>();
     for (const [threadId, threadResult] of parsed.threads) {
       const structuredExtraction = structuredExtractionByThread.get(threadId);
       const extractedValues = mergeExtractedValues(threadResult.extractedValues, structuredExtraction?.values);
@@ -615,6 +806,12 @@ export class ObserverRunner {
     for (const threadId of threadOrder) {
       if (!results.has(threadId)) {
         results.set(threadId, { observations: '' });
+      }
+    }
+
+    for (const msgs of messagesByThread.values()) {
+      for (const msg of msgs) {
+        this.observedMessageIds.add(msg.id);
       }
     }
 

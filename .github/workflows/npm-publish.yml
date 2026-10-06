@@ -16,6 +16,7 @@ on:
           - stable
           - enter-prerelease
           - snapshot
+          - playground-snapshot
         default: prerelease
       tag:
         description: 'npm tag (for snapshot: custom tag, otherwise auto-determined)'
@@ -51,6 +52,7 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -136,6 +138,30 @@ jobs:
             --endpoint-url "${STUDIO_ENDPOINT_URL}" \
             --delete
 
+      - name: Upload factory assets to R2 (staging)
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_STAGING }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_STAGING }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_STAGING }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_STAGING }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
+      - name: Upload factory assets to R2 (production)
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_PROD }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_PROD }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_PROD }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_PROD }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
       - name: Notify linked issues (alpha available)
         if: ${{ !inputs.dry_run }}
         continue-on-error: true
@@ -164,6 +190,7 @@ jobs:
     steps:
       - name: Initial checkout
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -178,12 +205,71 @@ jobs:
           permission-contents: write
           permission-issues: write
 
-      - name: Re-checkout with app token
+      - name: Re-checkout main with app token
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           token: ${{ steps.app-auth.outputs.token }}
-          fetch-depth: 0
+          ref: main
+          fetch-depth: 1
+          fetch-tags: true
           persist-credentials: true
+
+      - name: Fetch enough history for Changesets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEEPEN_BY=50
+
+          while true; do
+            missing=()
+
+            for f in .changeset/*.md; do
+              [ -e "$f" ] || continue
+
+              # Not an actual changeset
+              [[ "$f" == ".changeset/README.md" ]] && continue
+
+              result=$(
+                git log \
+                  --diff-filter=A \
+                  --follow \
+                  --max-count=1 \
+                  --pretty=format:'%H:%p' \
+                  -- "$f"
+              )
+
+              if [ -z "$result" ]; then
+                missing+=("$f")
+                continue
+              fi
+
+              commit="${result%%:*}"
+              parents="${result#*:}"
+
+              if [ -n "$commit" ] && [ -z "$parents" ]; then
+                missing+=("$f")
+              fi
+            done
+
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "Enough history fetched for all changesets."
+              break
+            fi
+
+            echo "Need more history for ${#missing[@]} changeset(s):"
+            printf '  %s\n' "${missing[@]}"
+
+            if [ "$(git rev-parse --is-shallow-repository)" = "false" ]; then
+              echo "Repository is fully unshallow but some changesets still cannot be resolved."
+              exit 1
+            fi
+
+            echo "Deepening by $DEEPEN_BY commits..."
+            # Deepen only main's history (no branches) and skip tags.
+            git fetch --deepen="$DEEPEN_BY" --no-tags origin main
+          done
 
       - name: Check for pre.json file existence
         id: check_files
@@ -214,28 +300,23 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build packages
-        run: pnpm build
-
       - name: Exit prerelease mode
         if: steps.check_files.outputs.files_exists == 'true'
         run: |
           pnpm changeset-cli pre exit
           pnpm changeset-cli version
-          git pull
           git add -A
           git commit -m 'chore: version - exit prerelease mode' --no-verify
-          git push
           pnpm install
-          pnpm build
         env:
           GITHUB_TOKEN: ${{ steps.app-auth.outputs.token }}
 
+      - name: Build packages
+        run: pnpm build
+
       - name: Push version changes
-        if: ${{ !inputs.dry_run }}
-        run: |
-          git push
-          pnpm install
+        if: steps.check_files.outputs.files_exists == 'true' && !inputs.dry_run
+        run: git push origin HEAD:main
         env:
           GITHUB_TOKEN: ${{ steps.app-auth.outputs.token }}
 
@@ -279,15 +360,44 @@ jobs:
             --endpoint-url "${STUDIO_ENDPOINT_URL}" \
             --delete
 
-      - name: Updated alpha versions
+      - name: Upload factory assets to R2 (staging)
         if: ${{ !inputs.dry_run }}
-        run: node .github/scripts/publish-alpha-tags.js alpha
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_STAGING }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_STAGING }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_STAGING }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_STAGING }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
+      # TODO: Remove continue-on-error once production CF R2 credentials are configured.
+      - name: Upload factory assets to R2 (production)
+        if: ${{ !inputs.dry_run }}
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_PROD }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_PROD }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_PROD }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_PROD }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
+      # Disabled: `npm dist-tag add` requires token authentication and cannot use npm OIDC.
+      # - name: Update alpha versions
+      #   if: ${{ !inputs.dry_run }}
+      #   run: node .github/scripts/publish-alpha-tags.js alpha
 
       - name: Publish packages - dry run
         if: ${{ inputs.dry_run }}
         run: pnpm publish -r --dry-run --access public --no-git-checks
 
       - name: Add tags
+        if: ${{ !inputs.dry_run }}
         run: |
           pnpm changeset-cli tag
           git push origin --tags
@@ -321,6 +431,7 @@ jobs:
     steps:
       - name: Initial checkout
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -336,6 +447,7 @@ jobs:
 
       - name: Re-checkout with app token
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           token: ${{ steps.app-auth.outputs.token }}
           fetch-depth: 0
@@ -378,6 +490,104 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-auth.outputs.token }}
 
   # ===========================================
+  # PLAYGROUND SNAPSHOT: UI library and its workspace dependencies only
+  # ===========================================
+  playground-snapshot:
+    if: |
+      github.repository == 'mastra-ai/mastra' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish_type == 'playground-snapshot' &&
+      github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+      TURBO_CACHE: remote:r
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@04be95cf3511ea51ebf9f224ddfb99cc7ab87cd4
+        with:
+          node-version: 24.18.0
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+          package-manager-cache: false
+
+      - name: Determine snapshot tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          SLUG=$(echo "$GITHUB_REF_NAME" | iconv -t ascii//TRANSLIT | sed -r 's/[^a-zA-Z0-9]+/-/g' | sed -r 's/^-+|-+$//g' | tr 'A-Z' 'a-z')
+          FINAL_TAG="${REQUESTED_TAG:-$SLUG}"
+          if [[ ! "$FINAL_TAG" =~ ^[a-zA-Z][a-zA-Z0-9-]*$ ]] || [[ "$FINAL_TAG" =~ ^(latest|next|alpha|beta|rc|stable)$ ]]; then
+            echo "::error::Use a non-release snapshot tag starting with a letter and containing only letters, numbers, or hyphens."
+            exit 1
+          fi
+          echo "FINAL_TAG=$FINAL_TAG" >> "$GITHUB_ENV"
+
+      - name: Ensure npm 11.5.1+ for OIDC
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build playground UI and dependencies
+        run: pnpm turbo build --filter '@mastra/playground-ui...'
+
+      - name: Version playground UI snapshot packages
+        run: |
+          pnpm --filter-prod '@mastra/playground-ui...' list --depth -1 --json > "$RUNNER_TEMP/playground-snapshot-packages.json"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const packages = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'playground-snapshot-packages.json'), 'utf8'))
+            .map(pkg => ({ path: path.join(pkg.path, 'package.json'), manifest: JSON.parse(fs.readFileSync(path.join(pkg.path, 'package.json'), 'utf8')) }))
+            .filter(pkg => !pkg.manifest.private);
+          if (!packages.some(pkg => pkg.manifest.name === '@mastra/playground-ui')) {
+            throw new Error('Playground UI is missing from the snapshot package set');
+          }
+          const names = new Set(packages.map(pkg => pkg.manifest.name));
+          const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+          const version = `0.0.0-${process.env.FINAL_TAG}-${timestamp}`;
+          // Global Changesets versioning would also bump unrelated fixed groups and dependents.
+          for (const { path: file, manifest } of packages) {
+            manifest.version = version;
+            for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+              for (const name of Object.keys(manifest[field] || {})) {
+                if (names.has(name)) manifest[field][name] = 'workspace:*';
+              }
+            }
+            fs.writeFileSync(file, JSON.stringify(manifest, null, 2) + '\n');
+            console.log(`${manifest.name}@${version}`);
+          }
+          NODE
+
+      - name: Publish playground UI and dependencies
+        env:
+          NPM_CONFIG_PROVENANCE: true
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [[ "$DRY_RUN" == 'true' ]]; then
+            args+=(--dry-run)
+          fi
+          pnpm --filter '@mastra/playground-ui...' publish -r --no-git-checks --tag "$FINAL_TAG" --access public "${args[@]}"
+
+  # ===========================================
   # SNAPSHOT: Manual trigger only (non-main branches)
   # ===========================================
   snapshot:
@@ -397,6 +607,7 @@ jobs:
     steps:
       - name: Initial checkout
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -412,6 +623,7 @@ jobs:
 
       - name: Re-checkout with app token
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           token: ${{ steps.app-auth.outputs.token }}
           fetch-depth: 0
@@ -457,17 +669,32 @@ jobs:
 
       - name: Update workspace dependencies
         run: |
-          for file in $(find . -type f -name package.json -not -path "./node_modules/*" -not -path "./package.json"); do
-            content="$(< "$file")"
-            updated="$(echo "$content" | sed -E 's/"workspace:\^"/"workspace:*"/g')"
-            updated="$(echo "$updated" | sed 's/"@mastra\/\([^"]*\)":[[:space:]]"[^"]*"/"@mastra\/\1": "workspace:*"/g')"
-            if [ "$content" != "$updated" ]; then
-              echo "Updating $file"
-              echo "$updated" > "$file"
-              changed_count=$((changed_count + 1))
-            fi
-          done
-          echo "Finished updating workspace dependencies. $changed_count files updated."
+          node <<'EOF'
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+          const workspacePackages = new Set(
+            JSON.parse(execSync('pnpm m ls --depth -1 --json', { maxBuffer: 64 * 1024 * 1024 }))
+              .map(pkg => pkg.name)
+              .filter(Boolean),
+          );
+          const files = execSync('git ls-files "*/package.json"').toString().trim().split('\n');
+          let changedCount = 0;
+          for (const file of files) {
+            const content = fs.readFileSync(file, 'utf8');
+            let updated = content.replace(/"workspace:\^"/g, '"workspace:*"');
+            // Only rewrite @mastra/* deps that are actual workspace packages;
+            // some (e.g. @mastra/docusaurus-plugin-*) are published from other repos.
+            updated = updated.replace(/"(@mastra\/[^"]*)":\s*"[^"]*"/g, (match, name) =>
+              workspacePackages.has(name) ? `"${name}": "workspace:*"` : match,
+            );
+            if (updated !== content) {
+              console.log(`Updating ${file}`);
+              fs.writeFileSync(file, updated);
+              changedCount++;
+            }
+          }
+          console.log(`Finished updating workspace dependencies. ${changedCount} files updated.`);
+          EOF
         shell: bash
 
       - name: Update lockfile
@@ -539,5 +766,29 @@ jobs:
           STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_PROD }}
         run: |
           aws s3 sync packages/cli/dist/studio "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/studio/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
+      - name: Upload factory assets to R2 (staging)
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_STAGING }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_STAGING }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_STAGING }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_STAGING }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
+            --endpoint-url "${STUDIO_ENDPOINT_URL}" \
+            --delete
+
+      - name: Upload factory assets to R2 (production)
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_ACCESS_KEY_ID_PROD }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_ACCESS_SECRET_PROD }}
+          STUDIO_BUCKET_NAME: ${{ vars.STUDIO_R2_BUCKET_PROD }}
+          STUDIO_ENDPOINT_URL: ${{ vars.STUDIO_R2_ENDPOINT_URL_PROD }}
+        run: |
+          aws s3 sync packages/cli/dist/factory "s3://${STUDIO_BUCKET_NAME}/${{ steps.cli-version.outputs.version }}/factory/" \
             --endpoint-url "${STUDIO_ENDPOINT_URL}" \
             --delete

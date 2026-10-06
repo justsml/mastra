@@ -1,17 +1,17 @@
 import { Button } from '@mastra/playground-ui/components/Button';
+import { useStoredSkills } from '@mastra/react/hooks/agents';
+import { useStoredWorkspaces } from '@mastra/react/hooks/workspace';
 import { ArrowLeftIcon } from 'lucide-react';
 import { Navigate, useNavigate } from 'react-router';
 import { SkillBuilderStarter } from '@/domains/agent-builder/components/skill-starter/skill-builder-starter';
 import { useBuilderSettings } from '@/domains/agent-builder/hooks/use-builder-settings';
-import { useStoredSkills } from '@/domains/agents/hooks/use-stored-skills';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
-import { useStoredWorkspaces } from '@/domains/workspace/hooks/use-stored-workspaces';
 
 export default function AgentBuilderSkillsCreate() {
   const { hasPermission, rbacEnabled } = usePermissions();
   const canWrite = !rbacEnabled || hasPermission('stored-skills:write');
   // Warm caches the edit page needs on first paint.
-  useStoredSkills({ enabled: canWrite });
+  useStoredSkills({ queryOptions: { enabled: canWrite } });
   useStoredWorkspaces();
   useBuilderSettings();
   const navigate = useNavigate();
@@ -21,7 +21,7 @@ export default function AgentBuilderSkillsCreate() {
   }
   return (
     <>
-      <div className="absolute top-3 left-3 md:top-6 md:left-6 z-10">
+      <div className="absolute top-3 left-3 z-10 md:top-6 md:left-6">
         <Button
           size="icon-sm"
           variant="ghost"

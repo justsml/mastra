@@ -1,5 +1,5 @@
 import { APICallError, JSONParseError, NoObjectGeneratedError, TypeValidationError } from '@internal/ai-sdk-v5';
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import type { Agent } from './agent';
 import {
@@ -7,14 +7,15 @@ import {
   tryStreamWithJsonFallback,
   isSupportedLanguageModel,
   resolveThreadIdFromArgs,
+  resolveSuspendedToolRunId,
 } from './utils';
 
-function makeAgent(generate: ReturnType<typeof vi.fn>): Agent {
-  return { generate } as unknown as Agent;
+function makeAgent(generate: ReturnType<typeof vi.fn>, warn = vi.fn()): Agent {
+  return { generate, __getLogger: () => ({ warn }) } as unknown as Agent;
 }
 
-function makeStreamAgent(stream: ReturnType<typeof vi.fn>): Agent {
-  return { stream } as unknown as Agent;
+function makeStreamAgent(stream: ReturnType<typeof vi.fn>, warn = vi.fn()): Agent {
+  return { stream, __getLogger: () => ({ warn }) } as unknown as Agent;
 }
 
 function makeAPICallError(isRetryable: boolean): APICallError {
@@ -31,6 +32,10 @@ const baseOptions = {
   structuredOutput: { schema: z.object({ decision: z.string() }) },
 } as any;
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe('agent/utils', () => {
   describe('tryGenerateWithJsonFallback', () => {
     it('returns the first result without retrying when it has a valid object', async () => {
@@ -43,16 +48,22 @@ describe('agent/utils', () => {
     });
 
     it('retries with jsonPromptInjection for a structured-output parse error', async () => {
+      const error = new JSONParseError({ text: 'not json', cause: new SyntaxError('Unexpected token') });
       const generate = vi
         .fn()
-        .mockRejectedValueOnce(new JSONParseError({ text: 'not json', cause: new SyntaxError('Unexpected token') }))
+        .mockRejectedValueOnce(error)
         .mockResolvedValueOnce({ object: { decision: 'continue' } });
+      const warn = vi.fn();
+      const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-      const result = await tryGenerateWithJsonFallback(makeAgent(generate), 'prompt', baseOptions);
+      const result = await tryGenerateWithJsonFallback(makeAgent(generate, warn), 'prompt', baseOptions);
 
       expect(result).toEqual({ object: { decision: 'continue' } });
       expect(generate).toHaveBeenCalledTimes(2);
       expect(generate.mock.calls[1][1].structuredOutput.jsonPromptInjection).toBe(true);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith('Error in tryGenerateWithJsonFallback. Attempting fallback.', error);
+      expect(consoleWarn).not.toHaveBeenCalled();
     });
 
     it('retries with jsonPromptInjection when no object is generated', async () => {
@@ -136,6 +147,60 @@ describe('agent/utils', () => {
   });
 
   describe('tryStreamWithJsonFallback', () => {
+    it('records one stream attempt for a successful invocation', async () => {
+      const result = { object: Promise.resolve({ decision: 'done' }) };
+      const stream = vi.fn().mockResolvedValue(result);
+      const onStreamAttempt = vi.fn();
+
+      await expect(
+        tryStreamWithJsonFallback(makeStreamAgent(stream), 'prompt', {
+          ...baseOptions,
+          onStreamAttempt,
+        } as any),
+      ).resolves.toBe(result);
+
+      expect(onStreamAttempt).toHaveBeenCalledTimes(1);
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    it('records both stream attempts for a structured-output fallback', async () => {
+      const fallbackResult = { object: Promise.resolve({ decision: 'continue' }) };
+      const error = new JSONParseError({ text: 'not json', cause: new SyntaxError('Unexpected token') });
+      const stream = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(fallbackResult);
+      const onStreamAttempt = vi.fn();
+      const warn = vi.fn();
+      const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await expect(
+        tryStreamWithJsonFallback(makeStreamAgent(stream, warn), 'prompt', {
+          ...baseOptions,
+          onStreamAttempt,
+        } as any),
+      ).resolves.toBe(fallbackResult);
+
+      expect(onStreamAttempt).toHaveBeenCalledTimes(2);
+      expect(stream).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
+      expect(consoleWarn).not.toHaveBeenCalled();
+    });
+
+    it('records a stream attempt before the provider rejects', async () => {
+      const error = new Error('provider failed');
+      const stream = vi.fn().mockRejectedValue(error);
+      const onStreamAttempt = vi.fn();
+
+      await expect(
+        tryStreamWithJsonFallback(makeStreamAgent(stream), 'prompt', {
+          ...baseOptions,
+          onStreamAttempt,
+        } as any),
+      ).rejects.toBe(error);
+
+      expect(onStreamAttempt).toHaveBeenCalledTimes(1);
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
     it('retries with jsonPromptInjection for a structured-output parse error', async () => {
       const fallbackResult = { object: Promise.resolve({ decision: 'continue' }) };
       const stream = vi
@@ -162,6 +227,18 @@ describe('agent/utils', () => {
       );
       expect(stream).toHaveBeenCalledTimes(2);
       expect(stream.mock.calls[1][1].structuredOutput.jsonPromptInjection).toBe(true);
+    });
+
+    it('returns the first result without a fallback for a valid falsy object', async () => {
+      // A structuredOutput schema can legitimately resolve to a falsy-but-defined
+      // value (e.g. z.boolean() -> false, z.number() -> 0). That is a successful
+      // first attempt and must not trigger the JSON-prompt fallback.
+      const firstResult = { object: Promise.resolve(false) };
+      const stream = vi.fn().mockResolvedValueOnce(firstResult);
+      const options = { structuredOutput: { schema: z.boolean() } } as any;
+
+      await expect(tryStreamWithJsonFallback(makeStreamAgent(stream), 'prompt', options)).resolves.toBe(firstResult);
+      expect(stream).toHaveBeenCalledTimes(1);
     });
 
     it.each([
@@ -206,6 +283,45 @@ describe('agent/utils', () => {
       expect(isSupportedLanguageModel({ specificationVersion: 'v5' } as any)).toBe(false);
       expect(isSupportedLanguageModel({} as any)).toBe(false);
     });
+  });
+
+  describe('resolveSuspendedToolRunId', () => {
+    it.each(['null', 'NULL', 'Null', 'undefined', 'UNDEFINED', 'none', 'None', 'nil', 'NIL'])(
+      'treats the sentinel string %j as absent',
+      value => {
+        expect(resolveSuspendedToolRunId(value)).toBeUndefined();
+      },
+    );
+
+    it.each([' null ', '\tnull\n', '  undefined', 'none  '])(
+      'treats the whitespace-padded sentinel %j as absent',
+      value => {
+        expect(resolveSuspendedToolRunId(value)).toBeUndefined();
+      },
+    );
+
+    it.each(['', '   ', '\n\t'])('treats the empty/whitespace-only string %j as absent', value => {
+      expect(resolveSuspendedToolRunId(value)).toBeUndefined();
+    });
+
+    it.each([null, undefined, 0, 42, false, true, {}, ['run-id'], Symbol('run-id')])(
+      'treats the non-string value %s as absent',
+      value => {
+        expect(resolveSuspendedToolRunId(value)).toBeUndefined();
+      },
+    );
+
+    it('passes through a UUID run id unchanged', () => {
+      const uuid = 'b7f5b9a0-1c2d-4e3f-8a9b-0c1d2e3f4a5b';
+      expect(resolveSuspendedToolRunId(uuid)).toBe(uuid);
+    });
+
+    it.each(['call_abc123', 'toolu_01XyZ', 'my-custom-run-id', 'nullable-run', 'nonexistent'])(
+      'passes through the non-sentinel run id %j unchanged',
+      value => {
+        expect(resolveSuspendedToolRunId(value)).toBe(value);
+      },
+    );
   });
 
   describe('resolveThreadIdFromArgs', () => {

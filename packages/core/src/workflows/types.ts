@@ -16,6 +16,7 @@ import type { ChunkType, WorkflowStreamEvent } from '../stream/types';
 import type { Tool, ToolExecutionContext } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { ExecutionEngine } from './execution-engine';
+import type { Predicate } from './predicate';
 import type { WorkflowScheduleInput } from './scheduler/types';
 import type { ConditionFunction, ExecuteFunction, ExecuteFunctionParams, LoopConditionFunction, Step } from './step';
 
@@ -53,6 +54,7 @@ export type RestartExecutionParams = {
   stepResults: Record<string, StepResult<any, any, any, any>>;
   state?: Record<string, any>;
   stepExecutionPath?: string[];
+  isPreFirstStepRestart?: boolean;
   isParallelOrConditionalRestarted?: boolean;
 };
 
@@ -162,6 +164,18 @@ export type StepSkipped<P, R, S, T> = {
   metadata?: StepMetadata;
 };
 
+export type StepCanceled<P, R, S, T> = {
+  status: 'canceled';
+  payload?: P;
+  resumePayload?: R;
+  suspendPayload?: S;
+  suspendOutput?: T;
+  output?: T;
+  startedAt?: number;
+  endedAt?: number;
+  metadata?: StepMetadata;
+};
+
 export type StepResult<P, R, S, T> =
   | StepSuccess<P, R, S, T>
   | StepFailure<P, R, S, T>
@@ -169,7 +183,8 @@ export type StepResult<P, R, S, T> =
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
   | StepPaused<P, R, S, T>
-  | StepSkipped<P, R, S, T>;
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 /**
  * Serialized version of StepFailure where error is a SerializedError
@@ -190,7 +205,8 @@ export type SerializedStepResult<P, R, S, T> =
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
   | StepPaused<P, R, S, T>
-  | StepSkipped<P, R, S, T>;
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 export type TimeTravelContext<P, R, S, T> = Record<
   string,
@@ -379,6 +395,13 @@ export type WorkflowStateField =
   | 'requestContext'
   | 'tracingContext';
 
+export interface NestedWorkflowParent {
+  workflowId: string;
+  runId: string;
+  stepId: string;
+  foreachIndex?: number;
+}
+
 export interface WorkflowRunState {
   // Core state info
   runId: string;
@@ -404,6 +427,29 @@ export interface WorkflowRunState {
    * as children of the original suspended span.
    */
   tracingContext?: WorkflowStateTracingContext;
+  parentWorkflow?: NestedWorkflowParent;
+}
+
+/**
+ * Info object passed to the onStart callback before a workflow run begins.
+ */
+export interface WorkflowStartCallbackInfo {
+  /** The unique workflow run ID */
+  runId: string;
+  /** The workflow identifier */
+  workflowId: string;
+  /** Resource/user identifier for multi-tenant scenarios (optional) */
+  resourceId?: string;
+  /** Function to get the initial workflow input data */
+  getInitData: () => any;
+  /** The Mastra instance (if registered) */
+  mastra?: Mastra;
+  /** The request context */
+  requestContext: RequestContext;
+  /** The Mastra logger for structured logging */
+  logger: IMastraLogger;
+  /** The initial workflow state */
+  state: Record<string, any>;
 }
 
 /**
@@ -470,19 +516,57 @@ export interface WorkflowErrorCallbackInfo {
   stepExecutionPath?: string[];
 }
 
+/**
+ * Predicate deciding whether a workflow run snapshot is persisted for a given
+ * status transition. Returning false skips the storage write entirely.
+ */
+export type ShouldPersistSnapshotFn = (params: {
+  stepResults: Record<string, StepResult<any, any, any, any>>;
+  workflowStatus: WorkflowRunStatus;
+}) => boolean;
+
 export interface WorkflowOptions {
   tracingPolicy?: TracingPolicy;
   validateInputs?: boolean;
+  /**
+   * Whether workflow step lifecycle events are emitted. Defaults to true.
+   * Internal workflows may disable these events when no consumer observes them.
+   */
+  emitStepEvents?: boolean;
   /**
    * When true, nested runs created by execute() share the parent's pubsub
    * instance instead of creating an isolated one. Used by durable agent
    * workflows so inner step events reach the outer subscriber.
    */
   sharePubsub?: boolean;
-  shouldPersistSnapshot?: (params: {
-    stepResults: Record<string, StepResult<any, any, any, any>>;
-    workflowStatus: WorkflowRunStatus;
-  }) => boolean;
+  /**
+   * Whether `Mastra.restartAllActiveWorkflowRuns()` (boot-time generic
+   * recovery) automatically restarts this workflow's active runs. Defaults to
+   * true. Set to false for workflows whose recovery is owned elsewhere or
+   * whose side effects must not be re-driven by a blanket restart — durable
+   * agent workflows set this to false because their recovery is owned by the
+   * dedicated opt-in path (`recovery.durableAgents: 'auto'`).
+   */
+  autoRestartActiveRuns?: boolean;
+  shouldPersistSnapshot?: ShouldPersistSnapshotFn;
+  /**
+   * Evaluates `shouldPersistSnapshot` before entering the durable operation so a
+   * false verdict does not consume a durable step.
+   *
+   * @internal Only enable this for framework-owned predicates that depend solely
+   * on serialized workflow state and are guaranteed deterministic across replay.
+   */
+  evaluatePersistencePredicateBeforeDurableOperation?: boolean;
+
+  /**
+   * Acknowledges that `resume()` calls for this workflow cannot be de-duplicated
+   * via the persisted resume claim (for example because `shouldPersistSnapshot`
+   * excludes the `running` status), and suppresses the per-resume warning.
+   *
+   * Set by internal workflows that intentionally trade resume de-duplication
+   * for reduced snapshot writes and serialize their own resumes.
+   */
+  allowUnclaimedResumes?: boolean;
 
   /**
    * Transforms the run snapshot immediately before it is persisted.
@@ -494,6 +578,20 @@ export interface WorkflowOptions {
    * read on resume (stale suspend payloads, duplicated message arrays).
    */
   pruneSnapshot?: (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
+
+  /**
+   * Called before a workflow run starts executing, and awaited.
+   * This callback is invoked server-side without requiring client-side .watch().
+   *
+   * Unlike `onFinish`/`onError`, errors thrown here are NOT swallowed: they reject
+   * the `start()`/`stream()` call and the run never executes, so the hook can act as
+   * a pre-flight gate (quota checks, entitlement checks). This mirrors how input
+   * schema validation failures behave: no step executes. The pending run record that
+   * `createRun()` already wrote is left as-is, so a gated run stays at `pending`.
+   *
+   * Fires only when a run first starts, not on resume, restart, or time travel.
+   */
+  onStart?: (info: WorkflowStartCallbackInfo) => Promise<void> | void;
 
   /**
    * Called when workflow execution completes (success, failed, suspended, or tripwire).
@@ -525,34 +623,160 @@ export type WorkflowInfo = {
   stepCount?: number;
   /** Whether this workflow is a processor workflow (auto-generated from agent processors) */
   isProcessorWorkflow?: boolean;
+  /**
+   * How this workflow got into the live registry. `'code'` for statically
+   * authored / `addWorkflow()`-added workflows, `'dynamic'` for anything
+   * hydrated or added via `addDynamicWorkflow()` (HTTP or SDK).
+   *
+   * Optional so external consumers of `WorkflowInfo` don't break; the server
+   * reads it from `workflow.origin`, which `rehydrateWorkflow` sets to
+   * `'dynamic'` at construction time (defaults to `'code'`).
+   */
+  origin?: 'code' | 'dynamic';
 };
 
 export type DefaultEngineType = {};
 
-export type StepFlowEntry<TEngineType = DefaultEngineType> =
+/**
+ * Object form of a `.map()` mapping config: a record of output keys to mapping
+ * sources (`value`, `fn`, `requestContextPath`, `step`+`path`, `initData`+`path`).
+ * Kept loose here because the precise per-key union lives in the `.map()` overload.
+ */
+export type MappingConfig = Record<string, any>;
+
+/**
+ * Optional identity and display metadata accepted by the control-flow builder
+ * methods (`.parallel()`, `.branch()`, `.dowhile()`, `.dountil()`, `.foreach()`,
+ * `.sleep()`, `.sleepUntil()`, `.map()`). Mirrors the `id` / `description` /
+ * `metadata` model that executable steps already have: `id` is a stable machine
+ * identity for addressing the entry across edits and serialization,
+ * `description` explains the intent of the control-flow operation, and
+ * `metadata` carries arbitrary JSON-serializable data (e.g. a display title
+ * for visual editors). None of these affect execution.
+ */
+export type StepFlowEntryOptions = {
+  id?: string;
+  description?: string;
+  metadata?: StepMetadata;
+};
+
+/**
+ * The "single step-like" graph entries: a plain user step plus the declarative
+ * variants that Mastra interprets at execution time (agent / tool / mapping).
+ *
+ * The live form carries runtime references (`agent`, `tool`, `mapConfig`,
+ * `options`) so the engine can materialize a runnable step on demand - mirroring
+ * how `loop` carries a live `condition`. These references are intentionally loose
+ * (`any`) because the public type-safety for these entries is enforced by the
+ * `Workflow` builder method overloads, not by this internal union.
+ */
+export type SerializableClassifierStepOptions = {
+  maxRetries?: number;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  retries?: number;
+  metadata?: StepMetadata;
+};
+
+export type SingleStepEntry<TEngineType = DefaultEngineType> =
   | { type: 'step'; step: Step }
-  | { type: 'sleep'; id: string; duration?: number; fn?: ExecuteFunction<any, any, any, any, any, TEngineType> }
-  | { type: 'sleepUntil'; id: string; date?: Date; fn?: ExecuteFunction<any, any, any, any, any, TEngineType> }
+  | { type: 'agent'; id: string; agentId: string; agent?: any; options?: any }
+  | { type: 'tool'; id: string; toolId: string; tool?: any; options?: any }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      classifier?: any;
+      options?: SerializableClassifierStepOptions;
+    }
+  | {
+      type: 'mapping';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      mapConfig: MappingConfig | ExecuteFunction<any, any, any, any, any, TEngineType>;
+    };
+
+/** The `{ type: 'step' }` variant of {@link SingleStepEntry}: a plain live step. */
+export type StepEntry = Extract<SingleStepEntry, { type: 'step' }>;
+/** The `{ type: 'agent' }` variant of {@link SingleStepEntry}. */
+export type AgentStepEntry = Extract<SingleStepEntry, { type: 'agent' }>;
+/** The `{ type: 'tool' }` variant of {@link SingleStepEntry}. */
+export type ToolStepEntry = Extract<SingleStepEntry, { type: 'tool' }>;
+/** The `{ type: 'classifier' }` variant of {@link SingleStepEntry}. */
+export type ClassifierStepEntry = Extract<SingleStepEntry, { type: 'classifier' }>;
+/** The `{ type: 'mapping' }` variant of {@link SingleStepEntry}. */
+export type MappingStepEntry<TEngineType = DefaultEngineType> = Extract<
+  SingleStepEntry<TEngineType>,
+  { type: 'mapping' }
+>;
+
+export type StepFlowEntry<TEngineType = DefaultEngineType> =
+  | SingleStepEntry<TEngineType>
+  | {
+      type: 'sleep';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      duration?: number;
+      fn?: ExecuteFunction<any, any, any, any, any, TEngineType>;
+    }
+  | {
+      type: 'sleepUntil';
+      id: string;
+      description?: string;
+      metadata?: StepMetadata;
+      date?: Date;
+      fn?: ExecuteFunction<any, any, any, any, any, TEngineType>;
+    }
   | {
       type: 'parallel';
-      steps: { type: 'step'; step: Step }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SingleStepEntry<TEngineType>[];
     }
   | {
       type: 'conditional';
-      steps: { type: 'step'; step: Step }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SingleStepEntry<TEngineType>[];
       conditions: ConditionFunction<any, any, any, any, any, TEngineType>[];
       serializedConditions: { id: string; fn: string }[];
+      /**
+       * Declarative predicates for each condition, aligned by index. Present
+       * for entries built via the `.branch({ predicate })` overload; absent
+       * for `.branch(fn)` closures. When present the entry is storable and
+       * round-trips through `toStorableGraph` / `rehydrateWorkflow`.
+       */
+      predicates?: (Predicate | null)[];
     }
   | {
+      // `loop` supports two condition forms: a closure (`.dowhile(fn)`, not
+      // storable) and a declarative predicate (`.dowhile({ predicate })`,
+      // storable). The live step shape is aligned with `parallel` / `foreach`
+      // so the builder can accept an Agent / Tool directly.
       type: 'loop';
-      step: Step;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SingleStepEntry<TEngineType>;
       condition: LoopConditionFunction<any, any, any, any, any, TEngineType>;
       serializedCondition: { id: string; fn: string };
       loopType: 'dowhile' | 'dountil';
+      /**
+       * Declarative predicate for the loop condition. Present when built via
+       * `.dowhile({ predicate })` / `.dountil({ predicate })`; absent for
+       * closure loops. Enables storage round-trip.
+       */
+      predicate?: Predicate;
     }
   | {
       type: 'foreach';
-      step: Step;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SingleStepEntry<TEngineType>;
       opts: ForeachOptions;
     };
 
@@ -592,48 +816,142 @@ export type SerializedStep<TEngineType = DefaultEngineType> = Pick<
   canSuspend?: boolean;
 };
 
-export type SerializedStepFlowEntry =
+/**
+ * JSON-safe mirror of {@link SingleStepEntry}: declarative variants carry
+ * ids/strings only (no closures or live references).
+ */
+/**
+ * JSON-safe subset of {@link AgentStepOptions} / tool step options carried on
+ * a serialized declarative entry. Closure-valued fields (`onFinish`, function
+ * `scorers`) don't round-trip and are rejected at `toStorableGraph` time.
+ */
+export type SerializedStepOptions = {
+  retries?: number;
+  metadata?: StepMetadata;
+};
+
+export type SerializedSingleStepEntry =
+  | { type: 'step'; step: SerializedStep }
   | {
-      type: 'step';
-      step: SerializedStep;
+      type: 'agent';
+      id: string;
+      agentId: string;
+      description?: string;
+      /**
+       * The step's output shape. When `.agent()` is called with
+       * `structuredOutput.schema`, that schema becomes the step output; this
+       * field captures it as JSON Schema so rehydration can reconstruct the
+       * same `structuredOutput` wiring. Absent means the step produces the
+       * default `{ text: string }`.
+       */
+      outputSchema?: Record<string, any>;
+      options?: SerializedStepOptions;
     }
+  | {
+      type: 'tool';
+      id: string;
+      toolId: string;
+      description?: string;
+      // No outputSchema: a tool's output shape lives on the tool itself and is
+      // looked up from the live Mastra instance at rehydration time.
+      options?: SerializedStepOptions;
+    }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      options?: SerializableClassifierStepOptions;
+    }
+  | { type: 'mapping'; id: string; description?: string; metadata?: StepMetadata; mapConfig: string }
+  /**
+   * A nested workflow referenced by its registered id (code-defined or
+   * another dynamic workflow). The referenced workflow must resolve on the
+   * live Mastra registry at rehydration time; missing refs fail loudly.
+   *
+   * `serializedStepFlow` is the nested workflow's full graph, inlined for
+   * Studio/API consumers (same role `SerializedStep.serializedStepFlow`
+   * played when nested workflows were emitted as `type: 'step'` +
+   * `component: 'WORKFLOW'`). Stored JSON definitions may omit it and keep
+   * only the id reference.
+   */
+  | {
+      type: 'workflow';
+      id: string;
+      workflowId: string;
+      description?: string;
+      serializedStepFlow?: SerializedStepFlowEntry[];
+    };
+
+export type SerializedStepFlowEntry =
+  | SerializedSingleStepEntry
   | {
       type: 'sleep';
       id: string;
+      description?: string;
+      metadata?: StepMetadata;
       duration?: number;
       fn?: string;
     }
   | {
       type: 'sleepUntil';
       id: string;
+      description?: string;
+      metadata?: StepMetadata;
       date?: Date;
       fn?: string;
     }
   | {
       type: 'parallel';
-      steps: {
-        type: 'step';
-        step: SerializedStep;
-      }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SerializedSingleStepEntry[];
     }
   | {
       type: 'conditional';
-      steps: {
-        type: 'step';
-        step: SerializedStep;
-      }[];
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      steps: SerializedSingleStepEntry[];
       serializedConditions: { id: string; fn: string }[];
+      /**
+       * Optional declarative predicate for each condition, aligned by index
+       * with `steps` / `serializedConditions`. When present, the entry is
+       * fully round-trippable through storage — the runtime rebuilds a live
+       * `ConditionFunction` by evaluating the predicate against the workflow
+       * context. When absent, the entry originated from a closure-based
+       * `.branch(fn)` call and cannot be stored (see `toStorableGraph`).
+       * Additive: never changes the shape of closure-based workflows.
+       */
+      predicates?: (Predicate | null)[];
     }
   | {
       type: 'loop';
-      step: SerializedStep;
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SerializedSingleStepEntry;
       serializedCondition: { id: string; fn: string };
       loopType: 'dowhile' | 'dountil';
+      /**
+       * Optional declarative predicate for the loop condition. When present,
+       * the entry is fully round-trippable through storage. When absent, the
+       * loop uses a closure predicate and cannot be stored. Additive.
+       */
+      predicate?: Predicate;
     }
   | {
       type: 'foreach';
-      step: SerializedStep;
-      opts: {
+      id?: string;
+      description?: string;
+      metadata?: StepMetadata;
+      step: SerializedSingleStepEntry;
+      /**
+       * Optional. When omitted, the engine defaults to `concurrency: 1`. Present
+       * when the foreach entry carries a static concurrency value or a
+       * serialized concurrency resolver function.
+       */
+      opts?: {
         /** Static concurrency. Omitted when a resolver function is used. */
         concurrency?: number;
         /** Source of the concurrency resolver function, when one is used. */
@@ -895,9 +1213,10 @@ export type WorkflowConfig<
   /** Type of workflow - 'processor' for processor workflows, 'default' otherwise */
   type?: WorkflowType;
   /**
-   * Optional cron schedule configuration. When set, the Mastra scheduler will
-   * publish a `workflow.start` event on the cron schedule.
-   * Only supported on the evented engine.
+   * Optional cron schedule configuration. When set, the Mastra scheduler
+   * starts a run on the cron schedule. Supported on the default and evented
+   * engines; other engines (Inngest, Temporal) ignore it and use their own
+   * scheduling.
    *
    * Accepts either a single schedule object or an array of schedule objects.
    * Array entries must each specify a unique stable `id`. The `inputData`,
@@ -989,6 +1308,7 @@ export type SubsetOf<TStepState, TState> =
 export type ExecutionContext = {
   workflowId: string;
   runId: string;
+  parentWorkflow?: NestedWorkflowParent;
   executionPath: number[];
   stepExecutionPath?: string[];
   activeStepsPath: Record<string, number[]>;
@@ -1043,7 +1363,8 @@ export type StepExecutionResult = {
   result: StepResult<any, any, any, any>;
   stepResults: Record<string, StepResult<any, any, any, any>>;
   mutableContext: MutableContext;
-  requestContext: Record<string, any>;
+  /** Serialized requestContext — only set by engines where `requiresDurableContextSerialization()` is true. */
+  requestContext?: Record<string, any>;
 };
 
 /**
@@ -1054,7 +1375,8 @@ export type EntryExecutionResult = {
   result: StepResult<any, any, any, any>;
   stepResults: Record<string, StepResult<any, any, any, any>>;
   mutableContext: MutableContext;
-  requestContext: Record<string, any>;
+  /** Serialized requestContext — only set by engines where `requiresDurableContextSerialization()` is true. */
+  requestContext?: Record<string, any>;
 };
 
 // =============================================================================

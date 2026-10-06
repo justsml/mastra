@@ -9,6 +9,7 @@ import type { ParsedRequestParams, ServerRoute } from '@mastra/server/server-ada
 import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
+  getCustomHTTPExceptionResponse,
   isZodError,
   normalizeQueryParams,
   redactStreamChunk,
@@ -136,6 +137,15 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
         }
         ctx.status = status;
         ctx.body = { error: error.message || 'Unknown error' };
+
+        // The route handler already logged this 501 at warn level. Skip the emit when only
+        // Koa's default listener would receive it, since that prints to console.error.
+        // Apps that register their own 'error' listeners still get the event.
+        const loggedAsWarning = status === 501 && (ctx as any)._mastraLoggedNotImplementedError === err;
+        const onlyDefaultListener = ctx.app.listeners('error').every(listener => listener === ctx.app.onerror);
+        if (loggedAsWarning && onlyDefaultListener) {
+          return;
+        }
 
         // Emit the error for logging (standard Koa pattern) but don't re-throw
         // since this middleware is the final error boundary.
@@ -335,7 +345,8 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
 
       ctx.params = {};
       registeredRoute.paramNames.forEach((name, index) => {
-        ctx.params[name] = match[index + 1];
+        const value = match[index + 1];
+        ctx.params[name] = value === undefined ? value : decodeURIComponent(value);
       });
 
       return registeredRoute;
@@ -407,7 +418,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       }
     }
 
-    if (params.body) {
+    if (params.body !== undefined || route.bodySchema) {
       try {
         params.body = await this.parseBody(route, params.body);
       } catch (error) {
@@ -504,15 +515,27 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
       const result = await route.handler(handlerParams);
       await this.sendResponse(route, ctx, result, prefix);
     } catch (error) {
-      const httpStatus = error && typeof error === 'object' && 'status' in error ? (error as any).status : undefined;
+      const httpStatus =
+        error && typeof error === 'object' ? ((error as any).status ?? (error as any).details?.status) : undefined;
       const isClientError = typeof httpStatus === 'number' && httpStatus >= 400 && httpStatus < 500;
       if (!isClientError) {
-        this.mastra.getLogger()?.error('Error calling handler', {
+        // 501 means an optional capability isn't provided by the configured storage or core: expected, not a server fault.
+        const logLevel = httpStatus === 501 ? 'warn' : 'error';
+        this.mastra.getLogger()?.[logLevel]('Error calling handler', {
           error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
           path: route.path,
           method: route.method,
         });
+        (ctx as any)._mastraLoggedNotImplementedError = httpStatus === 501 ? error : undefined;
       }
+      const customResponse = getCustomHTTPExceptionResponse(error);
+      if (customResponse) {
+        ctx.status = customResponse.status;
+        customResponse.headers.forEach((value, name) => ctx.set(name, value));
+        ctx.body = Buffer.from(await customResponse.arrayBuffer());
+        return;
+      }
+
       // Attach status code to the error for upstream middleware
       if (error && typeof error === 'object') {
         if (!('status' in error)) {
@@ -565,7 +588,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
     const reader = readableStream.getReader();
 
     ctx.res.on('close', () => {
-      void reader.cancel('request aborted');
+      void reader.cancel('request aborted').catch(() => {});
     });
 
     try {
@@ -740,7 +763,7 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
           this.mastra.getLogger()?.error('Error writing datastream response', {
             error: err instanceof Error ? { message: err.message, stack: err.stack } : err,
           });
-          void reader.cancel('response write error');
+          void reader.cancel('response write error').catch(() => {});
         };
         ctx.res.once('error', onResError);
 
@@ -876,10 +899,10 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
   }
 
   async registerCustomApiRoutes(): Promise<void> {
-    if (!(await this.buildCustomRouteHandler())) return;
+    const routes = await this.registerSchemaApiRoutes();
+    if (!(await this.buildCustomRouteHandler(routes))) return;
 
     const server = this;
-
     this.app.use(async function mastraCustomRouteDispatcher(ctx: Context, next: Next) {
       // Check if this request matches a protected custom route and run auth
       const path = String(ctx.path || '/');
@@ -1002,6 +1025,14 @@ export class MastraServer extends MastraServerBase<Koa, Context, Context> {
 
   registerContextMiddleware(): void {
     this.app.use(this.createContextMiddleware());
+    this.app.use(async (ctx: Context, next: Next) => {
+      const path = String(ctx.path || '/');
+      const method = String(ctx.method || 'GET');
+      ctx.res.once('finish', () => {
+        this.warnIfUnregisteredChannelWebhook(path, method, ctx.res.statusCode);
+      });
+      await next();
+    });
   }
 
   registerAuthMiddleware(): void {

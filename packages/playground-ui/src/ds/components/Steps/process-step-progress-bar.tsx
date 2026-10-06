@@ -19,18 +19,18 @@ export function ProcessStepProgressBar({ steps }: ProcessStepProgressBarProps) {
             <div
               key={step.id}
               className={cn('relative flex h-8 items-center justify-end', transitions.colors, {
-                'bg-accent1Dark': step.status === 'success' && steps?.[idx - 1]?.status === 'success',
+                'bg-success-subtle': step.status === 'success' && steps?.[idx - 1]?.status === 'success',
               })}
             >
               <div
                 className={cn(
-                  'absolute right-0 z-10 flex size-[2rem] translate-x-[50%] items-center justify-center self-center rounded-full bg-surface3 text-ui-sm font-bold text-neutral3',
-                  transitions.all,
+                  'absolute right-0 z-10 flex size-8 translate-x-1/2 items-center justify-center self-center rounded-full bg-fill text-column text-muted-foreground motion-reduce:transition-none',
+                  transitions.colors,
+                  transitions.transform,
                   {
-                    'border border-neutral2 border-dashed': step.status === 'pending',
-                    '[&>svg]:text-surface1 [&>svg]:w-[1.1rem] [&>svg]:h-[1.1rem]': step.status !== 'running',
-                    'bg-accent1Dark text-white shadow-glow-accent1 scale-110': step.status === 'success',
-                    'bg-accent2Dark text-white shadow-glow-accent2 scale-110': step.status === 'failed',
+                    'border border-dashed border-placeholder': step.status === 'pending',
+                    'scale-110 bg-success-subtle text-success-subtle-foreground': step.status === 'success',
+                    'scale-110 bg-destructive-subtle text-destructive-subtle-foreground': step.status === 'failed',
                   },
                 )}
               >
@@ -40,7 +40,7 @@ export function ProcessStepProgressBar({ steps }: ProcessStepProgressBarProps) {
           );
         })}
       </div>
-      <div className={cn('text-center text-xs text-neutral3', transitions.colors)}>
+      <div className={cn('text-center text-caption text-muted-foreground', transitions.colors)}>
         {completedSteps} of {totalSteps} steps completed
       </div>
     </div>

@@ -8,9 +8,9 @@ const meta: Meta<typeof Kbd> = {
     layout: 'centered',
   },
   argTypes: {
-    theme: {
+    size: {
       control: { type: 'select' },
-      options: ['light', 'dark'],
+      options: ['default', 'sm', 'xs'],
     },
   },
 };
@@ -21,22 +21,17 @@ type Story = StoryObj<typeof Kbd>;
 export const Default: Story = {
   args: {
     children: 'K',
-    theme: 'dark',
   },
 };
 
-export const Light: Story = {
-  args: {
-    children: 'K',
-    theme: 'light',
-  },
-};
-
-export const Dark: Story = {
-  args: {
-    children: 'K',
-    theme: 'dark',
-  },
+export const Sizes: Story = {
+  render: () => (
+    <div className="flex items-center gap-2">
+      <Kbd size="default">K</Kbd>
+      <Kbd size="sm">K</Kbd>
+      <Kbd size="xs">K</Kbd>
+    </div>
+  ),
 };
 
 export const ModifierKey: Story = {
@@ -49,7 +44,7 @@ export const KeyCombination: Story = {
   render: () => (
     <div className="flex items-center gap-1">
       <Kbd>Ctrl</Kbd>
-      <span className="text-neutral3">+</span>
+      <span className="text-muted-foreground">+</span>
       <Kbd>K</Kbd>
     </div>
   ),
@@ -61,26 +56,26 @@ export const CommonShortcuts: Story = {
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1">
           <Kbd>Ctrl</Kbd>
-          <span className="text-neutral3">+</span>
+          <span className="text-muted-foreground">+</span>
           <Kbd>C</Kbd>
         </div>
-        <span className="text-neutral5">Copy</span>
+        <span className="text-foreground">Copy</span>
       </div>
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1">
           <Kbd>Ctrl</Kbd>
-          <span className="text-neutral3">+</span>
+          <span className="text-muted-foreground">+</span>
           <Kbd>V</Kbd>
         </div>
-        <span className="text-neutral5">Paste</span>
+        <span className="text-foreground">Paste</span>
       </div>
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1">
           <Kbd>Ctrl</Kbd>
-          <span className="text-neutral3">+</span>
+          <span className="text-muted-foreground">+</span>
           <Kbd>Z</Kbd>
         </div>
-        <span className="text-neutral5">Undo</span>
+        <span className="text-foreground">Undo</span>
       </div>
     </div>
   ),

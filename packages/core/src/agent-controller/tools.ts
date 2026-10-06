@@ -2,6 +2,7 @@ import { z } from 'zod/v4';
 
 import { Agent } from '../agent';
 import type { ToolsInput, ToolsetsInput } from '../agent/types';
+import { CHAT_CHANNEL_RENDER_CONTEXT_KEY } from '../channels/output-processor';
 import type { MastraModelConfig } from '../llm/model/shared.types';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
@@ -68,7 +69,7 @@ export { TaskStateProcessor } from '../tools/builtin/task-state-processor';
 
 export interface CreateSubagentToolOptions {
   subagents: AgentControllerSubagent[];
-  resolveModel: (modelId: string) => MastraModelConfig;
+  resolveModel: (modelId: string, options: { requestContext?: RequestContext }) => MastraModelConfig;
   /** Resolved controller tools (already evaluated from DynamicArgument) */
   controllerTools?: ToolsInput;
   /** Fallback model ID when subagent definition has no defaultModelId */
@@ -90,6 +91,8 @@ export interface CreateSubagentToolOptions {
     sourceThreadId: string;
     resourceId?: string;
     title?: string;
+    /** The parent run's context, so a dynamic memory resolves for the run's user. */
+    requestContext?: RequestContext;
   }) => Promise<{ id: string; resourceId: string }>;
   /**
    * Resolves the toolsets the parent agent runs with for the current request.
@@ -114,6 +117,10 @@ export interface CreateSubagentToolOptions {
  */
 export function createSubagentTool(opts: CreateSubagentToolOptions) {
   const { subagents, resolveModel, controllerTools, fallbackModelId, mastra } = opts;
+
+  if (subagents.length === 0) {
+    throw new Error('createSubagentTool requires at least one subagent');
+  }
 
   const subagentIds = subagents.map(s => s.id);
 
@@ -227,6 +234,7 @@ Use this tool when:
             sourceThreadId: parentThreadId,
             resourceId: controllerCtx?.resourceId,
             title: `Fork: ${definition.name} subagent`,
+            requestContext: context?.requestContext,
           });
         } catch (err) {
           return {
@@ -258,6 +266,11 @@ Use this tool when:
               resourceId: forkedThread.resourceId,
             });
           }
+          // The fork runs on the channel-bearing parent agent instance, so the
+          // ChatChannelOutputProcessor is attached. Clear the inherited render
+          // key so the subagent's stream never renders back to the chat
+          // platform — without this the fork would post to Slack.
+          subagentRequestContext.delete(CHAT_CHANNEL_RENDER_CONTEXT_KEY);
         }
 
         // Inherit the parent's toolsets with the fork request context so tools that
@@ -301,9 +314,27 @@ Use this tool when:
         }
         resolvedModelId = maybeModelId;
 
+        // Build a request context for the subagent that inherits sandbox paths
+        // and controller state but strips threadId/resourceId so the subagent
+        // doesn't trigger OM enrichment on the parent's memory thread. Model
+        // resolution uses it too, so the parent's thread identity never reaches
+        // the subagent's model endpoint. This subagent runs on a fresh Agent
+        // with no channels, so no output processor attaches and it never
+        // renders to the chat platform.
+        if (context?.requestContext) {
+          subagentRequestContext = new RequestContext(context.requestContext.entries());
+          if (controllerCtx) {
+            subagentRequestContext.set('controller', {
+              ...controllerCtx,
+              threadId: null,
+              resourceId: '',
+            });
+          }
+        }
+
         let model: MastraModelConfig;
         try {
-          model = resolveModel(resolvedModelId);
+          model = resolveModel(resolvedModelId, { requestContext: subagentRequestContext });
         } catch (err) {
           return {
             content: `Failed to resolve model "${resolvedModelId}": ${err instanceof Error ? err.message : String(err)}`,
@@ -342,19 +373,9 @@ Use this tool when:
         streamPrepareStep =
           allowedWs && allWorkspaceToolNames
             ? ({ tools }) => ({
-                activeTools: Object.keys(tools ?? {}).filter(k => !allWorkspaceToolNames.has(k) || allowedWs!.has(k)),
+                activeTools: Object.keys(tools ?? {}).filter(k => !allWorkspaceToolNames.has(k) || allowedWs.has(k)),
               })
             : undefined;
-
-        // Build a request context for the subagent that inherits sandbox paths
-        // and controller state but strips threadId/resourceId so the subagent
-        // doesn't trigger OM enrichment on the parent's memory thread.
-        if (context?.requestContext) {
-          subagentRequestContext = new RequestContext(context.requestContext.entries());
-          if (controllerCtx) {
-            subagentRequestContext.set('controller', { ...controllerCtx, threadId: null, resourceId: '' });
-          }
-        }
       }
 
       const startTime = Date.now();

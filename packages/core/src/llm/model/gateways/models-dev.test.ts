@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { MASTRA_USER_AGENT } from './constants.js';
 import { ModelsDevGateway } from './models-dev.js';
 
 const {
@@ -18,6 +19,7 @@ const {
   createTogetherAIMock,
   createXaiMock,
   openAIResponsesMock,
+  xAIResponsesMock,
 } = vi.hoisted(() => ({
   callableModelMock: vi.fn(),
   chatModelMock: vi.fn(),
@@ -35,12 +37,13 @@ const {
   createTogetherAIMock: vi.fn(),
   createXaiMock: vi.fn(),
   openAIResponsesMock: vi.fn(),
+  xAIResponsesMock: vi.fn(),
 }));
 
 vi.mock('@ai-sdk/anthropic-v6', () => ({ createAnthropic: createAnthropicMock }));
 vi.mock('@ai-sdk/cerebras-v6', () => ({ createCerebras: createCerebrasMock }));
 vi.mock('@ai-sdk/deepinfra-v6', () => ({ createDeepInfra: createDeepInfraMock }));
-vi.mock('@ai-sdk/deepseek-v6', () => ({ createDeepSeek: createDeepSeekMock }));
+vi.mock('@ai-sdk/deepseek-v7', () => ({ createDeepSeek: createDeepSeekMock }));
 vi.mock('@ai-sdk/google-v6', () => ({ createGoogleGenerativeAI: createGoogleGenerativeAIMock }));
 vi.mock('@ai-sdk/groq-v6', () => ({ createGroq: createGroqMock }));
 vi.mock('@ai-sdk/mistral-v6', () => ({ createMistral: createMistralMock }));
@@ -75,8 +78,9 @@ describe('ModelsDevGateway', () => {
     createOpenRouterMock.mockReturnValue(callableModelMock);
     createPerplexityMock.mockReturnValue(callableModelMock);
     createTogetherAIMock.mockReturnValue(callableModelMock);
-    createXaiMock.mockReturnValue(callableModelMock);
+    createXaiMock.mockReturnValue({ responses: xAIResponsesMock });
     openAIResponsesMock.mockReturnValue({ provider: 'openai' });
+    xAIResponsesMock.mockReturnValue({ provider: 'xai' });
   });
 
   afterEach(() => {
@@ -263,7 +267,7 @@ describe('ModelsDevGateway', () => {
       expect(providers['example-provider'].apiKeyEnvVar).toBe('EXAMPLE_API_TOKEN');
     });
 
-    it('should filter out deprecated models', async () => {
+    it('should keep deprecated models and report them separately', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
@@ -286,12 +290,14 @@ describe('ModelsDevGateway', () => {
 
       const providers = await gateway.fetchProviders();
 
+      // Deprecated upstream means "still served, scheduled for retirement", so the
+      // model stays selectable and keeps type-checking for users already on it.
       expect(providers.groq).toBeDefined();
-      expect(providers.groq.models).toEqual(['llama-3.1-8b']);
-      expect(providers.groq.models).not.toContain('deepseek-r1-distill-llama-70b');
+      expect(providers.groq.models).toEqual(['deepseek-r1-distill-llama-70b', 'llama-3.1-8b']);
+      expect(providers.groq.deprecatedModels).toEqual(['deepseek-r1-distill-llama-70b']);
     });
 
-    it('should return empty models array when all models are deprecated', async () => {
+    it('should omit deprecatedModels when nothing is deprecated', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
@@ -299,8 +305,7 @@ describe('ModelsDevGateway', () => {
             id: 'groq',
             name: 'Groq',
             models: {
-              'model-1': { name: 'Model 1', status: 'deprecated' },
-              'model-2': { name: 'Model 2', status: 'deprecated' },
+              'llama-3.1-8b': { name: 'Llama 3.1 8B' },
             },
             env: ['GROQ_API_KEY'],
             api: 'https://api.groq.com/openai/v1',
@@ -311,8 +316,46 @@ describe('ModelsDevGateway', () => {
 
       const providers = await gateway.fetchProviders();
 
-      expect(providers.groq).toBeDefined();
-      expect(providers.groq.models).toEqual([]);
+      expect(providers.groq.models).toEqual(['llama-3.1-8b']);
+      expect(providers.groq.deprecatedModels).toBeUndefined();
+    });
+
+    it('should retain capabilities and per-model overrides for deprecated models', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          groq: {
+            id: 'groq',
+            name: 'Groq',
+            models: {
+              'legacy-model': {
+                name: 'Legacy Model',
+                status: 'deprecated',
+                attachment: true,
+                temperature: true,
+                structured_output: true,
+                provider: { api: 'https://api.groq.com/openai/v1/responses', shape: 'responses' },
+              },
+            },
+            env: ['GROQ_API_KEY'],
+            api: 'https://api.groq.com/openai/v1',
+            npm: '@ai-sdk/openai-compatible',
+          },
+        }),
+      });
+
+      const providers = await gateway.fetchProviders();
+
+      // A deprecated model still runs, so it must keep the routing and capability
+      // data required to call it correctly.
+      expect(providers.groq.modelOverrides?.['legacy-model']).toEqual({
+        api: 'https://api.groq.com/openai/v1/responses',
+        shape: 'responses',
+        npm: undefined,
+      });
+      expect(gateway.getAttachmentCapabilities().groq).toContain('legacy-model');
+      expect(gateway.getTemperatureCapabilities().groq).toContain('legacy-model');
+      expect(gateway.getStructuredOutputCapabilities().groq).toContain('legacy-model');
     });
 
     it('should extract model IDs from each provider', async () => {
@@ -436,6 +479,50 @@ describe('ModelsDevGateway', () => {
     });
   });
 
+  describe('buildUrl without a registry url template', () => {
+    const makeGateway = () =>
+      new ModelsDevGateway({
+        google: {
+          apiKeyEnvVar: 'GOOGLE_GENERATIVE_AI_API_KEY',
+          name: 'Google',
+          models: ['gemini-2.5-flash'],
+          gateway: 'models.dev',
+        },
+        'my-provider': {
+          apiKeyEnvVar: 'MY_PROVIDER_API_KEY',
+          name: 'My Provider',
+          models: ['m'],
+          gateway: 'models.dev',
+        },
+      });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('returns undefined when no override is set', () => {
+      vi.stubEnv('GOOGLE_BASE_URL', '');
+      expect(makeGateway().buildUrl('google/gemini-2.5-flash', {})).toBeUndefined();
+    });
+
+    it('honors <PROVIDER>_BASE_URL passed via envVars', () => {
+      expect(
+        makeGateway().buildUrl('google/gemini-2.5-flash', { GOOGLE_BASE_URL: 'https://proxy.example/google' }),
+      ).toBe('https://proxy.example/google');
+    });
+
+    it('honors <PROVIDER>_BASE_URL from process.env', () => {
+      vi.stubEnv('GOOGLE_BASE_URL', 'https://proxy.example/google');
+      expect(makeGateway().buildUrl('google/gemini-2.5-flash')).toBe('https://proxy.example/google');
+    });
+
+    it('maps hyphenated provider ids to underscore env var names', () => {
+      expect(makeGateway().buildUrl('my-provider/m', { MY_PROVIDER_BASE_URL: 'https://proxy.example/mine' })).toBe(
+        'https://proxy.example/mine',
+      );
+    });
+  });
+
   describe('resolveLanguageModel', () => {
     it.each([
       {
@@ -475,7 +562,7 @@ describe('ModelsDevGateway', () => {
         modelInvoker: callableModelMock,
         model: { provider: 'callable' },
       },
-      { providerId: 'xai', factory: createXaiMock, modelInvoker: callableModelMock, model: { provider: 'callable' } },
+      { providerId: 'xai', factory: createXaiMock, modelInvoker: xAIResponsesMock, model: { provider: 'xai' } },
       {
         providerId: 'deepseek',
         factory: createDeepSeekMock,
@@ -531,20 +618,96 @@ describe('ModelsDevGateway', () => {
           providerId,
           modelId: 'test-model',
           apiKey: 'sk-test',
-          headers: { 'x-test': 'true' },
+          headers: { 'x-test': 'true', ...(providerId === 'perplexity' ? { 'x-pplx-integration': 'custom' } : {}) },
         });
 
         expect(result).toEqual(model);
         expect(factory).toHaveBeenCalledWith({
           apiKey: 'sk-test',
           baseURL: `https://custom.${providerId}.proxy/v1`,
-          headers: expect.objectContaining({
+          headers: {
+            'User-Agent': expect.any(String),
             'x-test': 'true',
-          }),
+            ...(providerId === 'perplexity' ? { 'x-pplx-integration': 'custom' } : {}),
+          },
         });
         expect(modelInvoker).toHaveBeenCalledWith('test-model');
       },
     );
+
+    it('adds Perplexity integration attribution by default', async () => {
+      gateway = new ModelsDevGateway({
+        perplexity: {
+          apiKeyEnvVar: 'PERPLEXITY_API_KEY',
+          name: 'perplexity',
+          models: ['test-model'],
+          gateway: 'models.dev',
+          url: 'https://api.perplexity.ai',
+        },
+      });
+      vi.stubEnv('PERPLEXITY_BASE_URL', 'https://custom.perplexity.proxy/v1');
+
+      await gateway.resolveLanguageModel({
+        providerId: 'perplexity',
+        modelId: 'test-model',
+        apiKey: 'sk-test',
+      });
+
+      expect(createPerplexityMock).toHaveBeenCalledWith({
+        apiKey: 'sk-test',
+        baseURL: 'https://custom.perplexity.proxy/v1',
+        headers: {
+          'User-Agent': expect.any(String),
+          'X-Pplx-Integration': MASTRA_USER_AGENT,
+        },
+      });
+    });
+
+    it('routes xAI models through the Responses API', async () => {
+      gateway = new ModelsDevGateway({
+        xai: {
+          apiKeyEnvVar: 'XAI_API_KEY',
+          name: 'xAI',
+          models: ['grok-4.3'],
+          gateway: 'models.dev',
+          url: 'https://api.x.ai/v1',
+        },
+      });
+
+      const result = await gateway.resolveLanguageModel({
+        providerId: 'xai',
+        modelId: 'grok-4.3',
+        apiKey: 'xai-test',
+        headers: { 'x-test': 'true' },
+      });
+
+      expect(result).toEqual({ provider: 'xai' });
+      expect(createXaiMock).toHaveBeenCalledWith({
+        apiKey: 'xai-test',
+        baseURL: 'https://api.x.ai/v1',
+        headers: expect.objectContaining({ 'x-test': 'true' }),
+      });
+      expect(xAIResponsesMock).toHaveBeenCalledWith('grok-4.3');
+      expect(callableModelMock).not.toHaveBeenCalledWith('grok-4.3');
+    });
+
+    it('passes XAI_BASE_URL as baseURL when the provider has no registry url template', async () => {
+      gateway = new ModelsDevGateway({
+        xai: {
+          apiKeyEnvVar: 'XAI_API_KEY',
+          name: 'xAI',
+          models: ['grok-4'],
+          gateway: 'models.dev',
+        },
+      });
+      vi.stubEnv('XAI_BASE_URL', 'https://proxy.example/xai');
+
+      await gateway.resolveLanguageModel({ providerId: 'xai', modelId: 'grok-4', apiKey: 'xai-test' });
+
+      expect(createXaiMock).toHaveBeenCalledWith(
+        expect.objectContaining({ apiKey: 'xai-test', baseURL: 'https://proxy.example/xai' }),
+      );
+    });
   });
 
   describe('per-model provider overrides', () => {

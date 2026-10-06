@@ -26,6 +26,7 @@ import {
   isWorkflowExecutionDataChunkType,
   safeParseErrorObject,
   isMastraTextStreamChunk,
+  toUIDataChunk,
 } from './utils';
 
 type LanguageModelV2Usage = {
@@ -70,11 +71,7 @@ export type WorkflowDataPart = {
     status: WorkflowRunStatus;
     steps: Record<string, StepResult>;
     output: {
-      usage: {
-        inputTokens: number;
-        outputTokens: number;
-        totalTokens: number;
-      };
+      usage: LanguageModelV2Usage;
     } | null;
   };
 };
@@ -102,14 +99,73 @@ export type NetworkDataPart = {
   };
 };
 
+/**
+ * A tool call that threw inside a nested agent, normalized to a JSON-safe shape.
+ *
+ * The raw `tool-error` payload's `error` field is a live `Error` on the non-durable
+ * path but a plain `{ name, message, stack }` on the durable path, and
+ * `JSON.stringify(new Error(...))` yields `"{}"` — so an `Error` would reach a host
+ * as an empty object over SSE. Both shapes are flattened to `errorText` with
+ * `safeParseErrorObject`, the same helper the non-nested path uses to build its
+ * `tool-output-error` chunk.
+ */
+export type AgentToolError = {
+  toolCallId: string;
+  toolName: string;
+  args?: Record<string, unknown>;
+  /** JSON-safe rendering of the failure. */
+  errorText: string;
+  providerExecuted?: boolean;
+};
+
+/**
+ * `data-tool-agent` payload. Widens `LLMStepResult` with the Mastra-only fields this
+ * transform emits; `status` is likewise emitted at runtime but is not part of the
+ * AI SDK step shape.
+ */
+export type AgentRunSnapshot = LLMStepResult & {
+  toolErrors?: AgentToolError[];
+};
+
+export type AgentStreamAncestryEntry = {
+  toolCallId: string;
+  toolName?: string;
+  agentId?: string;
+};
+
+type AgentStreamAncestryMetadata = {
+  ancestry: AgentStreamAncestryEntry[];
+  depth: number;
+  parentAgentId?: string;
+};
+
 export type AgentDataPart = {
   type: 'data-tool-agent';
   id: string;
-  data: LLMStepResult;
+  data: AgentRunSnapshot;
 };
+
+export type AgentStepDataPart = {
+  type: 'data-tool-agent-step';
+  id: string;
+  data: {
+    runId: string;
+    stepIndex: number;
+    step: AgentRunSnapshot;
+  };
+};
+
+export type AgentDataPartWithAncestry = AgentDataPart & AgentStreamAncestryMetadata;
+export type AgentStepDataPartWithAncestry = AgentStepDataPart & AgentStreamAncestryMetadata;
+
+type TransformAgentResult =
+  | AgentDataPartWithAncestry
+  | readonly [AgentDataPartWithAncestry, AgentStepDataPartWithAncestry];
 
 // used so it's not serialized to JSON
 const PRIMITIVE_CACHE_SYMBOL = Symbol('primitive-cache');
+// persists completed-step details on the network step across subsequent events
+const COMPLETED_STEPS_SYMBOL = Symbol('completed-steps-cache');
 
 type ConvertMastraChunkToAISDK = <OUTPUT>(args: { chunk: ChunkType<OUTPUT>; mode?: 'generate' | 'stream' }) => any;
 
@@ -278,6 +334,7 @@ export function createAgentNetworkToAISDKTransformer<UI_CHUNK>() {
         task: null | Record<string, unknown>;
         input: StepResult['input'];
         [PRIMITIVE_CACHE_SYMBOL]: Map<string, any>;
+        [COMPLETED_STEPS_SYMBOL]?: Map<number, Record<string, any>>;
       })[];
       usage: LanguageModelV2Usage | null;
       output: unknown | null;
@@ -338,6 +395,7 @@ export function createAgentStreamToAISDKTransformer<OUTPUT>(
     sendSources,
     messageMetadata,
     onError,
+    includeSubAgentMetadata = false,
   }: {
     lastMessageId?: string;
     sendStart?: boolean;
@@ -346,96 +404,159 @@ export function createAgentStreamToAISDKTransformer<OUTPUT>(
     sendSources?: boolean;
     messageMetadata?: (args: { part: any }) => unknown;
     onError?: (error: unknown) => string;
+    includeSubAgentMetadata?: boolean;
   },
 ) {
   let bufferedSteps = new Map<string, any>();
   let tripwireOccurred = false;
   let finishEventSent = false;
+  // Processors can rotate the response message id before the first model step
+  // (e.g. observational memory). Hold `start` (and any preceding `data-*`
+  // chunks) until the first `step-start` so the announced id matches the id
+  // the response is actually persisted under. With `sendStart: false` no
+  // `start` UI chunk is emitted at all, so nothing is held.
+  let heldChunks: ChunkType<OUTPUT>[] | null = null;
+  let startIdResolved = false;
+
+  const processChunk = (chunk: ChunkType<OUTPUT>, controller: TransformStreamDefaultController<object>) => {
+    if (chunk.type === 'tripwire') {
+      tripwireOccurred = true;
+    }
+
+    if (chunk.type === 'finish') {
+      finishEventSent = true;
+    }
+
+    if (chunk.type === 'object-result') {
+      controller.enqueue({
+        type: 'data-structured-output',
+        data: {
+          object: chunk.object,
+        },
+      });
+    }
+
+    const part = convertMastraChunkToAISDK({ chunk, mode: 'stream' });
+
+    const enqueueTransformedPart = (p: any) => {
+      const transformedChunk = convertFullStreamChunkToUIMessageStream<any>({
+        part: p as any,
+        sendReasoning,
+        sendSources,
+        messageMetadataValue: p ? messageMetadata?.({ part: p as TextStreamPart<ToolSet> }) : undefined,
+        sendStart,
+        sendFinish,
+        responseMessageId: lastMessageId,
+        onError(error) {
+          return onError ? onError(error) : safeParseErrorObject(error);
+        },
+      });
+
+      if (transformedChunk) {
+        if (transformedChunk.type === 'tool-agent') {
+          if (!includeSubAgentMetadata) {
+            return;
+          }
+          const { payload, ancestry } = transformedChunk;
+          const agentTransformed = transformAgent<OUTPUT>(payload, bufferedSteps, ancestry);
+          if (agentTransformed) {
+            if (Array.isArray(agentTransformed)) {
+              for (const part of agentTransformed) {
+                controller.enqueue(part);
+              }
+            } else {
+              controller.enqueue(agentTransformed);
+            }
+          }
+        } else if (transformedChunk.type === 'tool-workflow') {
+          const payload = transformedChunk.payload;
+          const workflowChunk = transformWorkflow(
+            payload,
+            bufferedSteps,
+            true,
+            undefined,
+            undefined,
+            convertMastraChunkToAISDK,
+          );
+          if (workflowChunk) {
+            if (Array.isArray(workflowChunk)) {
+              for (const item of workflowChunk) {
+                controller.enqueue(item);
+              }
+            } else {
+              controller.enqueue(workflowChunk);
+            }
+          }
+        } else if (transformedChunk.type === 'tool-network') {
+          const payload = transformedChunk.payload;
+          const networkChunk = transformNetwork(payload, bufferedSteps, true);
+          if (Array.isArray(networkChunk)) {
+            for (const c of networkChunk) {
+              if (c) controller.enqueue(c);
+            }
+          } else if (networkChunk) {
+            controller.enqueue(networkChunk);
+          }
+        } else {
+          controller.enqueue(transformedChunk as any);
+        }
+      }
+    };
+
+    if (Array.isArray(part)) {
+      for (const p of part) {
+        enqueueTransformedPart(p);
+      }
+    } else {
+      enqueueTransformedPart(part);
+    }
+  };
 
   return new TransformStream<ChunkType<OUTPUT>, object>({
     transform(chunk, controller) {
-      if (chunk.type === 'tripwire') {
-        tripwireOccurred = true;
-      }
-
-      if (chunk.type === 'finish') {
-        finishEventSent = true;
-      }
-
-      if (chunk.type === 'object-result') {
-        controller.enqueue({
-          type: 'data-structured-output',
-          data: {
-            object: chunk.object,
-          },
-        });
-      }
-
-      const part = convertMastraChunkToAISDK({ chunk, mode: 'stream' });
-
-      const enqueueTransformedPart = (p: any) => {
-        const transformedChunk = convertFullStreamChunkToUIMessageStream<any>({
-          part: p as any,
-          sendReasoning,
-          sendSources,
-          messageMetadataValue: p ? messageMetadata?.({ part: p as TextStreamPart<ToolSet> }) : undefined,
-          sendStart,
-          sendFinish,
-          responseMessageId: lastMessageId,
-          onError(error) {
-            return onError ? onError(error) : safeParseErrorObject(error);
-          },
-        });
-
-        if (transformedChunk) {
-          if (transformedChunk.type === 'tool-agent') {
-            const payload = transformedChunk.payload;
-            const agentTransformed = transformAgent<OUTPUT>(payload, bufferedSteps);
-            if (agentTransformed) controller.enqueue(agentTransformed);
-          } else if (transformedChunk.type === 'tool-workflow') {
-            const payload = transformedChunk.payload;
-            const workflowChunk = transformWorkflow(
-              payload,
-              bufferedSteps,
-              true,
-              undefined,
-              undefined,
-              convertMastraChunkToAISDK,
-            );
-            if (workflowChunk) {
-              if (Array.isArray(workflowChunk)) {
-                for (const item of workflowChunk) {
-                  controller.enqueue(item);
-                }
-              } else {
-                controller.enqueue(workflowChunk);
-              }
-            }
-          } else if (transformedChunk.type === 'tool-network') {
-            const payload = transformedChunk.payload;
-            const networkChunk = transformNetwork(payload, bufferedSteps, true);
-            if (Array.isArray(networkChunk)) {
-              for (const c of networkChunk) {
-                if (c) controller.enqueue(c);
-              }
-            } else if (networkChunk) {
-              controller.enqueue(networkChunk);
-            }
-          } else {
-            controller.enqueue(transformedChunk as any);
+      if (!startIdResolved) {
+        if (sendStart && chunk.type === 'start') {
+          heldChunks = [chunk];
+          return;
+        }
+        if (heldChunks) {
+          if (typeof chunk.type === 'string' && chunk.type.startsWith('data-')) {
+            heldChunks.push(chunk);
+            return;
           }
+          startIdResolved = true;
+          const held = heldChunks;
+          heldChunks = null;
+          if (chunk.type === 'step-start') {
+            // held[0] is the run-level `start` chunk (the only chunk type that opens the hold).
+            const startPayload = (held[0] as { payload?: { messageId?: unknown } } | undefined)?.payload;
+            const stepMessageId = (chunk.payload as { messageId?: unknown } | undefined)?.messageId;
+            // Durable streams emit `start` without an id — leave those untouched.
+            if (
+              held[0] &&
+              typeof stepMessageId === 'string' &&
+              typeof startPayload?.messageId === 'string' &&
+              stepMessageId !== startPayload.messageId
+            ) {
+              held[0] = { ...held[0], payload: { ...startPayload, messageId: stepMessageId } } as ChunkType<OUTPUT>;
+            }
+          }
+          for (const heldChunk of held) {
+            processChunk(heldChunk, controller);
+          }
+        } else {
+          startIdResolved = true;
         }
-      };
-
-      if (Array.isArray(part)) {
-        for (const p of part) {
-          enqueueTransformedPart(p);
-        }
-      } else {
-        enqueueTransformedPart(part);
       }
+      processChunk(chunk, controller);
     },
     flush(controller) {
+      if (heldChunks) {
+        for (const heldChunk of heldChunks) {
+          processChunk(heldChunk, controller);
+        }
+        heldChunks = null;
+      }
       if (tripwireOccurred && !finishEventSent && sendFinish) {
         controller.enqueue({
           type: 'finish',
@@ -454,6 +575,7 @@ export function AgentStreamToAISDKTransformer<OUTPUT>({
   sendSources,
   messageMetadata,
   onError,
+  includeSubAgentMetadata = false,
 }: {
   lastMessageId?: string;
   sendStart?: boolean;
@@ -462,6 +584,7 @@ export function AgentStreamToAISDKTransformer<OUTPUT>({
   sendSources?: boolean;
   messageMetadata?: UIMessageStreamOptions<UIMessage>['messageMetadata'];
   onError?: UIMessageStreamOptions<UIMessage>['onError'];
+  includeSubAgentMetadata?: boolean;
 }) {
   return createAgentStreamToAISDKTransformer<OUTPUT>(convertMastraChunkToAISDKv5, {
     lastMessageId,
@@ -471,6 +594,7 @@ export function AgentStreamToAISDKTransformer<OUTPUT>({
     sendSources,
     messageMetadata,
     onError,
+    includeSubAgentMetadata,
   });
 }
 
@@ -482,6 +606,7 @@ export function AgentStreamToAISDKV6Transformer<OUTPUT>({
   sendSources,
   messageMetadata,
   onError,
+  includeSubAgentMetadata = false,
 }: {
   lastMessageId?: string;
   sendStart?: boolean;
@@ -490,6 +615,7 @@ export function AgentStreamToAISDKV6Transformer<OUTPUT>({
   sendSources?: boolean;
   messageMetadata?: UIMessageStreamOptionsV6<UIMessageV6>['messageMetadata'];
   onError?: UIMessageStreamOptionsV6<UIMessageV6>['onError'];
+  includeSubAgentMetadata?: boolean;
 }) {
   return createAgentStreamToAISDKTransformer<OUTPUT>(convertMastraChunkToAISDKv6, {
     lastMessageId,
@@ -499,35 +625,13 @@ export function AgentStreamToAISDKV6Transformer<OUTPUT>({
     sendSources,
     messageMetadata,
     onError,
+    includeSubAgentMetadata,
   });
 }
 
 function ensureAgentRunState(bufferedSteps: Map<string, any>, runId: string) {
   if (!bufferedSteps.has(runId)) {
-    bufferedSteps.set(runId, {
-      id: '',
-      object: null,
-      finishReason: null,
-      usage: null,
-      warnings: [],
-      text: '',
-      reasoning: [],
-      sources: [],
-      files: [],
-      toolCalls: [],
-      pendingToolCalls: [],
-      toolResults: [],
-      request: {},
-      response: {
-        id: '',
-        timestamp: new Date(),
-        modelId: '',
-        messages: [],
-      },
-      providerMetadata: undefined,
-      steps: [],
-      status: 'running',
-    });
+    bufferedSteps.set(runId, createAgentRunState());
   }
 
   return bufferedSteps.get(runId)!;
@@ -601,36 +705,171 @@ function removePendingToolCall(pendingToolCalls: PendingAgentToolCall[] = [], to
   return pendingToolCalls.filter(call => call.toolCallId !== toolCallId);
 }
 
-export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps: Map<string, any>) {
+function createAgentResponseState() {
+  return {
+    id: '',
+    timestamp: new Date(),
+    modelId: '',
+    messages: [],
+  };
+}
+
+function createAgentRunState(id: unknown = '') {
+  return {
+    id,
+    object: null,
+    finishReason: null,
+    usage: null,
+    warnings: [],
+    text: '',
+    reasoning: [],
+    sources: [],
+    files: [],
+    toolCalls: [],
+    pendingToolCalls: [],
+    toolResults: [],
+    toolErrors: [],
+    request: {},
+    response: createAgentResponseState(),
+    providerMetadata: undefined,
+    steps: [],
+    status: 'running',
+  };
+}
+
+function cloneAgentResponse(
+  response: Record<string, any> | undefined,
+  { includeMessages }: { includeMessages: boolean },
+) {
+  if (!response) return response;
+
+  return {
+    ...response,
+    ...(Object.prototype.hasOwnProperty.call(response, 'messages')
+      ? { messages: includeMessages ? response.messages : [] }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(response, 'dbMessages')
+      ? { dbMessages: includeMessages ? response.dbMessages : [] }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(response, 'uiMessages')
+      ? { uiMessages: includeMessages ? response.uiMessages : [] }
+      : {}),
+  };
+}
+
+function cloneAgentStep(step: Record<string, any>, { includeDetails }: { includeDetails: boolean }) {
+  if (includeDetails) {
+    return {
+      ...step,
+      response: cloneAgentResponse(step.response, { includeMessages: true }),
+    };
+  }
+
+  return {
+    ...step,
+    object: null,
+    files: [],
+    sources: [],
+    toolCalls: [],
+    pendingToolCalls: [],
+    toolResults: [],
+    toolErrors: [],
+    dynamicToolCalls: [],
+    dynamicToolResults: [],
+    staticToolCalls: [],
+    staticToolResults: [],
+    text: '',
+    reasoning: [],
+    content: Array.isArray(step.content) ? [] : step.content,
+    reasoningText: typeof step.reasoningText === 'string' ? '' : step.reasoningText,
+    response: cloneAgentResponse(step.response, { includeMessages: false }),
+  };
+}
+
+function serializeAgentRun(
+  current: Record<string, any>,
+  {
+    includeCompletedStepDetails,
+    includeResponseMessages,
+  }: { includeCompletedStepDetails: boolean; includeResponseMessages: boolean },
+) {
+  const { _textOffset: _to, _reasoningOffset: _ro, ...data } = current;
+
+  return {
+    ...data,
+    response: cloneAgentResponse(data.response, { includeMessages: includeResponseMessages }),
+    steps: data.steps.map((step: Record<string, any>) =>
+      cloneAgentStep(step, {
+        includeDetails: includeCompletedStepDetails,
+      }),
+    ),
+  };
+}
+
+function createAgentStreamAncestryMetadata(ancestry: AgentStreamAncestryEntry[]): AgentStreamAncestryMetadata {
+  const parentAgentId = ancestry.at(-2)?.agentId;
+
+  return {
+    ancestry,
+    depth: ancestry.length,
+    ...(parentAgentId ? { parentAgentId } : {}),
+  };
+}
+
+function createAgentDataPart(args: {
+  current: Record<string, any>;
+  runId: string;
+  ancestry: AgentStreamAncestryEntry[];
+  includeCompletedStepDetails: boolean;
+  includeResponseMessages: boolean;
+}): AgentDataPartWithAncestry {
+  const { current, runId, ancestry, includeCompletedStepDetails, includeResponseMessages } = args;
+
+  return {
+    type: 'data-tool-agent',
+    id: runId,
+    data: serializeAgentRun(current, {
+      includeCompletedStepDetails,
+      includeResponseMessages,
+    }) as unknown as AgentRunSnapshot,
+    ...createAgentStreamAncestryMetadata(ancestry),
+  };
+}
+
+function createAgentStepDataPart(args: {
+  runId: string;
+  stepIndex: number;
+  step: Record<string, any>;
+  ancestry: AgentStreamAncestryEntry[];
+}): AgentStepDataPartWithAncestry {
+  const { runId, stepIndex, step, ancestry } = args;
+
+  return {
+    type: 'data-tool-agent-step',
+    id: `${runId}:${stepIndex}`,
+    data: {
+      runId,
+      stepIndex,
+      step: cloneAgentStep(step, { includeDetails: true }) as unknown as AgentRunSnapshot,
+    },
+    ...createAgentStreamAncestryMetadata(ancestry),
+  };
+}
+
+export function transformAgent<OUTPUT>(
+  payload: ChunkType<OUTPUT>,
+  bufferedSteps: Map<string, any>,
+  ancestry: AgentStreamAncestryEntry[] = [],
+): TransformAgentResult | null {
   let hasChanged = false;
+  let completedStep: { stepIndex: number; step: Record<string, any> } | null = null;
   switch (payload.type) {
-    case 'start':
-      bufferedSteps.set(payload.runId!, {
-        id: payload.payload.id,
-        object: null,
-        finishReason: null,
-        usage: null,
-        warnings: [],
-        text: '',
-        reasoning: [],
-        sources: [],
-        files: [],
-        toolCalls: [],
-        pendingToolCalls: [],
-        toolResults: [],
-        request: {},
-        response: {
-          id: '',
-          timestamp: new Date(),
-          modelId: '',
-          messages: [],
-        },
-        providerMetadata: undefined,
-        steps: [],
-        status: 'running',
-      });
+    case 'start': {
+      const startState = createAgentRunState(payload.payload.id);
+      bufferedSteps.set(payload.runId!, startState);
       hasChanged = true;
       break;
+    }
     case 'tool-call-input-streaming-start': {
       const toolInputStartRun = ensureAgentRunState(bufferedSteps, payload.runId!);
       const existing = toolInputStartRun.pendingToolCalls?.find(
@@ -761,6 +1000,34 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
       hasChanged = true;
       break;
     }
+    case 'tool-error': {
+      const toolErrorRun = ensureAgentRunState(bufferedSteps, payload.runId!);
+      const toolErrorPayload = payload.payload as {
+        toolCallId: string;
+        toolName: string;
+        args?: Record<string, unknown>;
+        error: unknown;
+        providerExecuted?: boolean;
+      };
+      bufferedSteps.set(payload.runId!, {
+        ...toolErrorRun,
+        pendingToolCalls: removePendingToolCall(toolErrorRun.pendingToolCalls, toolErrorPayload.toolCallId),
+        toolErrors: [
+          ...toolErrorRun.toolErrors,
+          {
+            toolCallId: toolErrorPayload.toolCallId,
+            toolName: toolErrorPayload.toolName,
+            ...(toolErrorPayload.args !== undefined ? { args: toolErrorPayload.args } : {}),
+            errorText: safeParseErrorObject(toolErrorPayload.error),
+            ...(toolErrorPayload.providerExecuted !== undefined
+              ? { providerExecuted: toolErrorPayload.providerExecuted }
+              : {}),
+          },
+        ],
+      });
+      hasChanged = true;
+      break;
+    }
     case 'object-result':
       bufferedSteps.set(payload.runId!, {
         ...ensureAgentRunState(bufferedSteps, payload.runId!),
@@ -777,6 +1044,7 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
       break;
     case 'step-finish': {
       const stepRun = ensureAgentRunState(bufferedSteps, payload.runId!);
+      const stepIndex = stepRun.steps.length;
       // Exclude `steps` and internal offset trackers from the stepResult to
       // avoid recursive nesting where each stepResult embeds copies of all
       // prior stepResults (issue #14932).
@@ -837,12 +1105,14 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
         toolCalls: [],
         pendingToolCalls: [],
         toolResults: [],
+        toolErrors: [],
         usage: payload.payload.output.usage,
         warnings: payload.payload.stepResult.warnings || [],
         steps: [...stepRun.steps, stepResult],
         _textOffset: stepRun.text.length,
         _reasoningOffset: stepRun.reasoning.length,
       });
+      completedStep = { stepIndex, step: stepResult };
       hasChanged = true;
       break;
     }
@@ -851,13 +1121,28 @@ export function transformAgent<OUTPUT>(payload: ChunkType<OUTPUT>, bufferedSteps
   }
 
   if (hasChanged) {
-    // Strip internal offset trackers so they don't leak over the wire.
-    const { _textOffset: _to, _reasoningOffset: _ro, ...data } = bufferedSteps.get(payload.runId!)!;
-    return {
-      type: 'data-tool-agent',
-      id: payload.runId!,
-      data,
-    } satisfies AgentDataPart;
+    const current = bufferedSteps.get(payload.runId!)!;
+    const snapshot = createAgentDataPart({
+      current,
+      runId: payload.runId!,
+      ancestry,
+      includeCompletedStepDetails: payload.type === 'finish',
+      includeResponseMessages: payload.type === 'finish',
+    });
+
+    if (completedStep) {
+      return [
+        snapshot,
+        createAgentStepDataPart({
+          runId: payload.runId!,
+          stepIndex: completedStep.stepIndex,
+          step: completedStep.step,
+          ancestry,
+        }),
+      ] as const;
+    }
+
+    return snapshot;
   }
   return null;
 }
@@ -1003,8 +1288,7 @@ export function transformWorkflow<OUTPUT>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(output)}`,
           );
         }
-        const { type, data, id } = output;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(output);
       }
       return null;
     }
@@ -1016,13 +1300,7 @@ export function transformWorkflow<OUTPUT>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        const { type, data, id } = payload;
-
-        return {
-          type,
-          data,
-          ...(id !== undefined && { id }),
-        };
+        return toUIDataChunk(payload);
       }
       return null;
     }
@@ -1043,6 +1321,7 @@ export function transformNetwork(
         task: null | Record<string, unknown>;
         input: StepResult['input'];
         [PRIMITIVE_CACHE_SYMBOL]: Map<string, any>;
+        [COMPLETED_STEPS_SYMBOL]?: Map<number, Record<string, any>>;
       })[];
       usage: LanguageModelV2Usage | null;
       output: unknown | null;
@@ -1371,8 +1650,7 @@ export function transformNetwork(
           );
         }
 
-        const { type, data, id } = payload.payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload.payload);
       }
       if (isWorkflowExecutionDataChunkType(payload)) {
         if (!('data' in payload.payload)) {
@@ -1380,8 +1658,7 @@ export function transformNetwork(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        const { type, data, id } = payload.payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload.payload);
       }
 
       if (payload.type.startsWith('agent-execution-event-')) {
@@ -1395,10 +1672,33 @@ export function transformNetwork(
         }
 
         step[PRIMITIVE_CACHE_SYMBOL] = step[PRIMITIVE_CACHE_SYMBOL] || new Map();
+        // When the nested agent restarts (start event) discard stale step detail
+        // so a new run doesn't merge prior-run completedStepDetail into its steps.
+        if ((payload.payload as AgentChunkType).type === 'start') {
+          delete step[COMPLETED_STEPS_SYMBOL];
+        }
         const result = transformAgent(payload.payload as ChunkType<any>, step[PRIMITIVE_CACHE_SYMBOL]);
-        if (result) {
-          const { request, response, ...data } = result.data;
+        const snapshot = Array.isArray(result) ? result[0] : result;
+        if (snapshot) {
+          const { request, response, ...data } = snapshot.data;
+          // If this event carries a completed-step delta, persist its full detail
+          // on the network step so subsequent events can re-apply it.
+          if (Array.isArray(result)) {
+            const { stepIndex, step: completedStepDetail } = result[1].data;
+            step[COMPLETED_STEPS_SYMBOL] = step[COMPLETED_STEPS_SYMBOL] || new Map();
+            step[COMPLETED_STEPS_SYMBOL].set(stepIndex, completedStepDetail);
+          }
           step.task = data;
+          // Re-apply ALL persisted completed-step details after every assignment so
+          // later events (text-delta etc.) don't overwrite the merged toolResults.
+          const completedSteps = step[COMPLETED_STEPS_SYMBOL];
+          if (completedSteps && completedSteps.size > 0 && Array.isArray(data.steps)) {
+            for (const [stepIndex, completedStepDetail] of completedSteps) {
+              if (stepIndex < data.steps.length) {
+                data.steps[stepIndex] = { ...data.steps[stepIndex], ...completedStepDetail };
+              }
+            }
+          }
         }
 
         bufferedNetworks.set(payload.runId!, current);
@@ -1459,8 +1759,7 @@ export function transformNetwork(
           );
         }
 
-        const { type, data, id } = payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload);
       }
       return null;
     }

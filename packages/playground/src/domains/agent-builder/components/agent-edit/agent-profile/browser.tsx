@@ -1,4 +1,5 @@
-import { StatusBadge } from '@mastra/playground-ui/components/StatusBadge';
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Field, FieldLabel } from '@mastra/playground-ui/components/Field';
 import { Switch } from '@mastra/playground-ui/components/Switch';
 import { Txt } from '@mastra/playground-ui/components/Txt';
 import { GlobeIcon } from 'lucide-react';
@@ -28,38 +29,34 @@ export const Browser = ({ editable = true }: BrowserProps) => {
   const switchStyle: CSSProperties | undefined = browserEnabled ? { backgroundColor: agentColor.tint } : undefined;
 
   return (
-    <div className="flex h-full min-h-0 items-center justify-center px-6 py-8" data-testid="browser-detail-picker">
+    <div className="flex h-full min-h-0 items-center justify-center px-4 py-5" data-testid="browser-detail-picker">
       <div className="flex w-full max-w-[28rem] flex-col items-center gap-5 text-center">
         <div className="grid size-14 place-items-center rounded-full" style={iconStyle}>
           <GlobeIcon className="h-7 w-7" />
         </div>
 
         <div className="flex flex-col gap-2">
-          <Txt variant="header-sm" className="font-semibold text-neutral6">
+          <Txt variant="heading" tone="ink">
             Browser access
           </Txt>
-          <Txt variant="ui-md" className="text-neutral3">
+          <Txt variant="body" tone="muted">
             Let this agent open a browser session to navigate websites, fill out forms, and read live web content as
             part of a run.
           </Txt>
         </div>
 
-        <div className="mt-1 flex items-center gap-3">
+        <Field orientation="horizontal" disabled={!editable} className="mt-1 gap-3">
           <Switch
-            id={TOGGLE_ID}
             checked={browserEnabled}
             onCheckedChange={handleCheckedChange}
-            disabled={!editable}
             data-testid={TOGGLE_ID}
             style={switchStyle}
           />
-          <label htmlFor={TOGGLE_ID} className="cursor-pointer text-ui-md font-medium text-neutral6">
-            Enable browser
-          </label>
-          <StatusBadge variant={browserEnabled ? 'success' : 'neutral'} size="sm" withDot>
+          <FieldLabel size="smaller">Enable browser</FieldLabel>
+          <Badge variant={browserEnabled ? 'success' : 'neutral'} size="sm" indicator="dot">
             {browserEnabled ? 'Enabled' : 'Disabled'}
-          </StatusBadge>
-        </div>
+          </Badge>
+        </Field>
       </div>
     </div>
   );

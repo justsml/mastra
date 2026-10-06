@@ -2,7 +2,6 @@ import type { ConnectionOptions } from 'node:tls';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
 import type { StorageDomains } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
 import { Pool } from 'pg';
 import {
   validateConfig,
@@ -10,13 +9,16 @@ import {
   isConnectionStringConfig,
   isHostConfig,
   isPoolConfig,
+  isWritePoolConfig,
 } from '../shared/config';
 import type { PostgresStoreConfig } from '../shared/config';
 import { buildConnectionStringPoolConfig } from '../shared/pool-config';
+import { parseSchemaName } from '../shared/schema-name';
 import { PinnedClientAdapter, PoolAdapter, RoutingDbClient } from './client';
 import type { DbClient, PoolClient } from './client';
 import type { PgDomainClientConfig } from './db';
 import { getSchemaName } from './db';
+import { loadSchemaSnapshot } from './db/schema-snapshot';
 import { AgentsPG } from './domains/agents';
 import { BackgroundTasksPG } from './domains/background-tasks';
 import { BlobsPG } from './domains/blobs';
@@ -24,6 +26,7 @@ import { ChannelsPG } from './domains/channels';
 import { DatasetsPG } from './domains/datasets';
 import { ExperimentsPG } from './domains/experiments';
 import { FavoritesPG } from './domains/favorites';
+import { KnowledgePG } from './domains/knowledge';
 import { MCPClientsPG } from './domains/mcp-clients';
 import { MCPServersPG } from './domains/mcp-servers';
 import { MemoryPG } from './domains/memory';
@@ -36,7 +39,9 @@ import { SchedulesPG } from './domains/schedules';
 import { ScorerDefinitionsPG } from './domains/scorer-definitions';
 import { ScoresPG } from './domains/scores';
 import { SkillsPG } from './domains/skills';
+import { ThreadStatePG } from './domains/thread-state';
 import { ToolProviderConnectionsPG } from './domains/tool-provider-connections';
+import { WorkflowDefinitionsPG } from './domains/workflow-definitions';
 import { WorkflowsPG } from './domains/workflows';
 import { WorkspacesPG } from './domains/workspaces';
 
@@ -91,6 +96,7 @@ function createHostPool(config: HostPoolConfig): Pool {
  */
 const ALL_DOMAINS = [
   MemoryPG,
+  KnowledgePG,
   NotificationsPG,
   ObservabilityPG,
   ScoresPG,
@@ -104,12 +110,14 @@ const ALL_DOMAINS = [
   BlobsPG,
   ToolProviderConnectionsPG,
   WorkflowsPG,
+  WorkflowDefinitionsPG,
   DatasetsPG,
   ExperimentsPG,
   BackgroundTasksPG,
   FavoritesPG,
   ChannelsPG,
   SchedulesPG,
+  ThreadStatePG,
 ] as const;
 
 /**
@@ -140,6 +148,7 @@ export {
   ChannelsPG,
   DatasetsPG,
   ExperimentsPG,
+  KnowledgePG,
   MCPClientsPG,
   MCPServersPG,
   MemoryPG,
@@ -152,14 +161,17 @@ export {
   SchedulesPG,
   SkillsPG,
   FavoritesPG,
+  ThreadStatePG,
   ToolProviderConnectionsPG,
   WorkflowsPG,
+  WorkflowDefinitionsPG,
   WorkspacesPG,
 };
 export type { VNextPostgresObservabilityConfig };
 export { PoolAdapter } from './client';
 export type { DbClient, TxClient, QueryValues, Pool, PoolClient, QueryResult } from './client';
 export type { PgDomainConfig, PgDomainClientConfig, PgDomainPoolConfig, PgDomainRestConfig } from './db';
+export { PgFactoryStorage, type PgFactoryStorageConfig } from './factory-storage';
 
 /**
  * PostgreSQL storage adapter for Mastra.
@@ -185,12 +197,14 @@ export type { PgDomainConfig, PgDomainClientConfig, PgDomainPoolConfig, PgDomain
  * ```
  */
 export class PostgresStore extends MastraCompositeStore {
-  #pool: Pool;
+  #writePool: Pool;
+  #readPool: Pool;
   // Narrowed to RoutingDbClient so init()'s pin/unpin path is type-checked.
   // The public `db` getter still exposes it as DbClient.
   #db: RoutingDbClient;
-  #ownsPool: boolean;
-  #poolClosed: boolean = false;
+  #readDb: DbClient;
+  #ownsWritePool: boolean;
+  #writePoolClosed: boolean = false;
   private schema: string;
   private isInitialized: boolean = false;
   // Caches the in-flight init() so concurrent callers share one initialization
@@ -204,22 +218,28 @@ export class PostgresStore extends MastraCompositeStore {
       validateConfig('PostgresStore', config);
       super({ id: config.id, name: 'PostgresStore', disableInit: config.disableInit, retention: config.retention });
       // Validate schema name to prevent SQL injection
-      this.schema = parseSqlIdentifier(config.schemaName || 'public', 'schema name');
+      this.schema = parseSchemaName(config.schemaName || 'public');
 
       if (isPoolConfig(config)) {
-        this.#pool = config.pool;
-        this.#ownsPool = false;
+        this.#writePool = config.pool;
+        this.#ownsWritePool = false;
+      } else if (isWritePoolConfig(config)) {
+        this.#writePool = config.writePool;
+        this.#ownsWritePool = false;
       } else {
-        this.#pool = this.createPool(config);
-        this.#ownsPool = true;
+        this.#writePool = this.createPool(config);
+        this.#ownsWritePool = true;
       }
+      this.#readPool = config.readPool ?? this.#writePool;
 
-      // Wrap the pool adapter in a routing client so init() can temporarily
+      // Wrap the writer adapter in a routing client so init() can temporarily
       // pin all DDL traffic to a single PoolClient. See PostgresStore.init().
-      this.#db = new RoutingDbClient(new PoolAdapter(this.#pool));
+      this.#db = new RoutingDbClient(new PoolAdapter(this.#writePool));
+      this.#readDb = this.#readPool === this.#writePool ? this.#db : new PoolAdapter(this.#readPool);
 
       const domainConfig: PgDomainClientConfig = {
         client: this.#db,
+        readClient: this.#readDb,
         schemaName: this.schema,
         skipDefaultIndexes: config.skipDefaultIndexes,
         indexes: config.indexes,
@@ -228,7 +248,9 @@ export class PostgresStore extends MastraCompositeStore {
       this.stores = {
         scores: new ScoresPG(domainConfig),
         workflows: new WorkflowsPG(domainConfig),
+        workflowDefinitions: new WorkflowDefinitionsPG(domainConfig),
         memory: new MemoryPG(domainConfig),
+        knowledge: new KnowledgePG(domainConfig),
         notifications: new NotificationsPG(domainConfig),
         observability: new ObservabilityPG(domainConfig),
         agents: new AgentsPG(domainConfig),
@@ -246,6 +268,7 @@ export class PostgresStore extends MastraCompositeStore {
         backgroundTasks: new BackgroundTasksPG(domainConfig),
         channels: new ChannelsPG(domainConfig),
         schedules: new SchedulesPG(domainConfig),
+        threadState: new ThreadStatePG(domainConfig),
       };
     } catch (e) {
       throw new MastraError(
@@ -332,9 +355,14 @@ export class PostgresStore extends MastraCompositeStore {
     let pinnedClient: PoolClient | undefined;
 
     try {
-      pinnedClient = await this.#pool.connect();
-      const pinned = new PinnedClientAdapter(this.#pool, pinnedClient);
+      pinnedClient = await this.#writePool.connect();
+      const pinned = new PinnedClientAdapter(this.#writePool, pinnedClient);
       this.#db.pin(pinned);
+      // Read the schema's catalog once, up front, so the domains below can
+      // answer "does this table/column/index already exist?" locally instead of
+      // asking the server ~350 times over this one serialized connection.
+      // Cleared in the finally: the snapshot never outlives init().
+      this.#db.setSchemaSnapshot(await loadSchemaSnapshot(pinned, this.schema));
       await super.init();
       // Only mark initialized after schema creation actually finishes so a
       // racing second init() caller can't return early and issue runtime
@@ -358,6 +386,10 @@ export class PostgresStore extends MastraCompositeStore {
         error,
       );
     } finally {
+      // Drop the snapshot unconditionally — including when loading it or
+      // super.init() threw — so no code path can read a stale catalog picture
+      // after init returns.
+      this.#db.setSchemaSnapshot(null);
       // Only unpin/release when connect() actually handed us a client; on a
       // failed connect() pinnedClient is undefined and pin() never ran.
       if (pinnedClient) {
@@ -380,22 +412,30 @@ export class PostgresStore extends MastraCompositeStore {
     return this.#db;
   }
 
-  /**
-   * The underlying pg.Pool for direct database access or ORM integration.
-   */
+  /** Database client for queries that may run against the configured read replica. */
+  public get readDb(): DbClient {
+    return this.#readDb;
+  }
+
+  /** The underlying writer pg.Pool for direct database access or ORM integration. */
   public get pool(): Pool {
-    return this.#pool;
+    return this.#writePool;
+  }
+
+  /** The underlying reader pg.Pool, falling back to the writer pool when unset. */
+  public get readPool(): Pool {
+    return this.#readPool;
   }
 
   /**
-   * Closes the connection pool if it was created by this store.
-   * If a pool was passed in via config, it will not be closed.
+   * Closes the writer connection pool if it was created by this store.
+   * Caller-provided writer and reader pools are not closed.
    * Safe to call multiple times — subsequent calls are no-ops.
    */
   async close(): Promise<void> {
-    if (this.#ownsPool && !this.#poolClosed) {
-      this.#poolClosed = true;
-      await this.#pool.end();
+    if (this.#ownsWritePool && !this.#writePoolClosed) {
+      this.#writePoolClosed = true;
+      await this.#writePool.end();
     }
   }
 }
@@ -433,6 +473,7 @@ export type PostgresStoreVNextObservabilityConfig = (
   schemaName?: string;
   partitioning?: VNextPostgresObservabilityConfig['partitioning'];
   discovery?: VNextPostgresObservabilityConfig['discovery'];
+  traceQueryTimeoutMs?: VNextPostgresObservabilityConfig['traceQueryTimeoutMs'];
 };
 
 /**
@@ -556,6 +597,7 @@ export class PostgresStoreVNext extends PostgresStore {
       schemaName: obsConfig.schemaName ?? config.schemaName,
       partitioning: obsConfig.partitioning,
       discovery: obsConfig.discovery,
+      traceQueryTimeoutMs: obsConfig.traceQueryTimeoutMs,
     });
 
     this.stores = {

@@ -1,6 +1,17 @@
-import type { SpanRecord } from '@mastra/core/storage';
+import type { SpanRecord } from '../types';
+import { toDate } from '@/utils/date-format';
 
 type MessageLike = { role?: string; content?: unknown };
+
+export function getSpanDurationMs(
+  startedAt: Date | string | null | undefined,
+  endedAt: Date | string | null | undefined,
+): number | undefined {
+  const startedAtMs = toDate(startedAt)?.getTime();
+  const endedAtMs = toDate(endedAt)?.getTime();
+  if (startedAtMs === undefined || endedAtMs === undefined || endedAtMs < startedAtMs) return undefined;
+  return endedAtMs - startedAtMs;
+}
 
 /**
  * Extract a truncated text preview from a span's input field.

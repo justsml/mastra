@@ -1,6 +1,6 @@
 import type { IMastraLogger } from '@mastra/core/logger';
-import { ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import type { Resource, ResourceTemplate } from '@modelcontextprotocol/sdk/types.js';
+import type { Resource, ResourceTemplateType } from '@modelcontextprotocol/client';
+import { ProtocolErrorCode } from '@modelcontextprotocol/client';
 import type { InternalMastraMCPClient } from '../client';
 
 interface ResourceClientActionsConfig {
@@ -57,7 +57,7 @@ export class ResourceClientActions {
       }
     } catch (e: any) {
       // MCP Server might not support resources, so we return an empty array
-      if (e.code === ErrorCode.MethodNotFound) {
+      if (e.code === ProtocolErrorCode.MethodNotFound) {
         return [];
       }
       this.logger.error('Error getting resources from server', {
@@ -87,7 +87,7 @@ export class ResourceClientActions {
    * });
    * ```
    */
-  public async templates(): Promise<ResourceTemplate[]> {
+  public async templates(): Promise<ResourceTemplateType[]> {
     try {
       const response = await this.client.listResourceTemplates();
       if (response && response.resourceTemplates && Array.isArray(response.resourceTemplates)) {
@@ -101,7 +101,7 @@ export class ResourceClientActions {
       }
     } catch (e: any) {
       // MCP Server might not support resources, so we return an empty array
-      if (e.code === ErrorCode.MethodNotFound) {
+      if (e.code === ProtocolErrorCode.MethodNotFound) {
         return [];
       }
       this.logger.error('Error getting resource templates from server', {
@@ -132,47 +132,31 @@ export class ResourceClientActions {
   }
 
   /**
-   * Subscribes to updates for a specific resource.
+   * Subscribes to update notifications for a resource. The client carries every
+   * subscription on one `subscriptions/listen` stream and reopens it after reconnects.
    *
-   * After subscribing, you'll receive notifications via the `onUpdated` handler
-   * when the resource content changes.
-   *
-   * @param uri - URI of the resource to subscribe to
-   * @returns Promise resolving when subscription is established
-   * @throws {Error} If subscription fails
+   * @param uri - URI of the resource to watch
+   * @throws {Error} If the server declines the subscription
    *
    * @example
    * ```typescript
+   * await client.resources.onUpdated(({ uri }) => console.log(`updated ${uri}`));
    * await client.resources.subscribe('file://data/config.json');
    * ```
    */
-  public async subscribe(uri: string) {
-    return this.client.subscribeResource(uri);
+  public async subscribe(uri: string): Promise<void> {
+    await this.client.subscribeResource(uri);
   }
 
-  /**
-   * Unsubscribes from updates for a specific resource.
-   *
-   * Stops receiving notifications for this resource URI.
-   *
-   * @param uri - URI of the resource to unsubscribe from
-   * @returns Promise resolving when unsubscription is complete
-   * @throws {Error} If unsubscription fails
-   *
-   * @example
-   * ```typescript
-   * await client.resources.unsubscribe('file://data/config.json');
-   * ```
-   */
-  public async unsubscribe(uri: string) {
-    return this.client.unsubscribeResource(uri);
+  /** Stops update notifications for a resource previously passed to {@link subscribe}. */
+  public async unsubscribe(uri: string): Promise<void> {
+    await this.client.unsubscribeResource(uri);
   }
 
   /**
    * Sets a notification handler for when subscribed resources are updated.
    *
-   * The handler is called whenever the server sends a resource update notification
-   * for any resource you've subscribed to.
+   * Updates arrive for resources passed to {@link subscribe}.
    *
    * @param handler - Callback function receiving the updated resource URI
    *
@@ -207,6 +191,6 @@ export class ResourceClientActions {
    * ```
    */
   public async onListChanged(handler: () => void): Promise<void> {
-    this.client.setResourceListChangedNotificationHandler(handler);
+    await this.client.setResourceListChangedNotificationHandler(handler);
   }
 }

@@ -24,7 +24,6 @@
  */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -36,7 +35,7 @@ import { fileURLToPath } from 'node:url';
  *
  * In dev (tsx) the assets sit next to this source file. In a built CLI the JS is
  * bundled into a chunk under `dist/`, so the assets are copied to `dist/native/`
- * by tsup. We probe both layouts plus a couple of nearby fallbacks so the
+ * by tsdown. We probe both layouts plus a couple of nearby fallbacks so the
  * recognizer resolves regardless of how mastracode was launched.
  */
 function resolveAsset(name: string): string {
@@ -183,7 +182,11 @@ export async function resolveRecognizer(
   }
   // `v3` busts caches built before the .app-bundle + LaunchServices approach
   // (loose binaries never triggered the TCC prompt).
-  const hash = createHash('sha256').update('v3').update(source).update('\0').update(plist).digest('hex').slice(0, 16);
+  const hash = Buffer.from(
+    await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(`v3${source}\0${plist}`)),
+  )
+    .toString('hex')
+    .slice(0, 16);
   const dir = cacheDir();
   const appPath = join(dir, `macos-stt-${hash}.app`);
   const binaryPath = join(appPath, 'Contents', 'MacOS', APP_NAME);

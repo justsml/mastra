@@ -13,6 +13,7 @@ import { createSchedulesTests } from './domains/schedules';
 import { createChannelsTests } from './domains/channels';
 import { createToolProviderConnectionsTests } from './domains/tool-provider-connections';
 import { createSkillsTests } from './domains/skills';
+import { createWorkflowDefinitionsTests } from './domains/workflow-definitions';
 export * from './domains/memory/data';
 export * from './domains/workflows/data';
 export * from './domains/scores/data';
@@ -43,6 +44,14 @@ export type TestCapabilities = {
   toolMocks?: boolean;
   /** Whether identity-aware dataset item insertion is supported (defaults to true). */
   datasetItemIdentity?: boolean;
+  /** Whether permanent dataset item purge is supported by the test topology (defaults to true). */
+  datasetItemPurge?: boolean;
+  /**
+   * Whether batchDeleteTraces supports tenant-scoped deletion via
+   * organizationId/resourceId (defaults to false). Adapters without tenant
+   * columns must reject scoped calls; the suite asserts that rejection.
+   */
+  scopedTraceDeletion?: boolean;
 };
 
 export function createTestSuite(storage: MastraStorage, capabilities: TestCapabilities = {}) {
@@ -115,6 +124,11 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
         clearList.push(toolProviderConnectionsStorage.dangerouslyClearAll());
       }
 
+      const workflowDefinitionsStorage = await storage.getStore('workflowDefinitions');
+      if (workflowDefinitionsStorage) {
+        clearList.push(workflowDefinitionsStorage.dangerouslyClearAll());
+      }
+
       // Clear all domain data after tests
       await Promise.all(clearList);
     });
@@ -124,7 +138,7 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createWorkflowsTests({ storage });
     createMemoryTest({ storage });
     createScoresTest({ storage, capabilities });
-    createObservabilityTests({ storage });
+    createObservabilityTests({ storage, capabilities });
     createAgentsTests({ storage });
     createDatasetsTests({ storage, capabilities });
     createExperimentsTests({ storage, capabilities });
@@ -134,5 +148,6 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createSchedulesTests({ storage });
     createChannelsTests({ storage });
     createToolProviderConnectionsTests({ storage });
+    createWorkflowDefinitionsTests({ storage });
   });
 }

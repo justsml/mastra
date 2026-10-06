@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { Database } from '@google-cloud/spanner';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { ListScoresResponse, SaveScorePayload, ScoreRowData, ScoringSource } from '@mastra/core/evals';
@@ -151,9 +150,13 @@ export class ScoresSpanner extends ScoresStorage {
     }
 
     try {
-      const scoreId = randomUUID();
+      // Caller-supplied ids give scores a stable identity: retried writes for
+      // the same id replace the previous row via upsert (latest wins).
+      const suppliedId = validatedScore.id;
+      const scoreId = suppliedId ?? globalThis.crypto.randomUUID();
       const now = new Date();
       const {
+        id: _suppliedId,
         scorer,
         preprocessStepResult,
         analyzeStepResult,
@@ -181,10 +184,17 @@ export class ScoresSpanner extends ScoresStorage {
         createdAt: now,
         updatedAt: now,
       };
-      await this.db.insert({
-        tableName: TABLE_SCORERS,
-        record: insertedRecord,
-      });
+      if (suppliedId) {
+        await this.db.upsert({
+          tableName: TABLE_SCORERS,
+          record: insertedRecord,
+        });
+      } else {
+        await this.db.insert({
+          tableName: TABLE_SCORERS,
+          record: insertedRecord,
+        });
+      }
 
       return { score: insertedRecord as ScoreRowData };
     } catch (error) {

@@ -1,38 +1,37 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSankeyHueMap, hashHue, nodeColor, nodeColorVivid } from './sankeyColor';
+import { buildSankeyColorMap, sankeySeriesColors } from './sankeyColor';
+import { hashLabel } from '@/lib/colors';
 
-const labels = ['Europe', 'North America', 'Asia Pacific', 'Won', 'Lost', 'Search', 'Referral', 'Partner'];
+describe('buildSankeyColorMap', () => {
+  const labels = ['Search', 'Referral', 'Partner', 'Europe', 'North America', 'Asia Pacific', 'Won', 'Lost'];
 
-function circularDistance(left: number, right: number) {
-  const distance = Math.abs(left - right);
-  return Math.min(distance, 360 - distance);
-}
-
-describe('Sankey colors', () => {
-  it('returns stable normalized hashes and environment-appropriate colors', () => {
-    expect(hashHue('Europe')).toBe(hashHue('Europe'));
-    expect(hashHue('Europe')).toBeGreaterThanOrEqual(0);
-    expect(hashHue('Europe')).toBeLessThan(360);
-    expect(nodeColor(200)).toBe('hsl(200 42% 62%)');
-    expect(nodeColorVivid(200)).toBe('hsl(200 55% 68%)');
+  it('hashes labels stably', () => {
+    expect(hashLabel('Europe')).toBe(hashLabel('Europe'));
+    expect(hashLabel('Europe')).not.toBe(hashLabel('Lost'));
   });
 
-  it('deterministically separates runtime labels by at least 26 degrees', () => {
-    const hues = buildSankeyHueMap([...labels, 'Europe']);
-    const repeated = buildSankeyHueMap(labels.toReversed());
+  it('gives every label a chart series token', () => {
+    const colors = buildSankeyColorMap(labels);
+    for (const label of labels) expect(sankeySeriesColors).toContain(colors[label]);
+  });
 
-    expect(hues).toEqual(repeated);
-    expect(Object.keys(hues)).toHaveLength(labels.length);
+  it('keeps other labels colors when one label is removed', () => {
+    const colors = buildSankeyColorMap(labels);
+    const withoutEurope = buildSankeyColorMap(labels.filter(label => label !== 'Europe'));
+    for (const label of labels.filter(label => label !== 'Europe')) expect(withoutEurope[label]).toBe(colors[label]);
+  });
 
-    const values = Object.values(hues);
-    for (let leftIndex = 0; leftIndex < values.length; leftIndex += 1) {
-      for (let rightIndex = leftIndex + 1; rightIndex < values.length; rightIndex += 1) {
-        const left = values[leftIndex];
-        const right = values[rightIndex];
-        if (left === undefined || right === undefined) continue;
-        expect(circularDistance(left, right)).toBeGreaterThanOrEqual(26);
-      }
-    }
+  it('does not depend on input order or duplicates', () => {
+    expect(buildSankeyColorMap([...labels, 'Europe'])).toEqual(buildSankeyColorMap(labels.toReversed()));
+  });
+
+  it('reuses the series once there are more than eight labels', () => {
+    const many = Array.from({ length: 20 }, (_, index) => `label-${index}`);
+    expect(new Set(Object.values(buildSankeyColorMap(many))).size).toBe(sankeySeriesColors.length);
+  });
+
+  it('returns an empty map for no labels', () => {
+    expect(buildSankeyColorMap([])).toEqual({});
   });
 });

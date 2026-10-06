@@ -60,8 +60,12 @@ export function createPrepareToolsStep<OUTPUT = undefined>({
         autoResumeSuspendedTools: options.autoResumeSuspendedTools,
         delegation: options.delegation,
         backgroundTaskEnabled,
+        backgroundTaskPolicy: options.backgroundTaskPolicy,
         inputProcessors: options.inputProcessors,
         hooks: options.hooks,
+        // Use the resolved execution model so provider-native placeholders
+        // respect per-call and Studio model overrides.
+        model: capabilities.llm.getModel(),
       });
 
       // Update the agent span with available tool names for observability

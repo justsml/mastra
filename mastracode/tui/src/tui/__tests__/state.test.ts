@@ -1,15 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 
+const { requestUIRender } = vi.hoisted(() => ({ requestUIRender: vi.fn() }));
+
 vi.mock('@earendil-works/pi-tui', () => {
   class MockContainer {
     children: unknown[] = [];
+
+    addChild(child: unknown) {
+      this.children.push(child);
+    }
   }
 
   class MockProcessTerminal {
-    columns = 120;
+    get columns() {
+      return process.stdout.columns || 80;
+    }
   }
 
   class MockTUI {
+    requestRender = requestUIRender;
+
     constructor(public terminal: MockProcessTerminal) {}
   }
 
@@ -54,6 +64,7 @@ vi.mock('@mastra/code-sdk/utils/project', async importOriginal => {
 });
 
 import { createTUIState } from '../state.js';
+import { MIN_TERM_WIDTH } from '../theme.js';
 
 function createSession() {
   return {
@@ -148,5 +159,60 @@ describe('createTUIState', () => {
 
     expect(state.editor.getModeColor?.()).toBe('#7c3aed');
     expect(controller.session.mode.resolve).toHaveBeenCalled();
+
+    vi.useFakeTimers();
+    try {
+      requestUIRender.mockClear();
+      state.ui.requestRender();
+      state.ui.requestRender();
+      expect(requestUIRender).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(0);
+      expect(requestUIRender).toHaveBeenCalledOnce();
+
+      state.chatContainer.children.push(
+        ...Array.from({ length: 501 }, () => ({ render: () => [], invalidate: () => {} })),
+      );
+      state.ui.requestRender();
+      vi.advanceTimersByTime(200);
+      expect(state.chatContainer.children).toHaveLength(250);
+      expect(requestUIRender).toHaveBeenCalledTimes(2);
+
+      state.renderScheduler?.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('floors a transient narrow terminal width to the minimum layout width', () => {
+    const originalColumns = process.stdout.columns;
+    Object.defineProperty(process.stdout, 'columns', {
+      value: 2,
+      writable: true,
+      configurable: true,
+    });
+
+    let state: ReturnType<typeof createTUIState> | undefined;
+    try {
+      const session = createSession();
+      const createdState = createTUIState({
+        controller: createAgentController(session) as never,
+        session: session as never,
+        hookManager: {} as never,
+        analytics: {} as never,
+        authStorage: { getStoredApiKey: vi.fn(() => undefined) } as never,
+        mcpManager: {} as never,
+        workspace: {} as never,
+      });
+      state = createdState;
+
+      expect(createdState.terminal.columns).toBe(MIN_TERM_WIDTH);
+    } finally {
+      state?.renderScheduler?.dispose();
+      Object.defineProperty(process.stdout, 'columns', {
+        value: originalColumns,
+        writable: true,
+        configurable: true,
+      });
+    }
   });
 });

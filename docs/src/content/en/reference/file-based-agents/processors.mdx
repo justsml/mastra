@@ -1,6 +1,6 @@
 ---
 title: "Processors | File-based Agents"
-description: Add input and output processors to a file-based agent under processors/input/ and processors/output/.
+description: "Add input and output processors to file-based agents under processors/input and processors/output, with module exports discovered during build."
 packages:
   - "@mastra/core"
 ---
@@ -50,7 +50,7 @@ If `config.inputProcessors` or `config.outputProcessors` is a function, discover
 
 ## Precedence with config
 
-Use `config.ts` for processors that need to be created dynamically or shared across agents. Use file-based processors for static, per-agent processors that should be reviewed alongside the agent.
+Use `config.ts` for processors that need to be created at runtime or shared across agents. Use file-based processors for static, per-agent processors that should be reviewed alongside the agent.
 
 Precedence is:
 

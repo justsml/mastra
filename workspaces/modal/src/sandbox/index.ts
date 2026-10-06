@@ -5,7 +5,7 @@
 import type { MastraSandboxOptions, ProviderStatus, SandboxCloneOptions, SandboxInfo } from '@mastra/core/workspace';
 import { MastraSandbox, SandboxNotReadyError } from '@mastra/core/workspace';
 import { ClientClosedError, ModalClient, NotFoundError } from 'modal';
-import type { App, Image, Sandbox } from 'modal';
+import type { App, Image, Sandbox, SandboxReloadVolumesParams, Volume } from 'modal';
 import { ModalProcessManager } from './process-manager';
 
 const LOG_PREFIX = '[ModalSandbox]';
@@ -43,7 +43,10 @@ export interface ModalSandboxOptions extends Omit<MastraSandboxOptions, 'process
   timeoutMs?: number;
   /** Environment variables baked into the sandbox at create time. */
   env?: Record<string, string>;
-  /** Default working directory inside the sandbox. */
+  /** Default working directory inside the sandbox.
+   * @deprecated Use `workingDirectory` (the base sandbox option) instead.
+   * When both are set, `workingDirectory` wins.
+   */
   workdir?: string;
   /** Modal token ID. Falls back to MODAL_TOKEN_ID env var. */
   tokenId?: string;
@@ -51,6 +54,20 @@ export interface ModalSandboxOptions extends Omit<MastraSandboxOptions, 'process
   tokenSecret?: string;
   /** Custom instructions for getInstructions(). String replaces the default; function receives it. */
   instructions?: InstructionsOption;
+  /**
+   * Modal Volumes to mount, keyed by absolute mount path inside the sandbox.
+   *
+   * The working directory must not be a mount path or sit inside one, otherwise
+   * `reloadVolumes()` fails. Writes made by other sandboxes only become visible
+   * in a long-lived sandbox after calling `reloadVolumes()`.
+   *
+   * @example
+   * ```typescript
+   * const volume = await modal.volumes.fromName('agent-files', { createIfMissing: true });
+   * new ModalSandbox({ volumes: { '/mnt/agent': volume }, workingDirectory: '/workspace' });
+   * ```
+   */
+  volumes?: Record<string, Volume>;
 }
 
 // =============================================================================
@@ -92,17 +109,17 @@ export class ModalSandbox extends MastraSandbox {
   private readonly baseImage: string;
   private readonly timeoutMs: number;
   private readonly env: Record<string, string>;
-  private readonly workdir?: string;
   private readonly tokenId?: string;
   private readonly tokenSecret?: string;
   private readonly _instructionsOverride?: InstructionsOption;
+  private readonly volumes?: Record<string, Volume>;
   private readonly _constructorOptions: ModalSandboxOptions;
 
   constructor(options: ModalSandboxOptions = {}) {
     super({
       ...options,
       name: 'ModalSandbox',
-      processes: new ModalProcessManager({ env: options.env ?? {} }),
+      processes: new ModalProcessManager(),
     });
 
     this.id = options.id ?? this._generateId();
@@ -110,10 +127,14 @@ export class ModalSandbox extends MastraSandbox {
     this.baseImage = options.baseImage ?? 'ubuntu:22.04';
     this.timeoutMs = options.timeoutMs ?? 300_000;
     this.env = options.env ?? {};
-    this.workdir = options.workdir;
+    if (options.workingDirectory === undefined && options.workdir !== undefined) {
+      this.setWorkingDirectory(options.workdir);
+    }
     this.tokenId = options.tokenId;
     this.tokenSecret = options.tokenSecret;
     this._instructionsOverride = options.instructions;
+    this.volumes = options.volumes && Object.keys(options.volumes).length > 0 ? options.volumes : undefined;
+    this._assertWorkdirOutsideVolumes();
     this._constructorOptions = { ...options };
   }
 
@@ -137,6 +158,7 @@ export class ModalSandbox extends MastraSandbox {
       ...base,
       ...(options.id !== undefined && { id: options.id }),
       ...(options.env !== undefined && { env: options.env }),
+      ...(options.workingDirectory !== undefined && { workingDirectory: options.workingDirectory }),
       ...(options.idleTimeoutMinutes !== undefined && { timeoutMs: options.idleTimeoutMinutes * 60_000 }),
     });
   }
@@ -184,7 +206,8 @@ export class ModalSandbox extends MastraSandbox {
         name: this.id,
         timeoutMs: this.timeoutMs,
         env: Object.keys(this.env).length > 0 ? this.env : undefined,
-        workdir: this.workdir,
+        workdir: this.workingDirectory,
+        volumes: this.volumes,
       });
       this._createdAt = new Date();
       this.logger.debug(`${LOG_PREFIX} Created new sandbox from snapshot: ${this._sb?.sandboxId}`);
@@ -197,7 +220,8 @@ export class ModalSandbox extends MastraSandbox {
       name: this.id,
       timeoutMs: this.timeoutMs,
       env: Object.keys(this.env).length > 0 ? this.env : undefined,
-      workdir: this.workdir,
+      workdir: this.workingDirectory,
+      volumes: this.volumes,
     });
     this._createdAt = new Date();
     this.logger.debug(`${LOG_PREFIX} Created sandbox: ${this._sb.sandboxId}`);
@@ -259,6 +283,16 @@ export class ModalSandbox extends MastraSandbox {
     }
 
     this._imageSnapshot = null;
+  }
+
+  /**
+   * Reload all Volumes mounted in the sandbox so it sees writes committed by
+   * other sandboxes or clients.
+   *
+   * @throws {SandboxNotReadyError} If the sandbox has not been started.
+   */
+  async reloadVolumes(params?: SandboxReloadVolumesParams): Promise<void> {
+    await this.retryOnDead(() => this.modal.reloadVolumes(params));
   }
 
   async getInfo(): Promise<SandboxInfo> {
@@ -334,6 +368,25 @@ export class ModalSandbox extends MastraSandbox {
   // ---------------------------------------------------------------------------
   // Internal Helpers
   // ---------------------------------------------------------------------------
+
+  private _assertWorkdirOutsideVolumes(): void {
+    const workdir = this.workingDirectory;
+    if (!this.volumes || !workdir) return;
+    const normalize = (p: string) => {
+      let end = p.length;
+      while (end > 1 && p[end - 1] === '/') end--;
+      return p.slice(0, end);
+    };
+    const dir = normalize(workdir);
+    for (const mountPath of Object.keys(this.volumes)) {
+      const mount = normalize(mountPath);
+      if (dir === mount || dir.startsWith(`${mount}/`)) {
+        throw new Error(
+          `${LOG_PREFIX} workingDirectory "${workdir}" must be outside Volume mount "${mountPath}"; reloadVolumes() fails when the working directory is inside a mount.`,
+        );
+      }
+    }
+  }
 
   private _generateId(): string {
     return `modal-sandbox-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;

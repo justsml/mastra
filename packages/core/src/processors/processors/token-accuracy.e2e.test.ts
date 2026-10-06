@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { openai } from '@ai-sdk/openai';
+import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { getLLMTestMode, defaultNameGenerator, getLLMRecordingsDir } from '@internal/llm-recorder';
 import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -8,6 +9,7 @@ import { z } from 'zod/v4';
 
 import { Agent } from '../../agent';
 import type { MastraDBMessage } from '../../agent/message-list';
+
 import { MessageList } from '../../agent/message-list';
 import { generateConversationHistory } from '../../agent/test-utils';
 import { createTool } from '../../tools';
@@ -31,48 +33,51 @@ describe('TokenLimiterProcessor', () => {
     });
 
     const limiter = new TokenLimiterProcessor(200);
-    const mockAbort = vi.fn() as any;
     const messageList = new MessageList({ threadId: '1', resourceId: 'test-resource' });
     for (const msg of messagesV2) {
       messageList.add(msg, 'input');
     }
 
-    await limiter.processInputStep({
-      messageList,
-      messages: messageList.get.all.db(),
-      abort: mockAbort,
+    const prompt = await messageList.get.all.aiV5.llmPrompt();
+    const result = await limiter.processLLMRequest({
+      prompt,
+      model: { modelId: 'test-model' } as any,
       stepNumber: 0,
       steps: [],
       state: {},
-      systemMessages: [],
-      model: { modelId: 'test-model' } as any,
-      retryCount: 0,
     });
 
-    const result = messageList.get.all.db();
-
     // Should prioritize newest messages (higher ids)
-    expect(result.length).toBe(2);
-    expect(result[0].id).toBe('message-8');
-    expect(result[1].id).toBe('message-9');
+    expect(prompt.length).toBe(10);
+    expect(result?.prompt?.length).toBe(2);
+    expect(result?.prompt).toEqual(prompt.slice(-2));
+
+    // Limiting is transient: nothing is deleted from storage
+    expect(messageList.get.all.db().length).toBe(10);
+    expect(messageList.get.all.db().map(m => m.id)).toEqual([
+      'message-0',
+      'message-1',
+      'message-2',
+      'message-3',
+      'message-4',
+      'message-5',
+      'message-6',
+      'message-7',
+      'message-8',
+      'message-9',
+    ]);
   });
 
   it('should throw TripWire for empty messages array', async () => {
     const limiter = new TokenLimiterProcessor(1000);
-    const mockAbort = vi.fn() as any;
-    const emptyMessageList = new MessageList({ threadId: 'test-empty', resourceId: 'test' });
 
     await expect(
-      limiter.processInputStep({
-        messageList: emptyMessageList,
-        messages: [],
-        abort: mockAbort,
+      limiter.processLLMRequest({
+        prompt: [],
+        model: { modelId: 'test-model' } as any,
         stepNumber: 0,
         steps: [],
         state: {},
-        systemMessages: [],
-        model: { modelId: 'test-model' } as any,
-        retryCount: 0,
       }),
     ).rejects.toThrow('TokenLimiterProcessor: No messages to process');
   });
@@ -92,24 +97,22 @@ describe('TokenLimiterProcessor', () => {
       encoding: { foo: 'bar' } as unknown,
     });
 
-    const mockAbort = vi.fn() as any;
     const messageList = new MessageList({ threadId: '6', resourceId: 'test-resource' });
     for (const msg of messagesV2) {
       messageList.add(msg, 'input');
     }
 
-    await limiter.processInputStep({
-      messageList,
-      messages: messageList.get.all.db(),
-      abort: mockAbort,
+    const prompt = await messageList.get.all.aiV5.llmPrompt();
+    const result = await limiter.processLLMRequest({
+      prompt,
+      model: { modelId: 'test-model' } as any,
       stepNumber: 0,
       steps: [],
       state: {},
-      systemMessages: [],
-      model: { modelId: 'test-model' } as any,
-      retryCount: 0,
     });
 
+    // Nothing is trimmed at this limit, so the prompt passes through untouched
+    expect(result).toBeUndefined();
     expect(messageList.get.all.db().length).toBe(messagesV2.length);
   });
 
@@ -305,9 +308,31 @@ describe('TokenLimiterProcessor', () => {
 });
 
 describe('ToolCallFilter', () => {
-  const abort: (reason?: string) => never = reason => {
-    throw new Error(reason || 'abort should not be called in this test');
+  const runFilter = async (filter: ToolCallFilter, messageList: MessageList) => {
+    const prompt = await messageList.get.all.aiV5.llmPrompt();
+    const result = await filter.processLLMRequest?.({
+      prompt,
+      model: 'test-model' as any,
+      stepNumber: 0,
+      steps: [],
+      state: {},
+      abort: ((reason?: string) => {
+        throw new Error(reason || 'abort should not be called in this test');
+      }) as (reason?: string) => never,
+    } as any);
+    return result?.prompt ?? prompt;
   };
+
+  const toolPartsIn = (prompt: LanguageModelV2Prompt, toolName?: string) =>
+    prompt.flatMap(message =>
+      typeof message.content === 'string'
+        ? []
+        : (message.content as any[]).filter(
+            part =>
+              (part.type === 'tool-call' || part.type === 'tool-result') &&
+              (toolName === undefined || part.toolName === toolName),
+          ),
+    );
 
   it('should exclude all tool calls when created with no arguments', async () => {
     const { messagesV2 } = generateConversationHistory({
@@ -316,17 +341,11 @@ describe('ToolCallFilter', () => {
       messageCount: 1,
       toolFrequency: 1,
     });
-    const filter = new ToolCallFilter();
     const messageList = new MessageList().add(messagesV2, 'memory');
-    const result = (await filter.processInput({
-      messages: messagesV2,
-      messageList,
-      abort,
-    })) as MastraDBMessage[];
 
-    // Should only keep the text message and assistant res
-    expect(result.length).toBe(2);
-    expect(result[0].id).toBe('message-0');
+    const result = await runFilter(new ToolCallFilter(), messageList);
+
+    expect(toolPartsIn(result)).toHaveLength(0);
   });
 
   it('should exclude specific tool calls by name', async () => {
@@ -336,40 +355,12 @@ describe('ToolCallFilter', () => {
       messageCount: 3,
       toolFrequency: 1,
     });
-    const filter = new ToolCallFilter({ exclude: ['weather'] });
     const messageList = new MessageList().add(messagesV2, 'memory');
-    const result = (await filter.processInput({
-      messages: messagesV2,
-      messageList,
-      abort,
-    })) as MastraDBMessage[];
 
-    // With messageCount: 3 and toolFrequency: 1:
-    // i=0: user (message-0), assistant without tool (message-1)
-    // i=1: user (message-2), assistant with weather tool (removed)
-    // i=2: user (message-4), assistant with calculator tool (kept)
-    // Result: 6 messages (weather tool message removed entirely since it has no other parts)
-    expect(result.length).toBe(6);
+    const result = await runFilter(new ToolCallFilter({ exclude: ['weather'] }), messageList);
 
-    // Check that weather tool invocations are removed
-    const weatherToolInvocations = result.flatMap(m => {
-      if (typeof m.content === 'string') return [];
-      if (!m.content?.parts) return [];
-      return m.content.parts.filter(
-        (p: any) => p.type === 'tool-invocation' && p.toolInvocation?.toolName === 'weather',
-      );
-    });
-    expect(weatherToolInvocations.length).toBe(0);
-
-    // Check that calculator tool invocations are kept
-    const calculatorToolInvocations = result.flatMap(m => {
-      if (typeof m.content === 'string') return [];
-      if (!m.content?.parts) return [];
-      return m.content.parts.filter(
-        (p: any) => p.type === 'tool-invocation' && p.toolInvocation?.toolName === 'calculator',
-      );
-    });
-    expect(calculatorToolInvocations.length).toBeGreaterThan(0);
+    expect(toolPartsIn(result, 'weather')).toHaveLength(0);
+    expect(toolPartsIn(result, 'calculator').length).toBeGreaterThan(0);
   });
 
   it('should keep all messages when exclude list is empty', async () => {
@@ -377,16 +368,11 @@ describe('ToolCallFilter', () => {
       threadId: '5',
       toolNames: ['weather', 'calculator'],
     });
-
-    const filter = new ToolCallFilter({ exclude: [] });
     const messageList = new MessageList().add(messagesV2, 'memory');
-    const result = (await filter.processInput({
-      messages: messagesV2,
-      messageList,
-      abort,
-    })) as MastraDBMessage[];
+    const prompt = await messageList.get.all.aiV5.llmPrompt();
 
-    // Should keep all messages
-    expect(result.length).toBe(messagesV2.length);
+    const result = await runFilter(new ToolCallFilter({ exclude: [] }), messageList);
+
+    expect(result).toEqual(prompt);
   });
 });

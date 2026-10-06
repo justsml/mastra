@@ -16,7 +16,12 @@ import { stepCountIs } from '@internal/ai-sdk-v5';
 import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
 import { createTool } from '../../../../tools';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import {
+  runLoopScenario,
+  useLoopScenarioAimock,
+  describeForAllEngines,
+  isDurableEngineVariant,
+} from '../aimock-scenario';
 
 describeForAllEngines('AIMock loop scenario: input step processor (per-step)', engine => {
   const getMock = useLoopScenarioAimock();
@@ -138,5 +143,63 @@ describeForAllEngines('AIMock loop scenario: input step processor (per-step)', e
 
     // The second step has more messages than the first (accumulated context)
     expect(messagesByStep[1].length).toBeGreaterThan(messagesByStep[0].length);
+  });
+
+  it('processInputStep sees populated content/toolCalls for previous steps', async () => {
+    const lookupTool = createTool({
+      id: 'lookup',
+      description: 'Look up a value.',
+      inputSchema: z.object({ key: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ key }) => ({ value: `VALUE_FOR_${key}` }),
+    });
+
+    const stepsByCall: Array<Array<{ types: string[]; toolCallNames: string[] }>> = [];
+
+    const inputStepProcessor = {
+      id: 'step-content-tracker',
+      async processInputStep({ steps, messages }: { steps: any[]; messages: Array<{ role: string }> }) {
+        stepsByCall.push(
+          (steps || []).map(step => ({
+            types: (step.content || []).map((part: any) => part.type),
+            toolCallNames: (step.toolCalls || []).map((call: any) => call.toolName ?? call.payload?.toolName),
+          })),
+        );
+        return messages;
+      },
+    };
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Look up the value for key alpha.',
+      tools: { lookup: lookupTool },
+      stopWhen: stepCountIs(5),
+      inputProcessors: [inputStepProcessor],
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call_lookup', name: 'lookup', arguments: { key: 'alpha' } }] },
+        );
+        llm.on({ endpoint: 'chat', hasToolResult: true }, { content: 'The value for alpha is VALUE_FOR_alpha.' });
+      },
+    });
+
+    expect(stepsByCall).toHaveLength(2);
+    // First call: no completed steps yet.
+    expect(stepsByCall[0]).toEqual([]);
+
+    if (isDurableEngineVariant(engine)) {
+      // The durable workflow keeps completed steps on its workflow state and
+      // never forwards them to processInputStep, so there is nothing to assert
+      // about step content here. Tracked separately from this fix.
+      return;
+    }
+
+    // Second call: the completed tool-call step must expose its content and
+    // toolCalls (this was `[]` before the modelContent off-by-one fix).
+    expect(stepsByCall[1]).toHaveLength(1);
+    expect(stepsByCall[1][0].types).toEqual(expect.arrayContaining(['tool-call', 'tool-result']));
+    expect(stepsByCall[1][0].toolCallNames).toEqual(['lookup']);
   });
 });

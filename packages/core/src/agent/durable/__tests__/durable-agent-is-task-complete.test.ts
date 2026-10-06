@@ -15,6 +15,7 @@ import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
 import { RequestContext } from '../../../request-context';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
@@ -195,6 +196,37 @@ describe('DurableAgent isTaskComplete', () => {
     expect(textEnd).toHaveLength(1);
   });
 
+  it('does not persist the completion report to memory when the check passes', async () => {
+    const memory = new MockMemory();
+    const model = createTextModel('Here is the final answer.');
+    const baseAgent = new Agent({
+      id: 'task-complete-no-report-agent',
+      name: 'Task Complete No Report Agent',
+      instructions: 'noop',
+      model: model as LanguageModelV2,
+      memory,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const scorer = passingScorer();
+
+    const { output, cleanup } = await durableAgent.stream('go', {
+      isTaskComplete: {
+        scorers: [scorer as any],
+      } as any,
+      maxSteps: 3,
+      memory: { thread: 'thread-no-report', resource: 'resource-no-report' },
+    });
+
+    await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    const recalled = await memory.recall({ threadId: 'thread-no-report', resourceId: 'resource-no-report' });
+    const persistedText = JSON.stringify(recalled.messages);
+    expect(persistedText).toContain('Here is the final answer.');
+    expect(persistedText).not.toContain('Completion Check Results');
+  });
+
   it('continues the loop with feedback when scorers reject the answer, then stops at maxSteps', async () => {
     const model = createSequencedTextModel(['first try', 'second try', 'third try']);
     const baseAgent = new Agent({
@@ -290,5 +322,116 @@ describe('DurableAgent isTaskComplete', () => {
     const taskChunks = chunks.filter(c => c.type === 'is-task-complete');
     expect(taskChunks.length).toBeGreaterThanOrEqual(1);
     expect(taskChunks.every(c => c.payload.suppressFeedback === true)).toBe(true);
+  });
+
+  // #21897 (ported from the regular loop's #22273 fix): a provider can close
+  // the stream cleanly with finishReason 'other' and zero output. Before the
+  // fix, the completion checker would grade the empty answer, fail it, and
+  // re-issue the identical request every iteration until maxSteps.
+  it('terminates with a stream error instead of spinning when the model finishes "other" with no output', async () => {
+    let doStreamCalls = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        doStreamCalls++;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: `id-${doStreamCalls}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+            {
+              type: 'finish',
+              finishReason: 'other',
+              usage: { inputTokens: 10, outputTokens: 0, totalTokens: 10 },
+            },
+          ]),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+        };
+      },
+    });
+    const baseAgent = new Agent({
+      id: 'task-complete-zero-output-agent',
+      name: 'Task Complete Zero Output Agent',
+      instructions: 'noop',
+      model: model as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const scorer = failingScorer(0, 'incomplete');
+
+    const { output, cleanup } = await durableAgent.stream('go', {
+      isTaskComplete: {
+        scorers: [scorer as any],
+      } as any,
+      maxSteps: 4,
+    });
+
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    // The request must not be re-issued — one attempt, then a terminal error.
+    expect(doStreamCalls).toBe(1);
+
+    // The zero-output finish surfaces as a stream error instead of a silent
+    // empty success.
+    const errorChunks = chunks.filter(c => c.type === 'error');
+    expect(errorChunks.length).toBeGreaterThanOrEqual(1);
+    expect(errorChunks[0].payload?.error?.message).toContain('finishReason "other"');
+
+    // The errored iteration is never graded, so the checker can't flip the
+    // loop back on.
+    expect(scorer.run).not.toHaveBeenCalled();
+    expect(chunks.filter(c => c.type === 'is-task-complete')).toHaveLength(0);
+
+    const finishChunk = chunks.findLast((c: any) => c.type === 'step-finish');
+    expect(finishChunk?.payload?.stepResult).toMatchObject({ reason: 'error', isContinued: false });
+  });
+
+  it('still grades a finishReason "other" iteration that produced output', async () => {
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: 'partial but real output' },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'other',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+    });
+    const baseAgent = new Agent({
+      id: 'task-complete-other-output-agent',
+      name: 'Task Complete Other Output Agent',
+      instructions: 'noop',
+      model: model as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const scorer = passingScorer(1, 'good enough');
+
+    const { output, cleanup } = await durableAgent.stream('go', {
+      isTaskComplete: {
+        scorers: [scorer as any],
+      } as any,
+      maxSteps: 3,
+    });
+
+    const chunks = await drain(output.fullStream as unknown as ReadableStream<any>);
+    await cleanup();
+
+    // A finish with reason 'other' that DID produce output is not an error.
+    expect(chunks.filter(c => c.type === 'error')).toHaveLength(0);
+
+    // The checker still grades it as usual.
+    expect(scorer.run).toHaveBeenCalledTimes(1);
+    const taskChunks = chunks.filter(c => c.type === 'is-task-complete');
+    expect(taskChunks).toHaveLength(1);
+    expect(taskChunks[0].payload.passed).toBe(true);
   });
 });

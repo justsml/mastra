@@ -1,17 +1,22 @@
 import type { Agent } from '../agent';
-import type { MastraDBMessage } from '../agent/message-list/state/types';
+import type { MastraDBMessage, MastraMessagePart } from '../agent/message-list/state/types';
 import type { AgentInstructions, ToolsInput } from '../agent/types';
+import type { BackgroundTaskManagerConfig } from '../background-tasks';
 import type { MastraBrowser } from '../browser/browser';
+import type { AgentControllerChannelsConfig } from '../channels/agent-controller-channels';
 import type { PubSub } from '../events/pubsub';
 import type { MastraModelGatewayInterface } from '../llm/model/gateways';
+import type { MastraModelConfig } from '../llm/model/shared.types';
 import type { LoopOptions } from '../loop/types';
 import type { MastraMemory } from '../memory/memory';
 import type { ObservabilityEntrypoint } from '../observability/types/core';
+import type { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
 import type { MastraCompositeStore } from '../storage/base';
 import type { GoalEvaluationPayload } from '../stream/types';
 import type { DynamicArgument } from '../types';
 import type { Workspace, WorkspaceStatus } from '../workspace';
+import type { Session } from './session';
 import type { TaskItemSnapshot } from './tools';
 
 // =============================================================================
@@ -49,7 +54,7 @@ interface AgentControllerModeBase {
 
   name?: string;
 
-  /** bootstrap model default when a session enters this mode. */
+  /** Seeds sessions that start in this mode and remains the subagent fallback. Mode switches do not apply it. */
   defaultModelId?: string;
 
   /** Surfaced in mode pickers / Studio UI. Free text. */
@@ -220,6 +225,24 @@ export type BuiltinToolId =
   | 'task_check'
   | 'subagent';
 
+/** Process-local listener notified after AgentController materializes a live session. */
+export type AgentControllerSessionCreatedListener<TState = {}> = (session: Session<TState>) => void | Promise<void>;
+
+/** Options for {@link AgentController.onSessionCreated}. */
+export interface AgentControllerSessionCreatedOptions {
+  /**
+   * Make `createSession()` await this listener before resolving a newly
+   * materialized session. Blocking listeners run sequentially in registration
+   * order, before fire-and-forget listeners are notified. Failures are
+   * isolated and logged, never thrown. Keep the work short — it holds up every
+   * caller awaiting that session's creation.
+   */
+  blocking?: boolean;
+}
+
+/** Process-local listener notified after AgentController tears down a live session. */
+export type AgentControllerSessionDeletedListener<TState = {}> = (session: Session<TState>) => void | Promise<void>;
+
 export interface AgentControllerConfig<TState = {}> {
   /** Unique identifier for this controller instance */
   id: string;
@@ -232,6 +255,9 @@ export interface AgentControllerConfig<TState = {}> {
 
   /** Storage backend for persistence (threads, messages, state) */
   storage?: MastraCompositeStore;
+
+  /** Background task configuration for the controller's standalone internal Mastra instance. */
+  backgroundTasks?: BackgroundTaskManagerConfig;
 
   /** Schema defining the shape of controller state (Zod, JSON Schema, Standard Schema, etc.) */
   stateSchema?: PublicSchema<TState, any>;
@@ -247,6 +273,19 @@ export interface AgentControllerConfig<TState = {}> {
 
   /** Shared backing agent that each mode forks and decorates on the controller. */
   agent?: Agent<any, any, any, any>;
+
+  /**
+   * Chat channel adapters (Slack, Discord, ...) that run this controller
+   * inside messaging threads. Inbound platform messages route into a
+   * controller `Session` (one durable session per chat thread) and the
+   * streamed output renders back to the platform through the channels
+   * output processor (native streaming, tool cards, typing status).
+   * Tool approvals resolve through the session's approval gate.
+   *
+   * V1 expects manually constructed adapters and a long-lived server
+   * (controller sessions are in-memory and don't survive restarts).
+   */
+  channels?: AgentControllerChannelsConfig;
 
   /** Default mode to enter when a thread has no persisted mode. */
   defaultModeId?: string;
@@ -305,6 +344,13 @@ export interface AgentControllerConfig<TState = {}> {
    * that parent agents can call to spawn focused subagents.
    */
   subagents?: AgentControllerSubagent[];
+
+  /**
+   * Resolves a subagent's model id for the run that spawned it. Without it the
+   * bare id resolves through {@link gateways}; provide it when model resolution
+   * depends on the request (tenant credentials, request-scoped custom providers).
+   */
+  resolveSubagentModel?: (modelId: string, options: { requestContext?: RequestContext }) => MastraModelConfig;
 
   /**
    * Model gateways registered on AgentController' internal Mastra instance.
@@ -485,6 +531,8 @@ export interface TokenUsage {
   reasoningTokens?: number;
   cachedInputTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheCreationInputTokens5m?: number;
+  cacheCreationInputTokens1h?: number;
   raw?: unknown;
 }
 
@@ -578,6 +626,7 @@ export interface ActiveSubagentState {
   toolCalls: Array<{ name: string; isError: boolean }>;
   textDelta: string;
   status: 'running' | 'completed' | 'error';
+  startedAt?: number;
   durationMs?: number;
   result?: string;
 }
@@ -588,8 +637,8 @@ export type AgentControllerSubagentHistoryEntry = Omit<ActiveSubagentState, 'sta
  * Canonical display state maintained by the AgentController.
  *
  * This is the single source of truth for *what to display*.
- * Any UI (TUI, web, desktop) can subscribe to snapshots of this state
- * instead of interpreting 35+ raw event types.
+ * Any UI (TUI, web, desktop) can subscribe to updates of this state instead
+ * of interpreting 35+ raw event types.
  *
  * The AgentController updates this state alongside every event emission,
  * then emits a `display_state_changed` event so UIs can react.
@@ -600,7 +649,10 @@ export interface AgentControllerDisplayState {
   isRunning: boolean;
 
   // ── Current streaming message ────────────────────────────────────────
-  /** The message currently being streamed (null when idle) */
+  /**
+   * The live message currently being streamed (null when idle). Its content
+   * mutates as deltas arrive; copy it before retaining a point-in-time value.
+   */
   currentMessage: MastraDBMessage | null;
 
   // ── Follow-up queue ──────────────────────────────────────────────────
@@ -620,12 +672,22 @@ export interface AgentControllerDisplayState {
   toolInputBuffers: Map<string, { text: string; toolName: string }>;
 
   // ── Tool approval ────────────────────────────────────────────────────
-  /** A tool awaiting user approval (null when no approval pending) */
-  pendingApproval: {
-    toolCallId: string;
-    toolName: string;
-    args: unknown;
-  } | null;
+  /**
+   * Tools awaiting user approval, keyed by toolCallId. Each entry carries the
+   * thread that produced the call, so an approval parked on one thread can never
+   * shadow another thread's. More than one can be parked at once (e.g. a
+   * foreground run and a background/sub-agent run on a detached thread).
+   */
+  pendingApprovals: Map<
+    string,
+    {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      /** Thread that produced the gated call, when the producer knew it. */
+      threadId?: string;
+    }
+  >;
 
   // ── Tool suspension ─────────────────────────────────────────────────
   /**
@@ -681,7 +743,7 @@ export function defaultDisplayState(): AgentControllerDisplayState {
     tokenUsage: createEmptyTokenUsage(),
     activeTools: new Map(),
     toolInputBuffers: new Map(),
-    pendingApproval: null,
+    pendingApprovals: new Map(),
     pendingSuspensions: new Map(),
     activeSubagents: new Map(),
     omProgress: defaultOMProgressState(),
@@ -730,11 +792,32 @@ export function defaultOMProgressState(): OMProgressState {
 // =============================================================================
 
 /**
+ * Reasoning-effort levels a session can select alongside its model. Mirrors the
+ * persisted `thinkingLevel` session-state key so a model switch can carry the
+ * level that should take effect with it.
+ */
+export type AgentControllerThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
  * Events emitted by the controller that UIs can subscribe to.
+ *
+ * A logical message emits one `message_start` containing its initial
+ * `MastraDBMessage`, zero or more compact id-addressed `message_update` deltas,
+ * and one id-only `message_end` after terminal metadata has been applied.
+ * Consumers reconstruct streamed text, reasoning, and non-text message parts
+ * from ordered deltas, then use the id-only end to finalize the matching entry.
  */
 export type AgentControllerEvent =
   | { type: 'mode_changed'; modeId: string; previousModeId: string }
-  | { type: 'model_changed'; modelId: string; scope?: 'global' | 'thread' | 'mode'; modeId?: string }
+  | {
+      type: 'model_changed';
+      modelId: string;
+      /**
+       * The current session thinking level, including for model-only switches.
+       * Undefined when the session has no thinking-level override.
+       */
+      thinkingLevel: AgentControllerThinkingLevel | undefined;
+    }
   | { type: 'thread_changed'; threadId: string; previousThreadId: string | null }
   | { type: 'thread_created'; thread: AgentControllerThread }
   | { type: 'thread_deleted'; threadId: string }
@@ -742,34 +825,81 @@ export type AgentControllerEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; reason?: 'complete' | 'aborted' | 'error' | 'suspended' }
   | { type: 'message_start'; message: MastraDBMessage }
-  | { type: 'message_update'; message: MastraDBMessage }
-  | { type: 'message_end'; message: MastraDBMessage }
-  | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown }
-  | { type: 'tool_approval_required'; toolCallId: string; toolName: string; args: unknown }
   | {
-      type: 'tool_suspended';
-      toolCallId: string;
-      toolName: string;
-      args: unknown;
-      suspendPayload: unknown;
-      resumeSchema?: string;
+      type: 'message_update';
+      id: string;
+      event:
+        | { type: 'text-delta'; delta: string }
+        | { type: 'reasoning-delta'; index: number; delta: string }
+        | { type: 'part'; index: number; part: MastraMessagePart };
     }
-  | { type: 'tool_suspension_cancelled'; toolCallId: string; toolName: string; reason: string }
-  | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
-  | {
-      type: 'tool_end';
-      toolCallId: string;
-      result: unknown;
-      isError: boolean;
-      providerMetadata?: Record<string, unknown>;
-    }
-  | { type: 'tool_input_start'; toolCallId: string; toolName: string }
-  | { type: 'tool_input_delta'; toolCallId: string; argsTextDelta: unknown; toolName?: string }
-  | { type: 'tool_input_end'; toolCallId: string }
-  | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
+  | { type: 'message_end'; id: string }
+  | ({ threadId?: string } & (
+      | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown; title?: string }
+      | { type: 'tool_approval_required'; toolCallId: string; toolName: string; args: unknown }
+      | {
+          type: 'tool_suspended';
+          toolCallId: string;
+          toolName: string;
+          args: unknown;
+          suspendPayload: unknown;
+          resumeSchema?: string;
+        }
+      | { type: 'tool_suspension_cancelled'; toolCallId: string; toolName: string; reason: string }
+      | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
+      | {
+          type: 'tool_end';
+          toolCallId: string;
+          result: unknown;
+          isError: boolean;
+          /**
+           * True when the tool call resolved without ever running because the user
+           * denied its approval gate or the run was aborted while it was parked
+           * waiting for approval. `isError` stays `false` in that case (the tool
+           * did not fail — it simply never executed), so subscribers that gate on
+           * "the tool actually did work" must exclude `denied === true`.
+           */
+          denied?: boolean;
+          providerMetadata?: Record<string, unknown>;
+        }
+      | {
+          type: 'tool_input_start';
+          toolCallId: string;
+          toolName: string;
+          title?: string;
+          /**
+           * Assistant message the tool call belongs to, so consumers can attribute
+           * streamed arguments to the model step that produced them. Tool-call chunks
+           * can precede this step's `message_start`, so the id is the only way to tell
+           * one step's arguments from the next step's.
+           */
+          messageId?: string;
+        }
+      | {
+          type: 'tool_input_delta';
+          toolCallId: string;
+          argsTextDelta: unknown;
+          toolName?: string;
+          /** Assistant message the tool call belongs to; see `tool_input_start.messageId`. */
+          messageId?: string;
+        }
+      | { type: 'tool_input_end'; toolCallId: string; messageId?: string }
+      | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
+      | { type: 'command_exit'; toolCallId: string; exitCode: number; success: boolean }
+    ))
   | { type: 'usage_update'; usage: TokenUsage }
   | { type: 'info'; message: string }
-  | { type: 'error'; error: Error; errorType?: string; retryable?: boolean; retryDelay?: number }
+  | {
+      type: 'error';
+      error: Error;
+      /** Provider finish reason when a response ended without normal completion. */
+      finishReason?: string;
+      errorType?: string;
+      retryable?: boolean;
+      retryDelay?: number;
+      retryAttempt?: number;
+      maxRetries?: number;
+    }
   | { type: 'follow_up_queued'; count: number; runId?: string }
   | { type: 'workspace_status_changed'; status: WorkspaceStatus; error?: Error }
   | { type: 'workspace_ready'; workspaceId: string; workspaceName: string }
@@ -865,6 +995,7 @@ export type AgentControllerEvent =
       currentModel?: string;
     }
   | { type: 'om_thread_title_updated'; cycleId: string; threadId: string; oldTitle?: string; newTitle: string }
+  | { type: 'thread_title_updated'; threadId: string; title: string }
   | { type: 'subagent_start'; toolCallId: string; agentType: string; task: string; modelId: string; forked?: boolean }
   | { type: 'subagent_text_delta'; toolCallId: string; agentType: string; textDelta: string }
   | {
@@ -981,7 +1112,16 @@ export interface AgentControllerRequestContext<TState = unknown> {
   /** Update controller state from the latest state snapshot in a serialized transaction. */
   updateState?: <TResult>(updater: AgentControllerRequestStateUpdater<TState, TResult>) => Promise<TResult>;
 
-  /** Current thread ID */
+  /** Read a setting from the thread captured for this request. */
+  getThreadSetting?: (key: string) => Promise<unknown>;
+
+  /** Persist a setting on the thread captured for this request. */
+  setThreadSetting?: (setting: { key: string; value: unknown }) => Promise<void>;
+
+  /** Whether the thread captured for this request is still active in the session. */
+  isThreadActive?: () => boolean;
+
+  /** Thread ID captured for this request. */
   threadId: string | null;
 
   /** Current resource ID */

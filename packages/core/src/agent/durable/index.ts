@@ -23,6 +23,8 @@
  * 2. **Pluggable Cache**: Use InMemoryServerCache (default) or custom backends (Redis, etc.)
  * 3. **Cache Inheritance**: Durable agents inherit cache from Mastra if not explicitly provided
  * 4. **Durable Execution**: Run agentic loops on workflow engines (Inngest, evented, etc.)
+ * 5. **Crash Recovery**: In-flight runs persist their state; a fresh process over the
+ *    same storage can resume them via `recover(runId)` / `recoverActiveRuns()`
  *
  * @example Basic usage with resumable streams
  * ```typescript
@@ -101,6 +103,10 @@ export { prepareForDurableExecution, type PreparationOptions, type PreparationRe
 // Run registry for non-serializable state
 export { RunRegistry, ExtendedRunRegistry, globalRunRegistry, type ExtendedRunRegistryEntry } from './run-registry';
 
+// Shared thread-stream runtime, so durable-agent integrations outside core
+// (e.g. @mastra/inngest) can register their runs the same way DurableAgent does.
+export { agentThreadStreamRuntime } from '../thread-stream-runtime';
+
 // Stream adapter for pubsub-based streaming
 export {
   createDurableAgentStream,
@@ -115,7 +121,15 @@ export {
 } from './stream-adapter';
 
 // Constants
-export { AGENT_STREAM_TOPIC, AgentStreamEventTypes, DurableAgentDefaults, DurableStepIds } from './constants';
+export {
+  AGENT_STREAM_TOPIC,
+  AGENT_CONTROL_TOPIC,
+  AgentStreamEventTypes,
+  AgentControlEventTypes,
+  DurableAgentDefaults,
+  DurableStepIds,
+} from './constants';
+export { publishAbortRequest, subscribeToAbortRequests, ensureRemoteAbortListener } from './abort-transport';
 
 // Types
 export type {
@@ -168,7 +182,13 @@ export {
 } from './utils/resolve-runtime';
 
 // Workflow creation
-export { createDurableAgenticWorkflow, type DurableAgenticWorkflowOptions } from './workflows';
+export {
+  createDurableAgenticWorkflow,
+  runDurableFinishSideEffects,
+  type DurableAgenticWorkflowOptions,
+  type DurableFinishSideEffectsOptions,
+  type DurableFinishSideEffectsResult,
+} from './workflows';
 
 // Workflow steps (for advanced customization)
 export {
@@ -180,7 +200,7 @@ export {
 
 // Shared workflow utilities
 export {
-  executeDurableToolCalls,
+  executeDurableAgentScorers,
   modelConfigSchema,
   modelListEntrySchema,
   accumulatedUsageSchema,
@@ -193,10 +213,14 @@ export {
   resolveDurableToolCallConcurrency,
 } from './workflows/shared';
 export type {
-  ToolExecutionContext,
-  ToolExecutionError,
+  ExecuteDurableAgentScorersParams,
   BaseIterationState,
   AccumulatedUsage,
   IterationStateUpdateInput,
   StepRecord,
 } from './workflows/shared';
+
+// Deprecated pre-unification tool-execution helpers, kept so the public
+// surface stays additive at patch level. Removed in v2.
+export { executeDurableToolCalls } from './workflows/deprecated-tool-execution';
+export type { ToolExecutionContext, ToolExecutionError } from './workflows/deprecated-tool-execution';

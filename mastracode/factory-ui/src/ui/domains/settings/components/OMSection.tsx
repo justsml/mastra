@@ -1,0 +1,205 @@
+import { Badge } from '@mastra/playground-ui/components/Badge';
+import { Input } from '@mastra/playground-ui/components/Input';
+import { SegmentedControl, SegmentedControlItem } from '@mastra/playground-ui/components/SegmentedControl';
+import { SettingsRow } from '@mastra/playground-ui/new/settings';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { useState } from 'react';
+
+import {
+  useOMQuery,
+  useUpdateOMModel,
+  useUpdateOMObserveAttachments,
+  useUpdateOMThresholds,
+} from '../../../../hooks/use-om';
+import type { AvailableModelOption } from '../../../../hooks/useAvailableModels';
+import { SkeletonRows } from '../../../ui/SkeletonRows';
+import { ModelCombobox } from './ModelCombobox';
+
+type AttachmentChoice = 'auto' | 'on' | 'off';
+
+function attachmentToChoice(value: 'auto' | boolean): AttachmentChoice {
+  if (value === true) return 'on';
+  if (value === false) return 'off';
+  return 'auto';
+}
+
+function choiceToAttachment(choice: AttachmentChoice): 'auto' | boolean {
+  if (choice === 'on') return true;
+  if (choice === 'off') return false;
+  return 'auto';
+}
+
+function ThresholdInput({
+  value,
+  disabled,
+  onCommit,
+}: {
+  value: number;
+  disabled: boolean;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+
+  const commit = () => {
+    const parsed = Number(draft);
+    const rounded = Number.isFinite(parsed) ? Math.round(parsed) : NaN;
+    if (!Number.isFinite(rounded) || rounded <= 0) {
+      setDraft(String(value));
+      return;
+    }
+    setDraft(String(rounded));
+    if (rounded !== value) onCommit(rounded);
+  };
+
+  return (
+    <Input
+      size="sm"
+      type="number"
+      min={1}
+      step={1000}
+      value={draft}
+      disabled={disabled}
+      onChange={event => setDraft(event.target.value)}
+      onBlur={commit}
+    />
+  );
+}
+
+export function OMSection({
+  resourceId,
+  scope,
+  factoryId,
+  models,
+}: {
+  resourceId?: string;
+  scope?: string;
+  factoryId?: string;
+  models: AvailableModelOption[];
+}) {
+  const omQuery = useOMQuery(resourceId, scope, factoryId);
+  const observerMutation = useUpdateOMModel(resourceId, 'observer', scope, factoryId);
+  const reflectorMutation = useUpdateOMModel(resourceId, 'reflector', scope, factoryId);
+  const thresholdsMutation = useUpdateOMThresholds(resourceId, scope, factoryId);
+  const attachmentsMutation = useUpdateOMObserveAttachments(resourceId, scope, factoryId);
+
+  const config = omQuery.data?.config;
+  const configuredModelIds = new Set(models.map(model => model.id));
+  const observerAvailable = config !== undefined && configuredModelIds.has(config.observerModelId);
+  const reflectorAvailable = config !== undefined && configuredModelIds.has(config.reflectorModelId);
+  const modelsAvailable = observerAvailable && reflectorAvailable;
+  const loading = omQuery.isPending;
+  const busy =
+    observerMutation.isPending ||
+    reflectorMutation.isPending ||
+    thresholdsMutation.isPending ||
+    attachmentsMutation.isPending;
+  const mutationError = [
+    observerMutation.error,
+    reflectorMutation.error,
+    thresholdsMutation.error,
+    attachmentsMutation.error,
+  ].find(error => error instanceof Error);
+  const error = mutationError?.message ?? (omQuery.error instanceof Error ? omQuery.error.message : undefined);
+
+  const switchModel = (role: 'observer' | 'reflector', modelId: string) => {
+    if (!modelId) return;
+    const mutation = role === 'observer' ? observerMutation : reflectorMutation;
+    mutation.mutate({ modelId });
+  };
+
+  if (loading) {
+    return (
+      <div className="px-4 py-3">
+        <SkeletonRows label="Loading observational-memory settings" rows={4} rowClassName="h-10 w-full" />
+      </div>
+    );
+  }
+
+  const attachmentChoice = attachmentToChoice(config?.observeAttachments ?? 'auto');
+  return (
+    <>
+      {error && (
+        <Txt as="p" variant="caption" className="text-destructive-foreground px-4 py-3">
+          {error}
+        </Txt>
+      )}
+
+      {config && !modelsAvailable && (
+        <div className="flex items-center gap-2 px-4 py-3">
+          <Badge size="md" variant="warning">
+            Model credentials required
+          </Badge>
+          <Txt tone="muted" as="p" variant="meta">
+            Observational-memory model calls may fail until credentials are configured.
+          </Txt>
+        </div>
+      )}
+
+      <SettingsRow label="Observer model" description="Summarizes the conversation into observations">
+        <ModelCombobox
+          models={models}
+          value={config?.observerModelId ?? ''}
+          placeholder="Select observer model…"
+          disabled={busy}
+          onValueChange={modelId => switchModel('observer', modelId)}
+        />
+      </SettingsRow>
+
+      <SettingsRow label="Reflector model" description="Distills observations into longer-term memory">
+        <ModelCombobox
+          models={models}
+          value={config?.reflectorModelId ?? ''}
+          placeholder="Select reflector model…"
+          disabled={busy}
+          onValueChange={modelId => switchModel('reflector', modelId)}
+        />
+      </SettingsRow>
+
+      <SettingsRow label="Messages before observation" description="Message tokens processed before the observer runs.">
+        {config && (
+          <div className="w-full max-w-40">
+            <ThresholdInput
+              key={config.observationThreshold}
+              value={config.observationThreshold}
+              disabled={busy}
+              onCommit={observationThreshold => {
+                thresholdsMutation.mutate({ observationThreshold });
+              }}
+            />
+          </div>
+        )}
+      </SettingsRow>
+
+      <SettingsRow
+        label="Observations before reflection"
+        description="Observation tokens accumulated before the reflector runs."
+      >
+        {config && (
+          <div className="w-full max-w-40">
+            <ThresholdInput
+              key={config.reflectionThreshold}
+              value={config.reflectionThreshold}
+              disabled={busy}
+              onCommit={reflectionThreshold => {
+                thresholdsMutation.mutate({ reflectionThreshold });
+              }}
+            />
+          </div>
+        )}
+      </SettingsRow>
+
+      <SettingsRow label="Observe attachments" description="Whether attached files are included in observations">
+        <SegmentedControl
+          aria-label="Observe attachments"
+          value={attachmentChoice}
+          disabled={busy || !config}
+          onValueChange={choice => attachmentsMutation.mutate({ value: choiceToAttachment(choice) })}
+        >
+          <SegmentedControlItem value="auto">Auto</SegmentedControlItem>
+          <SegmentedControlItem value="on">On</SegmentedControlItem>
+          <SegmentedControlItem value="off">Off</SegmentedControlItem>
+        </SegmentedControl>
+      </SettingsRow>
+    </>
+  );
+}

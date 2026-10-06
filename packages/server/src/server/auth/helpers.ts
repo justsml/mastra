@@ -1,6 +1,7 @@
 import type { ISessionProvider } from '@mastra/core/auth';
 import type { IRBACProvider, EEUser } from '@mastra/core/auth/ee';
 import type { Mastra } from '@mastra/core/mastra';
+import { CompositeAuth } from '@mastra/core/server';
 import type { ApiRoute, IMastraAuthProvider, MastraAuthConfig, MastraAuthRequest } from '@mastra/core/server';
 
 import {
@@ -11,6 +12,7 @@ import {
   MASTRA_AUTH_TOKEN_KEY,
   MASTRA_AUTH_MODE_KEY,
 } from '../constants';
+import { HTTPException } from '../http-exception';
 import { defaultAuthConfig } from './defaults';
 import { parse } from './path-pattern';
 
@@ -395,6 +397,7 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
     // If authentication failed, attempt transparent session refresh before returning 401.
     // This handles expired access tokens without requiring client-side refresh logic.
     if (!user && supportsSessionRefresh(authConfig) && rawRequest instanceof Request) {
+      let retryHttpError: HTTPException | undefined;
       try {
         const sessionId = authConfig.getSessionIdFromRequest(rawRequest);
         if (sessionId) {
@@ -422,7 +425,12 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
               const cookieValue = refreshedCookie.includes('=')
                 ? refreshedCookie.split('=').slice(1).join('=')
                 : refreshedCookie;
-              user = await authConfig.authenticateToken(cookieValue, adaptToMastraAuthRequest(refreshedRequest));
+              try {
+                user = await authConfig.authenticateToken(cookieValue, adaptToMastraAuthRequest(refreshedRequest));
+              } catch (retryErr) {
+                retryHttpError = retryErr instanceof HTTPException ? retryErr : undefined;
+                throw retryErr;
+              }
             }
             if (!user) {
               refreshHeaders = undefined;
@@ -431,6 +439,8 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
         }
       } catch (refreshErr) {
         refreshHeaders = undefined;
+        // An explicit HTTP error from the retried authenticateToken goes to the outer handler.
+        if (retryHttpError === refreshErr) throw refreshErr;
         mastra.getLogger()?.debug('Session refresh failed, falling back to 401', {
           error: refreshErr instanceof Error ? { message: refreshErr.message } : refreshErr,
         });
@@ -469,7 +479,12 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
     if (typeof authConfig.mapUserToResourceId === 'function') {
       try {
         const resourceId = authConfig.mapUserToResourceId(user);
-        if (resourceId) {
+        // CompositeAuth validates the authenticating provider's mapper. It can
+        // return undefined when that provider never configured a mapper.
+        if (resourceId !== undefined || !(authConfig instanceof CompositeAuth)) {
+          if (typeof resourceId !== 'string' || !resourceId.trim()) {
+            throw new Error('mapUserToResourceId must return a non-empty string for the authenticated user');
+          }
           requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
         }
       } catch (mapError) {
@@ -519,6 +534,11 @@ export const coreAuthMiddleware = async (ctx: AuthMiddlewareContext): Promise<Au
     mastra.getLogger()?.error('Authentication error', {
       error: err instanceof Error ? { message: err.message, stack: err.stack } : err,
     });
+    // Explicit HTTP errors from auth callbacks keep their status/message; anything else is redacted.
+    // The HTTPException message is sent to the client, so callers must keep it safe (no internal details).
+    if (err instanceof HTTPException && err.status >= 400 && err.status <= 599) {
+      return { action: 'error', status: err.status, body: { error: err.message }, headers: refreshHeaders };
+    }
     return { action: 'error', status: 401, body: { error: 'Invalid or expired token' }, headers: refreshHeaders };
   }
 

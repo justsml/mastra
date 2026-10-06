@@ -1,10 +1,17 @@
-import { EntityType } from '@mastra/core/observability';
-import { CornerDownRightIcon, ListTreeIcon } from 'lucide-react';
-import { DataListCell, DataListMonoCell } from '../data-list-cells';
+import { CornerDownRightIcon, DatabaseIcon, ListTreeIcon, RouteIcon } from 'lucide-react';
+import type { ComponentType, SVGProps } from 'react';
+import { DataListCell, DataListTextCell } from '../data-list-cells';
+import { Badge } from '@/ds/components/Badge';
+import type { BadgeVariant } from '@/ds/components/Badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/ds/components/Tooltip';
+import { Txt } from '@/ds/components/Txt';
 import { AgentIcon } from '@/ds/icons/AgentIcon';
+import { McpServerIcon } from '@/ds/icons/McpServerIcon';
+import { MemoryIcon } from '@/ds/icons/MemoryIcon';
+import { ProcessorIcon } from '@/ds/icons/ProcessorIcon';
+import { ScorersIcon } from '@/ds/icons/ScorersIcon';
+import { ToolsIcon } from '@/ds/icons/ToolsIcon';
 import { WorkflowIcon } from '@/ds/icons/WorkflowIcon';
-import { Colors } from '@/ds/tokens/colors';
 import { cn } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -26,11 +33,11 @@ export function TracesDataListNameCell({ name, parentSpanId, showLevelTooltip }:
   const label = isRoot ? 'Trace' : 'Subtrace';
   const icon = (
     <span aria-label={label} className="inline-flex shrink-0">
-      <Icon className={cn('size-4 shrink-0', isRoot ? 'text-neutral3' : 'text-neutral2')} aria-hidden />
+      <Icon className={cn('size-4 shrink-0', isRoot ? 'text-muted-foreground' : 'text-placeholder')} aria-hidden />
     </span>
   );
   return (
-    <DataListCell height="compact" className="flex min-w-0 items-center gap-2 text-ui-smd text-neutral4">
+    <DataListCell className="flex min-w-0 items-center gap-2 text-body-sm text-muted-foreground">
       {showLevelTooltip ? (
         <Tooltip>
           <TooltipTrigger asChild>{icon}</TooltipTrigger>
@@ -53,40 +60,53 @@ export interface TracesDataListInputCellProps {
 }
 
 export function TracesDataListInputCell({ input }: TracesDataListInputCellProps) {
-  return <DataListMonoCell>{input || '-'}</DataListMonoCell>;
+  return <DataListTextCell font="mono">{input || '-'}</DataListTextCell>;
 }
 
 // ---------------------------------------------------------------------------
-// EntityCell
+// TypeCell
 // ---------------------------------------------------------------------------
 
-function EntityTypeIcon({ entityType, className }: { entityType: string; className?: string }) {
-  const iconClass = cn('size-3.5 shrink-0 text-neutral2', className);
-  const normalizedEntityType = entityType.toLowerCase();
+type EntityTypeDisplay = { label: string; Icon: ComponentType<SVGProps<SVGSVGElement>> };
 
-  switch (normalizedEntityType) {
-    case EntityType.AGENT:
-      return <AgentIcon className={iconClass} aria-hidden />;
-    case 'workflow':
-    case EntityType.WORKFLOW_RUN:
-      return <WorkflowIcon className={iconClass} aria-hidden />;
-    default:
-      return null;
-  }
-}
+// Keys are lowercase `EntityType` enum values (plus legacy `workflow`).
+const ENTITY_TYPE_DISPLAY: Record<string, EntityTypeDisplay> = {
+  agent: { label: 'Agent', Icon: AgentIcon },
+  workflow: { label: 'Workflow', Icon: WorkflowIcon },
+  workflow_run: { label: 'Workflow', Icon: WorkflowIcon },
+  workflow_step: { label: 'Step', Icon: WorkflowIcon },
+  tool: { label: 'Tool', Icon: ToolsIcon },
+  scorer: { label: 'Scorer', Icon: ScorersIcon },
+  memory: { label: 'Memory', Icon: MemoryIcon },
+  mcp_server: { label: 'MCP Server', Icon: McpServerIcon },
+  input_processor: { label: 'Processor', Icon: ProcessorIcon },
+  input_step_processor: { label: 'Processor', Icon: ProcessorIcon },
+  output_processor: { label: 'Processor', Icon: ProcessorIcon },
+  output_step_processor: { label: 'Processor', Icon: ProcessorIcon },
+  tool_result_processor: { label: 'Processor', Icon: ProcessorIcon },
+  rag_ingestion: { label: 'RAG', Icon: DatabaseIcon },
+  trajectory: { label: 'Trajectory', Icon: RouteIcon },
+};
 
-export interface TracesDataListEntityCellProps {
+export interface TracesDataListTypeCellProps {
   entityType?: string | null;
-  entityName?: string | null;
 }
 
-export function TracesDataListEntityCell({ entityType, entityName }: TracesDataListEntityCellProps) {
-  const type = entityType ?? '';
+export function TracesDataListTypeCell({ entityType }: TracesDataListTypeCellProps) {
+  const display = entityType ? ENTITY_TYPE_DISPLAY[entityType.toLowerCase()] : undefined;
 
   return (
-    <DataListCell height="compact" className="flex min-w-0 items-center gap-2">
-      <EntityTypeIcon entityType={type} />
-      {entityName ? <span className="min-w-0 truncate text-ui-smd">{entityName}</span> : '-'}
+    <DataListCell className="flex min-w-0 items-center gap-2">
+      {display ? (
+        <>
+          <display.Icon className="size-3.5 shrink-0 text-placeholder" aria-hidden />
+          <Txt as="span" variant="body-sm" className="min-w-0 truncate">
+            {display.label}
+          </Txt>
+        </>
+      ) : (
+        '-'
+      )}
     </DataListCell>
   );
 }
@@ -95,12 +115,14 @@ export function TracesDataListEntityCell({ entityType, entityName }: TracesDataL
 // StatusCell
 // ---------------------------------------------------------------------------
 
-const UNSET_STATUS_CONFIG = { label: '-', color: Colors.neutral4 };
+const UNSET_STATUS_CONFIG: { label: string; variant: BadgeVariant } = { label: '-', variant: 'neutral' };
 
-const STATUS_CONFIG: Record<string, { label: string; color: string }> = {
-  completed: { label: 'OK', color: Colors.accent2 },
-  ok: { label: 'OK', color: Colors.accent2 },
-  error: { label: 'ERR', color: Colors.error },
+const STATUS_CONFIG: Record<string, { label: string; variant: BadgeVariant }> = {
+  completed: { label: 'OK', variant: 'success' },
+  ok: { label: 'OK', variant: 'success' },
+  success: { label: 'OK', variant: 'success' },
+  error: { label: 'ERR', variant: 'destructive' },
+  running: { label: 'RUN', variant: 'neutral' },
   unset: UNSET_STATUS_CONFIG,
 };
 
@@ -113,10 +135,10 @@ export function TracesDataListStatusCell({ status }: TracesDataListStatusCellPro
   const config = STATUS_CONFIG[key] ?? UNSET_STATUS_CONFIG;
 
   return (
-    <DataListCell height="compact">
-      <span className="text-ui-sm font-semibold uppercase" style={{ color: config.color }}>
+    <DataListCell>
+      <Badge size="xs" variant={config.variant}>
         {config.label}
-      </span>
+      </Badge>
     </DataListCell>
   );
 }

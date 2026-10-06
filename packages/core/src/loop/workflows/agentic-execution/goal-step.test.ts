@@ -52,12 +52,17 @@ async function runGoalStep(
     useMemory?: boolean;
     scorer?: any;
     stepResult?: any;
+    requestContext?: RequestContext;
+    judge?: any;
+    tools?: any;
+    outputWriter?: (data: any, options: any) => Promise<void>;
   },
 ) {
   const store = createStore(record);
   const chunks: any[] = [];
   const messages: any[] = [];
   const dataParts: any[] = [];
+  const requestContext = opts?.requestContext ?? new RequestContext();
 
   const mastra: any = {
     generateId: () => `id-${Math.random().toString(36).slice(2)}`,
@@ -125,9 +130,14 @@ async function runGoalStep(
 
   const step = createGoalStep({
     goal: {
-      judge: opts?.undefinedJudgeResolver
-        ? () => undefined
-        : (createMockModel({ objectGenerationMode: 'json', mockText: { decision, reason: `r:${decision}` } }) as any),
+      judge:
+        opts?.judge ??
+        (opts?.undefinedJudgeResolver
+          ? () => undefined
+          : (createMockModel({
+              objectGenerationMode: 'json',
+              mockText: { decision, reason: `r:${decision}` },
+            }) as any)),
       ...(opts?.throwingScorer ? { scorer: throwingScorer } : {}),
       ...(opts?.scorer ? { scorer: opts.scorer } : {}),
       // A `goal.tools` resolver that throws exercises a resolution-time judge
@@ -138,14 +148,20 @@ async function runGoalStep(
               throw new Error(opts.throwingToolsResolver);
             },
           }
-        : {}),
+        : opts?.tools
+          ? { tools: opts.tools }
+          : {}),
     },
     messageList,
-    requestContext: new RequestContext(),
+    rotateResponseMessageId: (sealMessageId?: string) => {
+      messageList.markResponseMessageBoundary(sealMessageId);
+      return 'response-2';
+    },
+    requestContext,
     mastra,
     controller: { enqueue: (c: any) => chunks.push(c) },
     runId: 'run-1',
-    outputWriter: async (data: any, options: any) => dataParts.push({ data, options }),
+    outputWriter: opts?.outputWriter ?? (async (data: any, options: any) => dataParts.push({ data, options })),
     _internal: {
       generateId: () => 'response-2',
       threadId: THREAD_ID,
@@ -168,11 +184,13 @@ async function runGoalStep(
     pendingChunk: goalChunks.find(c => c.payload.pending),
     goalChunks,
     record: store.states.get(`${THREAD_ID}:${GOAL_STATE_TYPE}`)!,
+    store,
     stepResult,
     messages,
     dataParts,
     inputData,
     executionResult,
+    requestContext,
   };
 }
 
@@ -205,6 +223,85 @@ describe('goal step waiting semantics', () => {
         title: 'Goal judge: implement X, then stop and wait for my review',
         metadata: { forkedSubagent: true, goalJudge: true, parentThreadId: THREAD_ID, goalId: 'goal-1' },
       });
+    } finally {
+      streamSpy.mockRestore();
+    }
+  });
+
+  it('isolates the default judge request context while preserving inherited values and parent resolver context', async () => {
+    const parentMemory = { thread: { id: THREAD_ID }, resource: 'resource-1' };
+    const parentContext = new RequestContext();
+    parentContext.set('tenantId', 'tenant-1');
+    parentContext.set('MastraMemory', parentMemory);
+    const judgeModel = createMockModel({ objectGenerationMode: 'json', mockText: 'unused' });
+    const judgeResolver = vi.fn(({ requestContext }: { requestContext: RequestContext }) => {
+      expect(requestContext).toBe(parentContext);
+      return judgeModel;
+    });
+    const toolsResolver = vi.fn(({ requestContext }: { requestContext: RequestContext }) => {
+      expect(requestContext).toBe(parentContext);
+      return {};
+    });
+    let judgeContext: RequestContext | undefined;
+    const streamSpy = vi.spyOn(Agent.prototype, 'stream').mockImplementation((async (
+      _prompt: unknown,
+      options: any,
+    ) => {
+      judgeContext = options.requestContext;
+      judgeContext!.set('MastraMemory', { thread: { id: `${THREAD_ID}-goal-1` }, resource: 'resource-1' });
+      return { object: Promise.resolve({ decision: 'waiting', reason: 'need user input' }) } as any;
+    }) as any);
+
+    try {
+      const { record } = await runGoalStep('waiting', makeRecord({ id: 'goal-1' }), {
+        requestContext: parentContext,
+        judge: judgeResolver,
+        tools: toolsResolver,
+        useMemory: true,
+      });
+
+      expect(record.status).toBe('active');
+      expect(judgeResolver).toHaveBeenCalledOnce();
+      expect(toolsResolver).toHaveBeenCalledOnce();
+      expect(judgeContext).toBeInstanceOf(RequestContext);
+      expect(judgeContext).not.toBe(parentContext);
+      expect(judgeContext?.get('tenantId')).toBe('tenant-1');
+      expect(judgeContext?.get('MastraMemory')).toEqual({
+        thread: { id: `${THREAD_ID}-goal-1` },
+        resource: 'resource-1',
+      });
+      expect(parentContext.get('MastraMemory')).toBe(parentMemory);
+    } finally {
+      streamSpy.mockRestore();
+    }
+  });
+
+  it('keeps judge request-context mutations isolated when default judge execution fails', async () => {
+    const parentMemory = { thread: { id: THREAD_ID }, resource: 'resource-1' };
+    const parentContext = new RequestContext();
+    parentContext.set('tenantId', 'tenant-1');
+    parentContext.set('MastraMemory', parentMemory);
+    let judgeContext: RequestContext | undefined;
+    const streamSpy = vi.spyOn(Agent.prototype, 'stream').mockImplementation((async (
+      _prompt: unknown,
+      options: any,
+    ) => {
+      judgeContext = options.requestContext;
+      judgeContext!.set('MastraMemory', { thread: { id: `${THREAD_ID}-goal-1` }, resource: 'resource-1' });
+      throw new Error('judge model exploded');
+    }) as any);
+
+    try {
+      const { record, chunk } = await runGoalStep('done', makeRecord({ id: 'goal-1' }), {
+        requestContext: parentContext,
+        useMemory: true,
+      });
+
+      expect(record.status).toBe('paused');
+      expect(chunk.payload.judgeFailed).toBe(true);
+      expect(judgeContext).not.toBe(parentContext);
+      expect(judgeContext?.get('tenantId')).toBe('tenant-1');
+      expect(parentContext.get('MastraMemory')).toBe(parentMemory);
     } finally {
       streamSpy.mockRestore();
     }
@@ -292,6 +389,19 @@ describe('goal step waiting semantics', () => {
     expect(chunk.payload.passed).toBe(true);
   });
 
+  it('completes the judged step when the feedback signal transport write rejects', async () => {
+    const { record, stepResult, chunk, messages } = await runGoalStep('done', makeRecord(), {
+      outputWriter: async () => {
+        throw new Error('transport closed');
+      },
+    });
+
+    expect(record.status).toBe('done');
+    expect(stepResult.isContinued).toBe(false);
+    expect(chunk.payload.passed).toBe(true);
+    expect(messages.some(m => JSON.stringify(m).includes('goal-judge'))).toBe(true);
+  });
+
   it('keeps the objective active and continues the loop on a continue decision', async () => {
     const { record, stepResult, chunk } = await runGoalStep('continue', makeRecord());
 
@@ -346,7 +456,7 @@ describe('goal step waiting semantics', () => {
     expect(done.record.pausedReason).toBeUndefined();
   });
 
-  it('emits a goal-judge signal through the current loop signal path on continue', async () => {
+  it('adds a goal-judge signal and exposes the system reminder in the live stream', async () => {
     const { messages, dataParts, inputData } = await runGoalStep('continue', makeRecord({ runsUsed: 1, maxRuns: 10 }));
 
     expect(messages).toHaveLength(1);
@@ -384,10 +494,15 @@ describe('goal step judge-failure semantics', () => {
   it('pauses the objective and stops the loop when the judge/scorer throws', async () => {
     // The decision the model "would" have returned is irrelevant: the scorer
     // throws before it matters. The step must not treat the error as continue.
-    const { record, stepResult, chunk } = await runGoalStep('done', makeRecord(), { throwingScorer: true });
+    const { record, store, stepResult, chunk } = await runGoalStep('done', makeRecord(), { throwingScorer: true });
 
     expect(record.status).toBe('paused');
-    expect(record.runsUsed).toBe(1);
+    // A failed evaluation produced no verdict, so it must not consume the run budget.
+    expect(record.runsUsed).toBe(0);
+    // Read back through the store API: the persisted record is paused with the budget untouched.
+    const stored = await store.getState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE });
+    expect(stored).toMatchObject({ status: 'paused', runsUsed: 0 });
+    expect(stored?.pausedReason).toContain('judge model exploded');
     // A failed judge must stop the loop, not silently iterate against it.
     expect(stepResult.isContinued).toBe(false);
     expect(chunk.payload.status).toBe('paused');
@@ -432,8 +547,8 @@ describe('goal step judge-failure semantics', () => {
     // Loop stops immediately (isContinued false) — no march toward 500.
     expect(stepResult.isContinued).toBe(false);
     expect(record.status).toBe('paused');
-    // Only the single failed run was consumed (3 → 4), not the whole budget.
-    expect(record.runsUsed).toBe(4);
+    // The failed evaluation consumes no budget (stays 3), let alone the whole budget.
+    expect(record.runsUsed).toBe(3);
     expect(chunk.payload.judgeFailed).toBe(true);
     // The status drives the TUI label away from "continue" → it renders "paused".
     expect(chunk.payload.status).toBe('paused');
@@ -461,10 +576,14 @@ describe('goal step judge-failure semantics', () => {
 
     // The step must NOT throw — the failure is handled internally.
     expect(thrown).toBeUndefined();
-    const { record, stepResult, chunk } = res!;
+    const { record, store, stepResult, chunk } = res!;
     expect(stepResult.isContinued).toBe(false);
     expect(record.status).toBe('paused');
-    expect(record.runsUsed).toBe(4);
+    expect(record.runsUsed).toBe(3);
+    expect(await store.getState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE })).toMatchObject({
+      status: 'paused',
+      runsUsed: 3,
+    });
     expect(chunk.payload.judgeFailed).toBe(true);
     expect(chunk.payload.status).toBe('paused');
     expect(chunk.payload.reason).toContain('Bad Request');

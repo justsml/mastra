@@ -6,6 +6,7 @@ import { z } from 'zod';
 
 import type { Extractor, ExtractorSource } from './extractor';
 import { buildExtractorPriorLines } from './extractor';
+import { hasAbortInChain, isTransientLLMError, withRetry } from './retry';
 
 export interface StructuredExtractionResult {
   values: Record<string, unknown>;
@@ -13,10 +14,17 @@ export interface StructuredExtractionResult {
 }
 
 function isAbortError(error: unknown, abortSignal?: AbortSignal): boolean {
+  // Chain-aware so a cancellation wrapped by the provider SDK still rethrows
+  // instead of degrading into the json-prompt-injection fallback.
+  return abortSignal?.aborted === true || hasAbortInChain(error);
+}
+
+function shouldRetryEmptyStructuredObject(
+  object: Record<string, unknown>,
+  extractors: readonly Extractor<any>[],
+): boolean {
   return (
-    abortSignal?.aborted === true ||
-    (error instanceof DOMException && error.name === 'AbortError') ||
-    (error instanceof Error && error.name === 'AbortError')
+    Object.keys(object).length === 0 && extractors.some(extractor => extractor.retryStructuredExtractionOnEmptyObject)
   );
 }
 
@@ -59,33 +67,73 @@ ${extractorInstructions}${priorLines.length > 0 ? `\n\n## Prior Extracted Values
   const values: Record<string, unknown> = {};
   const failures: Array<{ slug: string; error: string }> = [];
 
-  const generateWithStructuredOutput = async (jsonPromptInjection?: boolean | 'system' | 'inline') => {
-    const output = await opts.agent.generate(prompt, {
+  const streamWithStructuredOutput = async (jsonPromptInjection?: boolean | 'system' | 'inline') =>
+    // OM agents pin model-level `maxRetries: 0`. Extraction failures are tolerated
+    // (returned as `failures`), so use a small fixed budget rather than the
+    // Observer/Reflector `maxRetries`, which only governs the stage's model call.
+    withRetry(() => streamOnce(jsonPromptInjection), {
+      label: `om-${opts.source}-structured-extraction`,
+      abortSignal: opts.abortSignal,
+      maxRetries: 1,
+    });
+
+  const streamOnce = async (jsonPromptInjection?: boolean | 'system' | 'inline') => {
+    const output = await opts.agent.stream(prompt, {
       structuredOutput: { schema, ...(jsonPromptInjection ? { jsonPromptInjection } : {}) },
       ...(opts.memory ? { memory: opts.memory } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
       ...(opts.requestContext ? { requestContext: opts.requestContext } : {}),
       ...opts.observabilityContext,
     });
+    const object = await output.object;
 
-    if (output.object === undefined) {
+    if (object === undefined) {
       throw new Error('structuredOutput object is undefined');
     }
 
-    return output.object;
+    return object;
   };
 
   let object: Record<string, unknown>;
+  let retryEmptyObject = false;
   try {
-    object = await generateWithStructuredOutput();
+    object = await streamWithStructuredOutput();
+    retryEmptyObject = shouldRetryEmptyStructuredObject(object, structuredExtractors);
   } catch (error) {
     if (isAbortError(error, opts.abortSignal)) {
       throw error;
     }
 
+    // The retry ladder already exhausted transient failures; the JSON-prompt
+    // fallback only helps providers that reject native structured output.
+    if (isTransientLLMError(error)) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        values,
+        failures: structuredExtractors.map(extractor => ({ slug: extractor.slug, error: message })),
+      };
+    }
+
     try {
       const fallbackJsonPromptInjection = coreFeatures.has('json-prompt-injection:inline') ? 'inline' : true;
-      object = await generateWithStructuredOutput(fallbackJsonPromptInjection);
+      object = await streamWithStructuredOutput(fallbackJsonPromptInjection);
+    } catch (fallbackError) {
+      if (isAbortError(fallbackError, opts.abortSignal)) {
+        throw fallbackError;
+      }
+
+      const message = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      return {
+        values,
+        failures: structuredExtractors.map(extractor => ({ slug: extractor.slug, error: message })),
+      };
+    }
+  }
+
+  if (retryEmptyObject) {
+    try {
+      const fallbackJsonPromptInjection = coreFeatures.has('json-prompt-injection:inline') ? 'inline' : true;
+      object = await streamWithStructuredOutput(fallbackJsonPromptInjection);
     } catch (fallbackError) {
       if (isAbortError(fallbackError, opts.abortSignal)) {
         throw fallbackError;
@@ -100,7 +148,7 @@ ${extractorInstructions}${priorLines.length > 0 ? `\n\n## Prior Extracted Values
   }
 
   for (const extractor of structuredExtractors) {
-    const value = (object as Record<string, unknown>)[extractor.slug];
+    const value = object[extractor.slug];
     if (value === undefined || value === null || value === '') {
       continue;
     }

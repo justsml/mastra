@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import type { UsageStats } from '@mastra/core/observability';
 import { assert, describe, expect, it } from 'vitest';
 import { getTokenUsageView } from '../span-token-usage.utils';
@@ -58,6 +59,23 @@ describe('getTokenUsageView', () => {
     } as UsageStats);
     expect(view.inputDetails).toEqual({ text: 80, cacheRead: 20 });
     expect(view.outputDetails).toBeUndefined();
+  });
+
+  it('keeps output details when the output side has a top-level token count', () => {
+    const view = getRequiredTokenUsageView({
+      inputTokens: 100,
+      outputTokens: 25,
+      outputDetails: { text: 20, reasoning: 5 },
+    } as UsageStats);
+    expect(view.outputDetails).toEqual({ text: 20, reasoning: 5 });
+  });
+
+  it('keeps a details object that mixes numeric and non-numeric entries', () => {
+    const view = getRequiredTokenUsageView({
+      inputTokens: 100,
+      inputDetails: { text: 80, cacheRead: undefined } as unknown as UsageStats['inputDetails'],
+    } as UsageStats);
+    expect(view.inputDetails).toEqual({ text: 80, cacheRead: undefined });
   });
 
   it('treats a details object with no numeric values as absent', () => {

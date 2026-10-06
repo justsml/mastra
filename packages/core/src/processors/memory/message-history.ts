@@ -1,8 +1,15 @@
-import type { Processor } from '..';
+import type { OutputResult, Processor, ProcessorSpanPhase } from '..';
 import type { MastraDBMessage, MessageList } from '../../agent';
-import { parseMemoryRequestContext } from '../../memory';
-import { removeWorkingMemoryTags } from '../../memory/working-memory-utils';
-import { SpanType, EntityType } from '../../observability';
+import { isTransientSignalMessage } from '../../agent/signals';
+import { noteThreadMessagesSaved } from '../../agent/thread-saves';
+import { loadMessageHistory, parseMemoryRequestContext } from '../../memory';
+import { getMemoryTokenBoundary, isAfterMemoryTokenBoundary } from '../../memory/message-history-config';
+import {
+  removeWorkingMemoryTags,
+  removeWorkingMemoryToolInvocationParts,
+  removeWorkingMemoryToolInvocations,
+} from '../../memory/working-memory-utils';
+import { SpanType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
@@ -12,7 +19,9 @@ import type { MemoryStorage } from '../../storage';
  */
 export interface MessageHistoryOptions {
   storage: MemoryStorage;
-  lastMessages?: number;
+  lastMessages?: number | false;
+  tokenLimit?: { maxTokens: number; atMaxRemoveTokens: number };
+  tokenCounter?: { countMessage(message: MastraDBMessage): number | Promise<number> };
 }
 
 /**
@@ -23,15 +32,46 @@ export interface MessageHistoryOptions {
  * This processor retrieves threadId and resourceId from RequestContext at execution time,
  * making it decoupled from memory-specific context.
  */
+/**
+ * Which memory operation each pipeline phase performs. The input phase recalls
+ * stored history into the context; the output phase saves the turn.
+ */
+const MEMORY_PHASE_OPERATION: Partial<Record<ProcessorSpanPhase, 'recall' | 'save'>> = {
+  input: 'recall',
+  inputStep: 'recall',
+  output: 'save',
+  outputStep: 'save',
+};
+
 export class MessageHistory implements Processor {
   readonly id = 'message-history';
   readonly name = 'MessageHistory';
+
+  /**
+   * Trace as a memory operation rather than an anonymous processor run: a user
+   * configures `memory`, not a processor. The two phases are different memory
+   * operations — the input phase recalls stored history, the output phase saves
+   * the turn — so each is named for what it does.
+   *
+   * This replaces a MEMORY_OPERATION span the processor used to create *inside*
+   * its own processor span, which meant two spans per phase describing one
+   * operation.
+   */
+  readonly spanType = SpanType.MEMORY_OPERATION;
+  readonly spanName = (phase: ProcessorSpanPhase): string => `memory: ${MEMORY_PHASE_OPERATION[phase] ?? 'recall'}`;
+  readonly spanAttributes = (phase: ProcessorSpanPhase): Partial<MemoryOperationAttributes> => ({
+    operationType: MEMORY_PHASE_OPERATION[phase] ?? 'recall',
+  });
   private storage: MemoryStorage;
-  private lastMessages?: number;
+  private lastMessages?: number | false;
+  private tokenLimit?: MessageHistoryOptions['tokenLimit'];
+  private tokenCounter?: MessageHistoryOptions['tokenCounter'];
 
   constructor(options: MessageHistoryOptions) {
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
+    this.tokenLimit = options.tokenLimit;
+    this.tokenCounter = options.tokenCounter;
   }
 
   /**
@@ -62,22 +102,14 @@ export class MessageHistory implements Processor {
     return null;
   }
 
-  private createMemorySpan(
-    operationType: MemoryOperationAttributes['operationType'],
-    observabilityContext?: Partial<ObservabilityContext>,
-    input?: any,
-    attributes?: Partial<MemoryOperationAttributes>,
-  ) {
-    const currentSpan = observabilityContext?.tracingContext?.currentSpan;
-    if (!currentSpan) return undefined;
-    return currentSpan.createChildSpan({
-      type: SpanType.MEMORY_OPERATION,
-      name: `memory: ${operationType}`,
-      entityType: EntityType.MEMORY,
-      entityName: 'Memory',
-      input,
-      attributes: { operationType, ...attributes },
-    });
+  /**
+   * This processor's own span, which the runner already typed as the memory
+   * operation. Recording onto it rather than creating a child keeps one span
+   * per memory operation. The runner owns its lifecycle, so this only ever
+   * updates — it never ends or errors the span.
+   */
+  private memorySpan(observabilityContext?: Partial<ObservabilityContext>) {
+    return observabilityContext?.tracingContext?.currentSpan;
   }
 
   async processInput(
@@ -98,65 +130,68 @@ export class MessageHistory implements Processor {
     }
 
     const { threadId, resourceId } = context;
+    const memoryRunState = parseMemoryRequestContext(requestContext)?.runState?.();
 
-    const span = this.createMemorySpan(
-      'recall',
-      observabilityContext,
-      { threadId, resourceId },
-      {
-        lastMessages: this.lastMessages,
-      },
-    );
+    const span = this.memorySpan(observabilityContext);
+    span?.update({ attributes: { lastMessages: this.lastMessages } });
 
     try {
       // 1. Fetch historical messages from storage (as DB format)
-      const result = await this.storage.listMessages({
-        threadId,
-        resourceId,
-        page: 0,
-        perPage: this.lastMessages,
-        orderBy: { field: 'createdAt', direction: 'DESC' },
-      });
+      const storedBoundary = getMemoryTokenBoundary(parseMemoryRequestContext(requestContext)?.thread);
+      const boundary =
+        this.tokenLimit &&
+        storedBoundary?.maxTokens === this.tokenLimit.maxTokens &&
+        storedBoundary.atMaxRemoveTokens === this.tokenLimit.atMaxRemoveTokens
+          ? storedBoundary
+          : undefined;
+      const cacheKey = `history:${threadId}:${resourceId ?? ''}:${this.lastMessages ?? 'all'}:${JSON.stringify(boundary)}`;
+      const loadMessages = async () => {
+        if (this.tokenLimit) {
+          const result = await loadMessageHistory({
+            storage: this.storage,
+            threadId,
+            resourceId,
+            boundary,
+            maxMessages: typeof this.lastMessages === 'number' ? this.lastMessages : undefined,
+            maxTokens: this.tokenLimit.maxTokens,
+            atMaxRemoveTokens: this.tokenLimit.atMaxRemoveTokens,
+            tokenCounter: this.tokenCounter,
+            includeOverflow: true,
+          });
+          return [...result.overflow, ...result.messages].reverse();
+        }
+
+        const result = await this.storage.listMessages({
+          threadId,
+          resourceId,
+          page: 0,
+          perPage: this.lastMessages,
+          orderBy: { field: 'createdAt', direction: 'DESC' },
+          // Last-N history read only consumes `messages`; skip the COUNT(*) work.
+          includeTotal: false,
+        });
+        return result.messages;
+      };
+      const messages = memoryRunState ? await memoryRunState.load(cacheKey, loadMessages) : await loadMessages();
 
       // 2. Filter out system messages (they should never be stored in DB)
-      const filteredMessages = result.messages.filter((msg: MastraDBMessage) => {
-        return msg.role !== 'system';
+      const filteredMessages = messages.filter((msg: MastraDBMessage) => {
+        return msg.role !== 'system' && (!boundary || isAfterMemoryTokenBoundary(msg, boundary));
       });
 
-      // 3. Merge with incoming messages and messages already in MessageList (avoiding duplicates by ID)
-      // This includes messages added by previous processors like SemanticRecall
-      const existingMessages = messageList.get.all.db();
-      const messageIds = new Set(existingMessages.map((m: MastraDBMessage) => m.id).filter(Boolean));
-      const uniqueHistoricalMessages = filteredMessages.filter((m: MastraDBMessage) => !m.id || !messageIds.has(m.id));
+      // 3. Add stored history in chronological order. MessageList layers any matching
+      // input copy onto the stored message so memory remains the authoritative base.
+      const chronologicalMessages = filteredMessages.reverse();
 
-      // Reverse to chronological order (oldest first) since we fetched DESC
-      const chronologicalMessages = uniqueHistoricalMessages.reverse();
-
-      if (chronologicalMessages.length === 0) {
-        span?.end({
-          output: { success: true },
-          attributes: { messageCount: 0 },
-        });
-        return messageList;
-      }
-
-      // Add historical messages with source: 'memory'
       for (const msg of chronologicalMessages) {
-        if (msg.role === 'system') {
-          continue; // memory should not store system messages
-        } else {
-          messageList.add(msg, 'memory');
-        }
+        messageList.add(msg, 'memory');
       }
 
-      span?.end({
-        output: { success: true },
-        attributes: { messageCount: chronologicalMessages.length },
-      });
+      span?.update({ attributes: { messageCount: chronologicalMessages.length } });
 
       return messageList;
     } catch (error) {
-      span?.error({ error: error as Error, endSpan: true });
+      // The runner records the failure on this span and ends it.
       throw error;
     }
   }
@@ -164,9 +199,10 @@ export class MessageHistory implements Processor {
   /**
    * Filters messages before persisting to storage:
    * 1. Removes system messages - these are runtime instructions and should never be stored
-   * 2. Removes streaming tool calls (state === 'partial-call') - these are intermediate states
-   * 3. Removes updateWorkingMemory tool invocations (hide args from message history)
-   * 4. Strips <working_memory> tags from text content
+   * 2. Removes transient signals (`transient: true`) - delivery-only, must never be retained
+   * 3. Removes streaming tool calls (state === 'partial-call') - these are intermediate states
+   * 4. Removes updateWorkingMemory tool invocations (hide args from message history)
+   * 5. Strips <working_memory> tags from text content
    *
    * Note: We preserve 'call' state tool invocations because:
    * - For server-side tools, 'call' should have been converted to 'result' by the time OUTPUT is processed
@@ -174,7 +210,7 @@ export class MessageHistory implements Processor {
    */
   private filterMessagesForPersistence(messages: MastraDBMessage[]): MastraDBMessage[] {
     return messages
-      .filter(m => m.role !== 'system')
+      .filter(m => m.role !== 'system' && !isTransientSignalMessage(m))
       .map(m => {
         const newMessage = { ...m };
         // Only spread content if it's a proper V2 object
@@ -190,14 +226,14 @@ export class MessageHistory implements Processor {
         }
 
         if (Array.isArray(newMessage.content?.parts)) {
-          newMessage.content.parts = newMessage.content.parts
+          if (Array.isArray(newMessage.content.toolInvocations)) {
+            newMessage.content.toolInvocations = removeWorkingMemoryToolInvocations(newMessage.content.toolInvocations);
+          }
+          // Filter out updateWorkingMemory tool invocations (hide args from message history)
+          newMessage.content.parts = removeWorkingMemoryToolInvocationParts(newMessage.content.parts)
             .map(p => {
               // Filter out streaming tool calls (partial-call is an intermediate state during streaming)
               if (p.type === `tool-invocation` && p.toolInvocation.state === `partial-call`) {
-                return null;
-              }
-              // Filter out updateWorkingMemory tool invocations (hide args from message history)
-              if (p.type === `tool-invocation` && p.toolInvocation.toolName === `updateWorkingMemory`) {
                 return null;
               }
               // Strip working memory tags from text parts
@@ -230,9 +266,10 @@ export class MessageHistory implements Processor {
       messageList: MessageList;
       abort: (reason?: string) => never;
       requestContext?: RequestContext;
+      result?: OutputResult;
     } & Partial<ObservabilityContext>,
   ): Promise<MessageList> {
-    const { messageList, requestContext, ...observabilityContext } = args;
+    const { messageList, requestContext, result, ...observabilityContext } = args;
 
     // Get memory context from RequestContext or MessageList
     const context = this.getMemoryContext(requestContext, messageList);
@@ -249,28 +286,35 @@ export class MessageHistory implements Processor {
 
     const newInput = messageList.get.input.db();
     const newOutput = messageList.get.response.db();
-    const messagesToSave = [...newInput, ...newOutput];
+    // Apply transcript redaction before persisting: this path bypasses
+    // drainUnsavedMessages(), and a background tool result may sit in the
+    // list as a raw payload whose transcript transform lives only in
+    // providerMetadata. Persisting it untransformed would leak the raw
+    // payload to storage whenever this save lands after the redacting
+    // save-queue flush (last-writer-wins on the message id).
+    const messagesToSave = messageList.transformMessagesForTranscript([...newInput, ...newOutput]);
 
     if (messagesToSave.length === 0) {
       return messageList;
     }
 
-    const span = this.createMemorySpan('save', observabilityContext, undefined, {
-      messageCount: messagesToSave.length,
-    });
+    // Don't persist an input-only failed turn: if the provider errored before
+    // producing any output, saving the user message would orphan it in history.
+    if (result?.finishReason === 'error' && newOutput.length === 0) {
+      return messageList;
+    }
+
+    const span = this.memorySpan(observabilityContext);
+    span?.update({ attributes: { messageCount: messagesToSave.length } });
 
     try {
       await this.persistMessages({ messages: messagesToSave, threadId, resourceId });
       // add extra 1ms latency to make sure the next generate has not the same input
       await new Promise(resolve => setTimeout(resolve, 10));
 
-      span?.end({
-        output: { success: true },
-      });
-
       return messageList;
     } catch (error) {
-      span?.error({ error: error as Error, endSpan: true });
+      // The runner records the failure on this span and ends it.
       throw error;
     }
   }
@@ -295,15 +339,13 @@ export class MessageHistory implements Processor {
       return;
     }
 
-    // Ensure thread exists (create if needed) before saving messages
+    const savedAt = Date.now();
+
+    // Ensure thread exists (create if needed) before saving messages.
+    // Nothing to write when it already exists: re-writing the row we just read
+    // would clobber a title generated concurrently with this save.
     const thread = await this.storage.getThreadById({ threadId });
-    if (thread) {
-      await this.storage.updateThread({
-        id: threadId,
-        title: thread.title || '',
-        metadata: thread.metadata || {},
-      });
-    } else {
+    if (!thread) {
       // Auto-create thread if it doesn't exist
       await this.storage.saveThread({
         thread: {
@@ -319,5 +361,6 @@ export class MessageHistory implements Processor {
 
     // Persist messages after thread is guaranteed to exist
     await this.storage.saveMessages({ messages: filtered });
+    noteThreadMessagesSaved({ threadId, resourceId, savedAt });
   }
 }

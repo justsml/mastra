@@ -1,14 +1,23 @@
+/* eslint-disable react-refresh/only-export-components */
 import type { ReactNode } from 'react';
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useState } from 'react';
 
 interface PlaygroundModelContextType {
   provider: string;
   model: string;
+  modelOverride?: string;
+  modelWarning?: string;
   setProvider: (provider: string) => void;
-  setModel: (model: string) => void;
+  setModel: (provider: string, model: string) => void;
 }
 
-const PlaygroundModelContext = createContext<PlaygroundModelContextType | null>(null);
+interface ModelSelection {
+  provider: string;
+  model: string;
+  explicit: boolean;
+}
+
+export const PlaygroundModelContext = createContext<PlaygroundModelContextType | null>(null);
 
 interface PlaygroundModelProviderProps {
   children: ReactNode;
@@ -21,20 +30,27 @@ export function PlaygroundModelProvider({
   defaultProvider = '',
   defaultModel = '',
 }: PlaygroundModelProviderProps) {
-  const [provider, setProvider] = useState(defaultProvider);
-  const [model, setModel] = useState(defaultModel);
+  const [selection, setSelection] = useState<ModelSelection>({
+    provider: defaultProvider,
+    model: defaultModel,
+    explicit: false,
+  });
 
-  // Sync from form when it loads (defaultProvider/defaultModel may be empty on first render)
-  useEffect(() => {
-    if (defaultProvider && !provider) setProvider(defaultProvider);
-  }, [defaultProvider]);
+  const selectProvider = (nextProvider: string) => {
+    setSelection({ provider: nextProvider, model: '', explicit: false });
+  };
 
-  useEffect(() => {
-    if (defaultModel && !model) setModel(defaultModel);
-  }, [defaultModel]);
+  const selectModel = (nextProvider: string, nextModel: string) => {
+    setSelection({ provider: nextProvider, model: nextModel, explicit: true });
+  };
+
+  const { provider, model, explicit } = selection;
+  const modelOverride = explicit ? `${provider}/${model}` : undefined;
 
   return (
-    <PlaygroundModelContext.Provider value={{ provider, model, setProvider, setModel }}>
+    <PlaygroundModelContext.Provider
+      value={{ provider, model, modelOverride, setProvider: selectProvider, setModel: selectModel }}
+    >
       {children}
     </PlaygroundModelContext.Provider>
   );
@@ -50,5 +66,5 @@ export function usePlaygroundModel() {
 
 /** Like usePlaygroundModel but returns null outside the provider (e.g. shared session page). */
 export function usePlaygroundModelOptional() {
-  return useContext(PlaygroundModelContext);
+  return useContext(PlaygroundModelContext) ?? undefined;
 }

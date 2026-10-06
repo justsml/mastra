@@ -1,5 +1,5 @@
 import { MastraError } from '../../../error';
-import type { DatasetItemPayload } from '../../types';
+import type { DatasetItemPayload, UpdateDatasetItemInput } from '../../types';
 
 interface SerializationIssue {
   path: string;
@@ -44,7 +44,7 @@ function findSerializationIssue(
       // Date, Map, Set, class instances, custom toJSON() objects, etc. change
       // shape during JSON persistence, so identical retries would no longer
       // deep-equal the persisted payload. Require explicit conversion instead.
-      const constructorName = (value as object).constructor?.name || 'unknown class';
+      const constructorName = value.constructor?.name || 'unknown class';
       return { path, reason: `non-plain object (${constructorName}) at ${path} would change during JSON persistence` };
     }
   }
@@ -69,7 +69,10 @@ function findSerializationIssue(
   return undefined;
 }
 
-export function validateDatasetItemPayloadSerialization(payload: Partial<DatasetItemPayload>, path: string): void {
+type SerializableDatasetItemPayload = Partial<Omit<DatasetItemPayload, 'scorerIds'>> &
+  Pick<UpdateDatasetItemInput, 'scorerIds'>;
+
+export function validateDatasetItemPayloadSerialization(payload: SerializableDatasetItemPayload, path: string): void {
   const ancestors = new WeakMap<object, string>();
   ancestors.set(payload, path);
 

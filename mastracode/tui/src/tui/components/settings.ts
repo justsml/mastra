@@ -8,7 +8,7 @@
 
 import { Box, Container, SelectList, SettingsList, Spacer, Text, matchesKey } from '@earendil-works/pi-tui';
 import type { Focusable, SelectItem, SettingItem } from '@earendil-works/pi-tui';
-import type { StorageBackend } from '@mastra/code-sdk/onboarding/settings';
+import type { ExperimentalAgent, StorageBackend, WebSearchProviderSetting } from '@mastra/code-sdk/onboarding/settings';
 import type { NotificationMode } from '../notify.js';
 import { theme, getSettingsListTheme, getSelectListTheme } from '../theme.js';
 import { MaskedInput } from './masked-input.js';
@@ -29,6 +29,13 @@ export interface SettingsConfig {
   pgConnectionString: string;
   libsqlUrl: string;
   experimentalGithubSignals: boolean;
+  experimentalCrossAgentSignals: boolean;
+  experimentalScheduleTools: boolean;
+  experimentalAgent: ExperimentalAgent | null;
+  backgroundToolsEnabled: boolean;
+  webSearchProvider: WebSearchProviderSetting;
+  tavilyKeyAvailable: boolean;
+  parallelKeyAvailable: boolean;
 }
 
 export interface SettingsCallbacks {
@@ -40,6 +47,11 @@ export interface SettingsCallbacks {
   onQuietModeMaxToolPreviewLinesChange: (lines: number) => void;
   onStorageBackendChange: (backend: StorageBackend, connectionUrl?: string) => void;
   onExperimentalGithubSignalsChange: (enabled: boolean) => boolean | void | Promise<boolean | void>;
+  onExperimentalCrossAgentSignalsChange: (enabled: boolean) => boolean | void | Promise<boolean | void>;
+  onExperimentalScheduleToolsChange: (enabled: boolean) => void;
+  onExperimentalAgentChange: (agent: ExperimentalAgent | null) => void;
+  onBackgroundToolsChange: (enabled: boolean) => void;
+  onWebSearchProviderChange: (provider: WebSearchProviderSetting) => void;
   onApiKeys?: () => void;
   onClose: () => void;
 }
@@ -187,6 +199,12 @@ class StorageBackendSubmenu extends Container {
 
 function quietPreviewLinesLabel(lines: number): string {
   return lines === 0 ? 'None' : `${lines} line${lines === 1 ? '' : 's'}`;
+}
+
+function webSearchProviderLabel(provider: WebSearchProviderSetting): string {
+  if (provider === 'tavily') return 'Tavily';
+  if (provider === 'parallel') return 'Parallel';
+  return 'Auto';
 }
 
 function storageLabel(config: SettingsConfig): string {
@@ -371,7 +389,7 @@ export class SettingsComponent extends Box implements Focusable {
             {
               id: 'quietModeMaxToolPreviewLines',
               label: 'Quiet mode tool preview lines',
-              description: 'Maximum compact tool detail preview lines. Set to None to hide previews.',
+              description: 'Preview lines shown under each tool, including shell output. Set to None to hide previews.',
               currentValue: quietPreviewLinesLabel(config.quietModeMaxToolPreviewLines),
               submenu: (_currentValue: string, done: (value?: string) => void) =>
                 new SelectSubmenu(
@@ -380,7 +398,7 @@ export class SettingsComponent extends Box implements Focusable {
                     label: `  ${quietPreviewLinesLabel(lines)}`,
                     description:
                       lines === 0
-                        ? 'Hide compact tool detail previews'
+                        ? 'Hide tool previews and shell output'
                         : `Show up to ${lines} preview line${lines === 1 ? '' : 's'}`,
                   })),
                   String(config.quietModeMaxToolPreviewLines),
@@ -394,6 +412,46 @@ export class SettingsComponent extends Box implements Focusable {
             },
           ]
         : []),
+      {
+        id: 'webSearchProvider',
+        label: 'Web search provider',
+        description: 'Default provider for web_search/web_extract. Providers require their API key.',
+        currentValue: webSearchProviderLabel(config.webSearchProvider),
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'auto',
+                label: '  Auto',
+                description: 'First configured provider key (Tavily, then Parallel)',
+              },
+              {
+                value: 'tavily',
+                label: config.tavilyKeyAvailable ? '  Tavily' : '  Tavily (unavailable)',
+                description: config.tavilyKeyAvailable
+                  ? 'Always use Tavily'
+                  : 'Missing TAVILY_API_KEY — set it to use Tavily',
+              },
+              {
+                value: 'parallel',
+                label: config.parallelKeyAvailable ? '  Parallel' : '  Parallel (unavailable)',
+                description: config.parallelKeyAvailable
+                  ? 'Always use Parallel'
+                  : 'Missing PARALLEL_API_KEY — set it to use Parallel',
+              },
+            ],
+            config.webSearchProvider,
+            value => {
+              // Providers without their API key are shown but not selectable.
+              if (value === 'tavily' && !config.tavilyKeyAvailable) return;
+              if (value === 'parallel' && !config.parallelKeyAvailable) return;
+              config.webSearchProvider = value as WebSearchProviderSetting;
+              callbacks.onWebSearchProviderChange(config.webSearchProvider);
+              done(webSearchProviderLabel(config.webSearchProvider));
+            },
+            () => done(),
+          ),
+      },
       {
         id: 'experimentalGithubSignals',
         label: 'Experimental GitHub signals',
@@ -419,6 +477,122 @@ export class SettingsComponent extends Box implements Focusable {
               const accepted = await callbacks.onExperimentalGithubSignalsChange(nextValue);
               config.experimentalGithubSignals = accepted === false ? !nextValue : nextValue;
               done(config.experimentalGithubSignals ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalCrossAgentSignals',
+        label: 'Experimental cross-agent communication',
+        description:
+          'Enable thread ownership advertisement, peer discovery, and agent connection tools (restart required).',
+        currentValue: config.experimentalCrossAgentSignals ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Enable cross-agent connection tools and thread ownership advertisement',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Disable cross-agent communication',
+              },
+            ],
+            config.experimentalCrossAgentSignals ? 'on' : 'off',
+            async value => {
+              const nextValue = value === 'on';
+              const accepted = await callbacks.onExperimentalCrossAgentSignalsChange(nextValue);
+              config.experimentalCrossAgentSignals = accepted === false ? !nextValue : nextValue;
+              done(config.experimentalCrossAgentSignals ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalScheduleTools',
+        label: 'Experimental schedule tools',
+        description: 'Let the agent create and manage /schedules on its thread (restart required).',
+        currentValue: config.experimentalScheduleTools ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              {
+                value: 'on',
+                label: '  On',
+                description: 'Give the agent schedule_create, schedule_list, schedule_update, and schedule_run',
+              },
+              {
+                value: 'off',
+                label: '  Off',
+                description: 'Only you can manage schedules, with /schedules',
+              },
+            ],
+            config.experimentalScheduleTools ? 'on' : 'off',
+            value => {
+              const enabled = value === 'on';
+              callbacks.onExperimentalScheduleToolsChange(enabled);
+              config.experimentalScheduleTools = enabled;
+              done(enabled ? 'On' : 'Off');
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'experimentalAgent',
+        label: 'Experimental agent',
+        description: 'Run the coding agent on the durable or evented runtime (restart required).',
+        currentValue:
+          config.experimentalAgent === 'durable'
+            ? 'Durable'
+            : config.experimentalAgent === 'evented'
+              ? 'Evented'
+              : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              { value: 'off', label: '  Off', description: 'Use the standard coding agent' },
+              { value: 'durable', label: '  Durable', description: 'Use resumable durable agent streams' },
+              {
+                value: 'evented',
+                label: '  Evented',
+                description: 'Run the agent loop on the evented workflow engine',
+              },
+            ],
+            config.experimentalAgent ?? 'off',
+            value => {
+              config.experimentalAgent = value === 'off' ? null : (value as ExperimentalAgent);
+              callbacks.onExperimentalAgentChange(config.experimentalAgent);
+              done(
+                config.experimentalAgent === 'durable'
+                  ? 'Durable'
+                  : config.experimentalAgent === 'evented'
+                    ? 'Evented'
+                    : 'Off',
+              );
+            },
+            () => done(),
+          ),
+      },
+      {
+        id: 'backgroundToolsEnabled',
+        label: 'Experimental background tools',
+        description: 'Allow eligible tools to run in the background (restart required).',
+        currentValue: config.backgroundToolsEnabled ? 'On' : 'Off',
+        submenu: (_currentValue, done) =>
+          new SelectSubmenu(
+            [
+              { value: 'on', label: '  On', description: 'Enable background tools and the activity center' },
+              { value: 'off', label: '  Off', description: 'Keep background tools disabled' },
+            ],
+            config.backgroundToolsEnabled ? 'on' : 'off',
+            value => {
+              const enabled = value === 'on';
+              callbacks.onBackgroundToolsChange(enabled);
+              config.backgroundToolsEnabled = enabled;
+              done(enabled ? 'On' : 'Off');
             },
             () => done(),
           ),

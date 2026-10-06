@@ -1,19 +1,16 @@
 import { TooltipProvider } from '@mastra/playground-ui/components/Tooltip';
 import { MastraReactProvider } from '@mastra/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import React from 'react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { LoginPage } from '../login-page';
 import { Login } from '@/pages/login';
 import { SignUp } from '@/pages/signup';
 import { server } from '@/test/msw-server';
-vi.mock('@mastra/playground-ui/store/playground-store', () => ({
-  usePlaygroundStore: () => ({ requestContext: undefined }),
-}));
-
 vi.mock('@mastra/playground-ui/utils/toast', () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
@@ -89,16 +86,14 @@ describe('LoginPage UI parity for /login and /signup', () => {
     expect(root).toBeTruthy();
   });
 
-  it('does not wrap content in a bordered card on either route', async () => {
+  it('does not render its own card or viewport wrapper on either route (the auth shell owns those)', async () => {
     mockCapabilities(credentialsCapabilities);
     const { unmount } = renderLogin();
 
     const loginRoot = await screen.findByTestId('login-page');
-    const loginInner = loginRoot.firstElementChild as HTMLElement;
-    expect(loginInner.className).not.toMatch(/rounded-lg/);
-    expect(loginInner.className).not.toMatch(/border-border1/);
-    expect(loginInner.className).not.toMatch(/bg-surface2/);
-    expect(loginInner.className).not.toMatch(/\bp-8\b/);
+    expect(loginRoot.className).not.toMatch(/min-h-screen/);
+    expect(loginRoot.className).not.toMatch(/bg-sidebar/);
+    expect(loginRoot.closest('[data-slot="main-card"]')).toBeNull();
 
     unmount();
     cleanup();
@@ -106,11 +101,9 @@ describe('LoginPage UI parity for /login and /signup', () => {
     mockCapabilities(credentialsCapabilities);
     renderSignUp();
     const signUpRoot = await screen.findByTestId('login-page');
-    const signUpInner = signUpRoot.firstElementChild as HTMLElement;
-    expect(signUpInner.className).not.toMatch(/rounded-lg/);
-    expect(signUpInner.className).not.toMatch(/border-border1/);
-    expect(signUpInner.className).not.toMatch(/bg-surface2/);
-    expect(signUpInner.className).not.toMatch(/\bp-8\b/);
+    expect(signUpRoot.className).not.toMatch(/min-h-screen/);
+    expect(signUpRoot.className).not.toMatch(/bg-sidebar/);
+    expect(signUpRoot.closest('[data-slot="main-card"]')).toBeNull();
   });
 
   it('shows the sign in heading on /login by default', async () => {
@@ -151,8 +144,8 @@ describe('LoginPage UI parity for /login and /signup', () => {
     mockCapabilities(credentialsCapabilities);
     renderLogin();
 
-    expect(await screen.findByLabelText('Email')).toBeTruthy();
-    expect(screen.getByLabelText('Password')).toBeTruthy();
+    expect(await screen.findByLabelText(/^Email/)).toBeTruthy();
+    expect(screen.getByLabelText(/^Password/)).toBeTruthy();
     expect(screen.queryByText('or continue with')).toBeNull();
   });
 
@@ -169,7 +162,7 @@ describe('LoginPage UI parity for /login and /signup', () => {
     mockCapabilities(bothCapabilities);
     renderLogin();
 
-    expect(await screen.findByLabelText('Email')).toBeTruthy();
+    expect(await screen.findByLabelText(/^Email/)).toBeTruthy();
     expect(screen.getByText('or continue with')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Continue with SSO' })).toBeTruthy();
   });
@@ -190,6 +183,46 @@ describe('LoginPage UI parity for /login and /signup', () => {
 
     await waitFor(() => {
       expect(screen.getByText('oops')).toBeTruthy();
+    });
+  });
+
+  describe('when credentials login succeeds without a redirect target', () => {
+    it('redirects to the studio base path', async () => {
+      window.MASTRA_STUDIO_BASE_PATH = '/studio';
+      mockCapabilities(credentialsCapabilities);
+      server.use(
+        http.post(`${BASE_URL}/api/auth/credentials/sign-in`, () =>
+          HttpResponse.json({ user: { id: 'user-1', email: 'user@example.com' } }),
+        ),
+      );
+
+      const originalLocation = window.location;
+      const hrefSetter = vi.fn();
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: new Proxy(originalLocation, {
+          set(_target, prop, value) {
+            if (prop === 'href') hrefSetter(value);
+            return true;
+          },
+          get(target, prop) {
+            // @ts-expect-error indexed access
+            return target[prop];
+          },
+        }),
+      });
+
+      try {
+        renderRoute('/login', <LoginPage />);
+        fireEvent.change(await screen.findByLabelText(/^Email/), { target: { value: 'user@example.com' } });
+        fireEvent.change(screen.getByLabelText(/^Password/), { target: { value: 'password' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+
+        await waitFor(() => expect(hrefSetter).toHaveBeenCalledWith('/studio/'));
+      } finally {
+        Object.defineProperty(window, 'location', { configurable: true, value: originalLocation });
+        delete window.MASTRA_STUDIO_BASE_PATH;
+      }
     });
   });
 });

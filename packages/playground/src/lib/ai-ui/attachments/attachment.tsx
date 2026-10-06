@@ -1,25 +1,23 @@
-import { Button } from '@mastra/playground-ui/components/Button';
 import { Spinner } from '@mastra/playground-ui/components/Spinner';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
-import { Icon } from '@mastra/playground-ui/icons/Icon';
+import {
+  ImageEntry,
+  TxtEntry,
+  PdfEntry,
+  FileChipEntry,
+} from '@mastra/playground-ui/domains/chat/attachments/attachment-preview-dialog';
+import { ComposerAttachment as ComposerAttachmentPreview } from '@mastra/playground-ui/domains/chat/attachments/composer-attachment';
+import { ComposerAttachmentList } from '@mastra/playground-ui/domains/chat/attachments/composer-attachment-list';
 import { fileToBase64, isBrowserFetchableUrl } from '@mastra/playground-ui/utils/file';
-import { TooltipProvider } from '@radix-ui/react-tooltip';
-import { X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { useLoadBrowserFile } from '../hooks/use-load-browser-file';
-import { ImageEntry, TxtEntry, PdfEntry, FileChipEntry } from './attachment-preview-dialog';
 import { useComposerAttachments } from './composer-attachments';
 import type { ComposerAttachment } from './composer-attachments';
 
 const ComposerTxtAttachment = ({ file }: { file: File }) => {
   const { isLoading, text } = useLoadBrowserFile(file);
 
-  return (
-    <div className="flex items-center justify-center h-full w-full">
-      {isLoading ? <Spinner /> : <TxtEntry data={text} />}
-    </div>
-  );
+  return isLoading ? <Spinner /> : <TxtEntry data={text} name={file.name} />;
 };
 
 const ComposerPdfAttachment = ({ attachment }: { attachment: ComposerAttachment }) => {
@@ -44,7 +42,7 @@ const ComposerPdfAttachment = ({ attachment }: { attachment: ComposerAttachment 
   }, [attachment]);
 
   return (
-    <div className="flex items-center justify-center h-full w-full">
+    <div className="flex h-full w-full items-center justify-center">
       {state.isLoading ? (
         <Spinner />
       ) : (
@@ -67,67 +65,40 @@ const ImageAttachmentThumbnail = ({ attachment }: { attachment: ComposerAttachme
     return () => URL.revokeObjectURL(url);
   }, [attachment]);
 
-  return <ImageEntry src={src} />;
+  return <ImageEntry src={src} name={attachment.name} />;
 };
 
-const AttachmentThumbnail = ({ attachment }: { attachment: ComposerAttachment }) => {
-  const { remove } = useComposerAttachments();
+const AttachmentPreview = ({ attachment }: { attachment: ComposerAttachment }) => {
+  if (attachment.kind === 'image') return <ImageAttachmentThumbnail attachment={attachment} />;
+  if (attachment.kind === 'pdf') return <ComposerPdfAttachment attachment={attachment} />;
+  if (attachment.kind === 'text' && !attachment.isUrl) return <ComposerTxtAttachment file={attachment.file} />;
 
   return (
-    <div className="relative">
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <div className="overflow-hidden size-16 rounded-lg bg-surface3 border border-border1 ">
-              {attachment.kind === 'image' ? (
-                <ImageAttachmentThumbnail attachment={attachment} />
-              ) : attachment.kind === 'pdf' ? (
-                <ComposerPdfAttachment attachment={attachment} />
-              ) : attachment.kind === 'video' ? (
-                <FileChipEntry
-                  name={attachment.name}
-                  url={attachment.isUrl && isBrowserFetchableUrl(attachment.name) ? attachment.name : undefined}
-                  contentType={attachment.contentType}
-                />
-              ) : (
-                <ComposerTxtAttachment file={attachment.file} />
-              )}
-            </div>
-          </TooltipTrigger>
-          <TooltipContent side="top">{attachment.name}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-
-      <Button
-        variant="default"
-        size="icon-sm"
-        type="button"
-        tooltip="Remove file"
-        onClick={() => remove(attachment.id)}
-        className="absolute -right-2 -top-2 text-neutral3 hover:text-neutral6 bg-surface1 hover:bg-surface2"
-      >
-        <Icon>
-          <X />
-        </Icon>
-      </Button>
-    </div>
+    <FileChipEntry
+      name={attachment.name}
+      url={attachment.isUrl && isBrowserFetchableUrl(attachment.name) ? attachment.name : undefined}
+      contentType={attachment.contentType}
+    />
   );
 };
 
 export const ComposerAttachments = () => {
-  const { attachments } = useComposerAttachments();
+  const { attachments, remove } = useComposerAttachments();
 
   if (attachments.length === 0) return null;
 
   return (
-    <div className="absolute bottom-full inset-x-0 px-2" data-attachments-row>
-      <div className="max-w-3xl w-full mx-auto overflow-x-auto">
-        <div className="flex flex-row items-center gap-4 px-3 pt-3 pb-1">
-          {attachments.map(att => (
-            <AttachmentThumbnail key={att.id} attachment={att} />
-          ))}
-        </div>
-      </div>
-    </div>
+    <ComposerAttachmentList data-testid="composer-attachments">
+      {attachments.map(att => (
+        <ComposerAttachmentPreview
+          key={att.id}
+          name={att.name}
+          onRemove={() => remove(att.id)}
+          variant={att.kind === 'text' ? 'inline' : 'thumbnail'}
+        >
+          <AttachmentPreview attachment={att} />
+        </ComposerAttachmentPreview>
+      ))}
+    </ComposerAttachmentList>
   );
 };

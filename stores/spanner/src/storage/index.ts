@@ -2,7 +2,7 @@ import { Spanner } from '@google-cloud/spanner';
 import type { Database, Instance } from '@google-cloud/spanner';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
-import type { StorageDomains, CreateIndexOptions } from '@mastra/core/storage';
+import type { StorageDomains, CreateIndexOptions, RetentionConfig } from '@mastra/core/storage';
 
 import type { SpannerInitMode } from './db';
 import { AgentsSpanner } from './domains/agents';
@@ -21,6 +21,7 @@ import { SchedulesSpanner } from './domains/schedules';
 import { ScorerDefinitionsSpanner } from './domains/scorer-definitions';
 import { ScoresSpanner } from './domains/scores';
 import { SkillsSpanner } from './domains/skills';
+import { WorkflowDefinitionsSpanner } from './domains/workflow-definitions';
 import { WorkflowsSpanner } from './domains/workflows';
 import { WorkspacesSpanner } from './domains/workspaces';
 
@@ -42,6 +43,7 @@ export {
   ScorerDefinitionsSpanner,
   ScoresSpanner,
   SkillsSpanner,
+  WorkflowDefinitionsSpanner,
   WorkflowsSpanner,
   WorkspacesSpanner,
 };
@@ -67,6 +69,7 @@ export const SPANNER_DOMAIN_KEYS = [
   'experiments',
   'favorites',
   'workspaces',
+  'workflowDefinitions',
 ] as const satisfies ReadonlyArray<keyof StorageDomains>;
 
 export type SpannerDomainKey = (typeof SPANNER_DOMAIN_KEYS)[number];
@@ -167,6 +170,11 @@ export type SpannerConfigType = {
    * @default true
    */
   disableMetrics?: boolean;
+  /**
+   * Opt-in age-based retention policies. Only configured tables are pruned.
+   * Call `store.prune()` from your scheduler to apply them.
+   */
+  retention?: RetentionConfig;
 } & (
   | {
       /** Pre-configured Spanner Database handle. */
@@ -218,7 +226,7 @@ export class SpannerStore extends MastraCompositeStore {
     if (!config.id || config.id.trim() === '') {
       throw new Error('SpannerStore: id must be provided and cannot be empty.');
     }
-    super({ id: config.id, name: 'SpannerStore', disableInit: config.disableInit });
+    super({ id: config.id, name: 'SpannerStore', disableInit: config.disableInit, retention: config.retention });
     try {
       if (isPreConfiguredDatabase(config)) {
         this.database = config.database;
@@ -284,6 +292,9 @@ export class SpannerStore extends MastraCompositeStore {
         ...(wants('experiments') && { experiments: new ExperimentsSpanner(domainConfig) }),
         ...(wants('favorites') && { favorites: new FavoritesSpanner(domainConfig) }),
         ...(wants('workspaces') && { workspaces: new WorkspacesSpanner(domainConfig) }),
+        ...(wants('workflowDefinitions') && {
+          workflowDefinitions: new WorkflowDefinitionsSpanner(domainConfig),
+        }),
       };
     } catch (e) {
       throw new MastraError(
@@ -353,6 +364,7 @@ export class SpannerStore extends MastraCompositeStore {
         'experiments',
         'workspaces',
         'favorites',
+        'workflowDefinitions',
       ];
       for (const key of domainOrder) {
         const store = this.stores?.[key];
@@ -391,7 +403,7 @@ export class SpannerStore extends MastraCompositeStore {
       if (this.spanner) {
         // Spanner node lib wraps most functions (including this one with PromisifyAll), but currently there's a bug that causes awaiting on it to hand indefinitely.
         // Current workaround is to just call it without await https://github.com/googleapis/google-cloud-node/issues/8106
-        this.spanner.close();
+        void this.spanner.close();
       }
     } catch (error) {
       throw error;

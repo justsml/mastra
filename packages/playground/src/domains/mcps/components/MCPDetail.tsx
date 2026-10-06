@@ -1,27 +1,14 @@
-import type { McpToolInfo } from '@mastra/client-js';
-import type { ServerInfo } from '@mastra/core/mcp';
-import { Badge } from '@mastra/playground-ui/components/Badge';
+import type { McpServerInfo } from '@mastra/client-js';
+import { Card, CardContent, CardHeader, CardTitle } from '@mastra/playground-ui/components/Card';
 import { CopyButton } from '@mastra/playground-ui/components/CopyButton';
-import {
-  Entity,
-  EntityContent,
-  EntityDescription,
-  EntityIcon,
-  EntityName,
-} from '@mastra/playground-ui/components/Entity';
-import { MainContentContent } from '@mastra/playground-ui/components/MainContent';
+import { Tab, TabContent, TabList, Tabs } from '@mastra/playground-ui/components/Tabs';
 import { Txt } from '@mastra/playground-ui/components/Txt';
-import { FolderIcon } from '@mastra/playground-ui/icons/FolderIcon';
-import { Icon } from '@mastra/playground-ui/icons/Icon';
-import { McpServerIcon } from '@mastra/playground-ui/icons/McpServerIcon';
-import { useEffect, useRef, useState } from 'react';
-import { useMCPServerTools } from '../hooks/useMCPServerTools';
-import { ToolIconMap } from '@/domains/tools';
-import { useLinkComponent } from '@/lib/framework';
+import { useEffect, useState } from 'react';
+import { McpServerToolsList } from './mcp-server-tools-list';
 
 export interface MCPDetailProps {
   isLoading: boolean;
-  server?: ServerInfo;
+  server?: McpServerInfo;
 }
 
 declare global {
@@ -59,153 +46,78 @@ export const MCPDetail = ({ isLoading, server }: MCPDetailProps) => {
 
   if (!server)
     return (
-      <MainContentContent>
-        <Txt as="h1" variant="header-md" className="text-neutral3 font-medium py-20 text-center">
-          Server not found
-        </Txt>
-      </MainContentContent>
+      <Txt as="h1" variant="heading" tone="muted" className="py-20 text-center">
+        Server not found
+      </Txt>
     );
 
-  const commandLineConfig = `npx -y mcp-remote ${sseUrl}`;
+  // MCP v2 servers speak Streamable HTTP only; the SSE endpoint exists for 1.x servers.
+  // Servers that predate transport reporting are 1.x, so absence means SSE is available.
+  const hasSse = server.transports?.includes('sse') ?? true;
+  const commandLineConfig = `npx -y mcp-remote ${hasSse ? sseUrl : httpStreamUrl}`;
+
+  const endpoints = [
+    {
+      value: 'http',
+      label: 'HTTP',
+      description: 'Use for stateless HTTP transport with streamable responses.',
+      content: httpStreamUrl,
+      tooltip: 'Copy HTTP Stream URL',
+    },
+    ...(hasSse
+      ? [
+          {
+            value: 'sse',
+            label: 'SSE',
+            description: 'Use for real-time communication via SSE.',
+            content: sseUrl,
+            tooltip: 'Copy SSE URL',
+          },
+        ]
+      : []),
+    {
+      value: 'cli',
+      label: 'CLI',
+      description: 'Use for local command-line access via npx and mcp-remote.',
+      content: commandLineConfig,
+      tooltip: 'Copy Command Line Config',
+    },
+  ];
 
   return (
-    <MainContentContent isDivided={true}>
-      <div className="px-8 py-12 mx-auto max-w-2xl w-full">
-        <Txt as="h1" variant="header-md" className="text-neutral6 font-medium pb-4">
-          {server.name}
-        </Txt>
-
-        <div className="flex items-center gap-1 pb-6">
-          <Badge icon={<FolderIcon className="text-neutral6" />} className="rounded-r-sm text-neutral4!">
-            Version
-          </Badge>
-          <Badge className="rounded-l-sm text-neutral4!">{server.version_detail.version}</Badge>
-        </div>
-
-        <Txt className="text-neutral3 pb-4">
-          This MCP server can be accessed through multiple transport methods. Choose the one that best fits your use
-          case.
-        </Txt>
-
-        <div className="flex flex-col gap-4">
-          {/* HTTP Stream */}
-          <div className="rounded-lg border border-border1 bg-surface3 p-4">
-            <Badge icon={<span className="font-mono w-6 text-accent1 font-medium mr-1">HTTP</span>}>
-              Regular HTTP Endpoint
-            </Badge>
-
-            <Txt className="text-neutral3 pt-1 pb-2">Use for stateless HTTP transport with streamable responses.</Txt>
-
-            <div className="flex items-start gap-2">
-              <Txt className="px-2 py-1 bg-surface4 rounded-lg">{httpStreamUrl}</Txt>
-              <div className="pt-1">
-                <CopyButton tooltip="Copy HTTP Stream URL" content={httpStreamUrl} />
-              </div>
+    <div className="flex flex-col gap-6 pt-4">
+      <Card>
+        <Tabs defaultTab="http">
+          <CardHeader className="flex-row items-center justify-between gap-3 space-y-0 border-b border-border">
+            <CardTitle className="shrink-0">Connect</CardTitle>
+            <div className="min-w-0">
+              <TabList variant="pill-ghost" size="sm">
+                {endpoints.map(endpoint => (
+                  <Tab key={endpoint.value} value={endpoint.value}>
+                    {endpoint.label}
+                  </Tab>
+                ))}
+              </TabList>
             </div>
-          </div>
+          </CardHeader>
 
-          {/* SSE */}
-          <div className="rounded-lg border border-border1 bg-surface3 p-4">
-            <Badge icon={<span className="font-mono w-6 text-accent1 font-medium mr-1">SSE</span>}>
-              Server-Sent Events
-            </Badge>
+          {endpoints.map(endpoint => (
+            <TabContent key={endpoint.value} value={endpoint.value} flush>
+              <CardContent className="flex flex-col gap-3">
+                <Txt tone="muted">{endpoint.description}</Txt>
+                <div className="flex items-center justify-between gap-3 rounded-lg bg-muted py-2 pr-2 pl-3">
+                  <Txt as="span" font="mono" className="min-w-0 break-all">
+                    {endpoint.content}
+                  </Txt>
+                  <CopyButton tooltip={endpoint.tooltip} content={endpoint.content} />
+                </div>
+              </CardContent>
+            </TabContent>
+          ))}
+        </Tabs>
+      </Card>
 
-            <Txt className="text-neutral3 pt-1 pb-2">Use for real-time communication via SSE.</Txt>
-
-            <div className="flex items-start gap-2">
-              <Txt className="px-2 py-1 bg-surface4 rounded-lg">{sseUrl}</Txt>
-              <div className="pt-1">
-                <CopyButton tooltip="Copy SSE URL" content={sseUrl} />
-              </div>
-            </div>
-          </div>
-
-          {/* Command Line */}
-          <div className="rounded-lg border border-border1 bg-surface3 p-4">
-            <Badge icon={<span className="font-mono w-6 text-accent1 font-medium mr-1">CLI</span>}>Command Line</Badge>
-
-            <Txt className="text-neutral3 pt-1 pb-2">Use for local command-line access via npx and mcp-remote.</Txt>
-
-            <div className="flex items-start gap-2">
-              <Txt className="px-2 py-1 bg-surface4 rounded-lg">{commandLineConfig}</Txt>
-              <div className="pt-1">
-                <CopyButton tooltip="Copy Command Line Config" content={commandLineConfig} />
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="h-full overflow-y-scroll border-l border-border1">
-        <McpToolList server={server} />
-      </div>
-    </MainContentContent>
-  );
-};
-
-const McpToolList = ({ server }: { server: ServerInfo }) => {
-  const { data: tools = {}, isLoading } = useMCPServerTools(server);
-
-  if (isLoading) return null;
-
-  const toolsKeyArray = Object.keys(tools);
-
-  return (
-    <div className="p-5 overflow-y-scroll">
-      <div className="text-neutral6 flex gap-2 items-center">
-        <Icon size="lg" className="bg-surface4 rounded-md p-1">
-          <McpServerIcon />
-        </Icon>
-
-        <Txt variant="header-md" as="h2" className="font-medium">
-          Available Tools
-        </Txt>
-      </div>
-
-      <div className="flex flex-col gap-2 pt-6">
-        {toolsKeyArray.map(toolId => {
-          const tool = tools[toolId];
-
-          return <ToolEntry key={toolId} tool={tool} serverId={server.id} />;
-        })}
-      </div>
+      <McpServerToolsList server={server} />
     </div>
-  );
-};
-
-/** Check if a tool has an MCP App UI resource */
-function hasAppUi(meta?: Record<string, unknown>): boolean {
-  if (!meta) return false;
-  const ui = meta.ui as { resourceUri?: string } | undefined;
-  if (typeof ui?.resourceUri === 'string' && ui.resourceUri.startsWith('ui://')) return true;
-  if (typeof meta['ui/resourceUri'] === 'string' && (meta['ui/resourceUri'] as string).startsWith('ui://')) return true;
-  return false;
-}
-
-const ToolEntry = ({ tool, serverId }: { tool: McpToolInfo; serverId: string }) => {
-  const linkRef = useRef<HTMLAnchorElement>(null);
-  const { Link, paths } = useLinkComponent();
-
-  const ToolIconComponent = ToolIconMap[tool.toolType || 'tool'];
-  const isAppTool = hasAppUi(tool._meta);
-
-  return (
-    <Entity onClick={() => linkRef.current?.click()}>
-      <EntityIcon>
-        <ToolIconComponent className="group-hover/entity:text-accent6" />
-      </EntityIcon>
-
-      <EntityContent>
-        <EntityName>
-          <span className="flex items-center gap-2">
-            <Link ref={linkRef} href={paths.mcpServerToolLink(serverId, tool.id)}>
-              {tool.id}
-            </Link>
-            {isAppTool && <Badge className="text-[10px] py-0">App</Badge>}
-          </span>
-        </EntityName>
-        <EntityDescription>{tool.description}</EntityDescription>
-      </EntityContent>
-    </Entity>
   );
 };

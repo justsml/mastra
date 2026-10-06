@@ -18,6 +18,7 @@ import {
   GET_ROLE_PERMISSIONS_ROUTE,
   GET_SSO_LOGIN_ROUTE,
   GET_SSO_CALLBACK_ROUTE,
+  POST_LOGOUT_ROUTE,
 } from './auth';
 import { createTestServerContext } from './test-utils';
 
@@ -158,6 +159,83 @@ describe('GET /auth/sso/login — callback URI prefix', () => {
     const [, encodedRedirect] = stateArg.split('|', 2);
     const decodedRedirect = decodeURIComponent(encodedRedirect);
     expect(decodedRedirect).toBe('http://localhost:4111/agents');
+  });
+});
+
+// =============================================================================
+// Public host behind a gateway that rewrites X-Forwarded-Host
+// =============================================================================
+
+describe('GET /auth/sso/login — public host behind a rewriting gateway', () => {
+  // Railway's gateway overwrites X-Forwarded-Host with its own internal domain,
+  // so the edge in front of it forwards the browser-facing host in
+  // X-Mastra-Public-Host. Resolving the origin from X-Forwarded-Host instead
+  // produced an internal *.up.railway.app callback that the platform's OAuth
+  // redirect_uri allowlist rejected outright.
+  const gatewayHeaders = {
+    'x-mastra-public-host': 'my-project--qa.studio.example.com',
+    'x-forwarded-host': 'my-project-qa-qa.up.railway.app',
+  };
+
+  it('should build the OAuth callback URI from the public host, not the gateway host', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: undefined,
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    const callbackUri = (mockAuth.getLoginUrl as any).mock.calls[0][0];
+    expect(callbackUri).toBe('https://my-project--qa.studio.example.com/api/auth/sso/callback');
+  });
+
+  it('should treat the public host as same-origin when validating the post-login redirect', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: 'https://my-project--qa.studio.example.com/agents',
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    // Resolving the origin as the gateway host makes this fail the same-origin
+    // check and silently collapse to '/', dropping the user's landing page.
+    const stateArg = (mockAuth.getLoginUrl as any).mock.calls[0][1] as string;
+    const [, encodedRedirect] = stateArg.split('|', 2);
+    expect(decodeURIComponent(encodedRedirect)).toBe('https://my-project--qa.studio.example.com/agents');
+  });
+
+  it('should still reject an external redirect_uri when a public host is set', async () => {
+    const mockAuth = createMockSSOProvider();
+    const mastra = createMastraWithAuth(mockAuth);
+
+    const request = new Request('http://internal-hostname:8080/api/auth/sso/login', {
+      headers: new Headers(gatewayHeaders),
+    });
+    const ctx = {
+      ...createTestServerContext({ mastra }),
+      request,
+      redirect_uri: 'https://evil.com/phish',
+    };
+
+    await GET_SSO_LOGIN_ROUTE.handler(ctx as any);
+
+    const stateArg = (mockAuth.getLoginUrl as any).mock.calls[0][1] as string;
+    const [, encodedRedirect] = stateArg.split('|', 2);
+    expect(decodeURIComponent(encodedRedirect)).toBe('/');
   });
 });
 
@@ -391,5 +469,96 @@ describe('GET /auth/permission-patterns', () => {
   it('has correct path and method', () => {
     expect(GET_PERMISSION_PATTERNS_ROUTE.path).toBe('/auth/permission-patterns');
     expect(GET_PERMISSION_PATTERNS_ROUTE.method).toBe('GET');
+  });
+});
+
+// =============================================================================
+// POST /auth/logout — https://github.com/mastra-ai/mastra/issues/24456
+//
+// Logout reported `{ success: true }` even when nothing could possibly have been
+// logged out, while POST /auth/refresh returns 404 for the same missing
+// capability. These lock in the capability-based contract.
+// =============================================================================
+
+describe('POST /auth/logout — provider capability contract', () => {
+  async function logout(auth: unknown) {
+    const mastra = auth === undefined ? { getServer: () => ({}) } : { getServer: () => ({ auth }) };
+    return (await POST_LOGOUT_ROUTE.handler({
+      mastra,
+      request: { headers: new Headers(), url: 'http://localhost:4111/api/auth/logout' },
+    } as any)) as Response;
+  }
+
+  // 404s surface as a thrown HTTPException for the framework layer to
+  // serialize, which is exactly how POST /auth/refresh reports the same thing.
+  async function expectNotConfigured(auth: unknown) {
+    await expect(logout(auth)).rejects.toMatchObject({ status: 404, message: 'Logout not configured' });
+  }
+
+  it('returns 404 when no auth provider is configured', async () => {
+    await expectNotConfigured(undefined);
+  });
+
+  it('returns 404 when the provider has no logout capability at all', async () => {
+    await expectNotConfigured({
+      name: 'token-only',
+      authenticateToken: vi.fn(),
+      authorizeUser: vi.fn(),
+      isSimpleAuth: true,
+    });
+  });
+
+  it('succeeds for an SSO-only provider that can only supply a logout URL', async () => {
+    // No destroySession and no getClearSessionHeaders — but logout is still
+    // meaningful, so this must not 404.
+    const response = await logout({
+      name: 'sso-only',
+      authenticateToken: vi.fn(),
+      authorizeUser: vi.fn(),
+      getLogoutUrl: vi.fn(async () => 'https://sso.example.com/logout'),
+      isSimpleAuth: true,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      redirectTo: 'https://sso.example.com/logout',
+    });
+  });
+
+  it('destroys the session and clears cookies when the provider supports it', async () => {
+    const destroySession = vi.fn(async () => {});
+    const response = await logout({
+      name: 'session',
+      authenticateToken: vi.fn(),
+      authorizeUser: vi.fn(),
+      getSessionIdFromRequest: vi.fn(() => 'session-1'),
+      destroySession,
+      getClearSessionHeaders: vi.fn(() => ({ 'Set-Cookie': 'session=; Max-Age=0' })),
+      isSimpleAuth: true,
+    });
+
+    expect(response.status).toBe(200);
+    expect(destroySession).toHaveBeenCalledWith('session-1');
+    expect(response.headers.get('Set-Cookie')).toBe('session=; Max-Age=0');
+  });
+
+  it('stays successful when there is no active session, since logout is idempotent', async () => {
+    // Unlike /auth/refresh (401 without a session), the desired end state of
+    // logout is already satisfied, so this is a success.
+    const destroySession = vi.fn(async () => {});
+    const response = await logout({
+      name: 'session',
+      authenticateToken: vi.fn(),
+      authorizeUser: vi.fn(),
+      getSessionIdFromRequest: vi.fn(() => undefined),
+      destroySession,
+      getClearSessionHeaders: vi.fn(() => ({ 'Set-Cookie': 'session=; Max-Age=0' })),
+      isSimpleAuth: true,
+    });
+
+    expect(response.status).toBe(200);
+    expect(destroySession).not.toHaveBeenCalled();
+    expect(response.headers.get('Set-Cookie')).toBe('session=; Max-Age=0');
   });
 });

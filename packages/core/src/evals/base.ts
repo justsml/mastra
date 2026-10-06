@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod/v4';
 import { Agent, isSupportedLanguageModel } from '../agent';
+import type { AgentExecutionOptions } from '../agent';
 import type { MastraDBMessage, MastraMessagePart, MastraToolInvocationPart } from '../agent/message-list';
 import type { AgentMemoryOption, ToolsInput } from '../agent/types';
 import { tryStreamWithJsonFallback } from '../agent/utils';
@@ -36,8 +36,14 @@ import type {
 import { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
+import type { JSONValue, MastraOnFinishCallback } from '../stream';
+import type { MastraOnStepFinishCallback } from '../stream/types';
+import { selectFields } from '../utils';
 import { createWorkflow } from '../workflows/create';
 import { createStep } from '../workflows/workflow';
+import { isNotScorable } from './not-scorable';
+import type { NotScorable, NotScorableOutcome } from './not-scorable';
+import type { ScoringFilter } from './predicate';
 import type {
   ScoringSamplingConfig,
   ScorerRunInputForAgent,
@@ -81,6 +87,8 @@ export interface ScorerJudgeConfig {
    * Defaults to automatic capability-based routing.
    */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
+  /** @internal Injection placement for the format-error retry; leaves the initial request unchanged. */
+  fallbackJsonPromptInjection?: 'system' | 'inline';
   /** Optional tools the judge agent may call while evaluating (e.g. readonly verification tools). */
   tools?: ToolsInput;
   /** Optional memory instance for the internal judge agent. */
@@ -89,6 +97,10 @@ export interface ScorerJudgeConfig {
   defaultMemoryOptions?: AgentMemoryOption;
   /** Optional callback for observing the internal judge agent stream as soon as it starts. */
   onStream?: (stream: Awaited<ReturnType<Agent['stream']>>) => void | Promise<void>;
+  /** Optional callback fired after each model step in the internal judge agent. */
+  onStepFinish?: MastraOnStepFinishCallback<unknown>;
+  /** Optional callback fired when an internal judge agent invocation finishes. */
+  onFinish?: MastraOnFinishCallback<unknown>;
   /** Optional maximum number of agentic loop iterations for the internal judge agent. */
   maxSteps?: number;
   /**
@@ -109,11 +121,23 @@ export interface ScorerJudgeConfig {
    */
   errorProcessors?: ErrorProcessorOrWorkflow[];
   /**
+   * Set to `false` to run only the judge's configured `errorProcessors`, with none
+   * of the agent's shared stability defaults added. See `AgentConfig.errorProcessorDefaults`.
+   */
+  errorProcessorDefaults?: boolean;
+  /**
    * Maximum number of times error processors can retry one V2+ judge generation.
    * When errorProcessors are configured and this is omitted, the runtime cap is
-   * 10. Set this explicitly to bound the coordinated retry budget.
+   * 3. Set this explicitly to bound the coordinated retry budget.
    */
   maxProcessorRetries?: number;
+  /**
+   * Optional model call settings (e.g. temperature, topP, topK, maxOutputTokens,
+   * maxRetries, frequencyPenalty, presencePenalty, timeout) forwarded to the
+   * internal judge agent run. Step-level `judge.modelSettings` replaces this
+   * scorer-level value.
+   */
+  modelSettings?: AgentExecutionOptions['modelSettings'];
   /**
    * Optional request context forwarded to the judge agent execution. When the judge
    * agent has memory with OM observers that read dynamic model config from controller
@@ -182,6 +206,22 @@ interface ScorerRun<TInput = any, TOutput = any> {
   /** Optional request context forwarded to scorers and judge prompts. */
   requestContext?: Record<string, any> | RequestContext;
 
+  /**
+   * RequestContext keys to persist onto the scorer-run span input, so the run
+   * can be reproduced later (datasets, experiments). Supports dot notation for
+   * nested values (e.g. `'user.id'`).
+   *
+   * This is independent of the observability config's `requestContextKeys`,
+   * which controls live span metadata — recording a run for repeatability and
+   * surfacing keys on every span are different concerns.
+   *
+   * - Omitted or `[]`: nothing from the request context is persisted (default).
+   * - `['*']`: the entire request context is persisted (the framework-managed
+   *   auth token is still redacted).
+   * - Specific keys: only those keys are persisted.
+   */
+  requestContextKeys?: string[];
+
   /** What kind of scoring flow produced this score, such as live runs, trace scoring, or experiments. */
   scoreSource?: ScorerScoreSource;
 
@@ -206,6 +246,11 @@ interface ScorerRun<TInput = any, TOutput = any> {
 
   /** Live target metadata to merge into emitted score metadata when available. */
   targetMetadata?: Record<string, unknown>;
+
+  /** @internal Framework controls that must not affect scorer execution or returned results. */
+  _internal?: {
+    emitObservabilityScore?: boolean;
+  };
 }
 
 // Prompt object definition with conditional typing
@@ -241,10 +286,14 @@ type Awaited<T> = T extends Promise<infer U> ? U : T;
 type StepContext<TAccumulated extends Record<string, any>, TInput, TRunOutput> = Partial<ObservabilityContext> & {
   run: ScorerRun<TInput, TRunOutput>;
   results: TAccumulated;
+  mastra?: Mastra;
 };
 
-// Simplified AccumulatedResults - don't try to resolve Promise types here
-type AccumulatedResults<T extends Record<string, any>, K extends string, V> = T & Record<StepResultKey<K>, V>;
+// Simplified AccumulatedResults - don't try to resolve Promise types here.
+// A step that returns `notScorable()` ends the run, so later steps never see
+// that value in `results`; it's excluded from the accumulated type.
+type AccumulatedResults<T extends Record<string, any>, K extends string, V> = T &
+  Record<StepResultKey<K>, Exclude<V, NotScorable>>;
 
 // Special context type for generateReason that includes the score
 type GenerateReasonContext<TAccumulated extends Record<string, any>, TInput, TRunOutput> = StepContext<
@@ -255,25 +304,389 @@ type GenerateReasonContext<TAccumulated extends Record<string, any>, TInput, TRu
   score: TAccumulated extends Record<'generateScoreStepResult', infer TScore> ? TScore : never;
 };
 
-type ScorerRunResult<TAccumulatedResults extends Record<string, any>, TInput, TRunOutput> = Promise<
-  ScorerRun<TInput, TRunOutput> & {
-    scoreTraceId?: string;
-    score: TAccumulatedResults extends Record<'generateScoreStepResult', infer TScore> ? TScore : never;
-    reason?: TAccumulatedResults extends Record<'generateReasonStepResult', infer TReason> ? TReason : undefined;
+export type ScorerStepName = 'preprocess' | 'analyze' | 'generateScore' | 'generateReason';
+export type ScorerJudgeStepName = ScorerStepName;
 
-    // Prompts
-    preprocessPrompt?: string;
-    analyzePrompt?: string;
-    generateScorePrompt?: string;
-    generateReasonPrompt?: string;
+const scorerStepNames = [
+  'preprocess',
+  'analyze',
+  'generateScore',
+  'generateReason',
+] as const satisfies readonly ScorerStepName[];
 
-    // Results
-    preprocessStepResult?: TAccumulatedResults extends Record<'preprocessStepResult', infer TPreprocess>
-      ? TPreprocess
-      : undefined;
-    analyzeStepResult?: TAccumulatedResults extends Record<'analyzeStepResult', infer TAnalyze> ? TAnalyze : undefined;
-  } & { runId: string }
->;
+function isScorerStepName(stepName: unknown): stepName is ScorerStepName {
+  return typeof stepName === 'string' && (scorerStepNames as readonly string[]).includes(stepName);
+}
+
+export interface ScorerJudgeUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+export interface ScorerJudgeCost {
+  amount: number;
+  unit: string;
+  source: string;
+}
+
+interface ScorerJudgeExecutionBase {
+  prompt: string;
+  judgeModelId: string;
+  judgeProvider?: string;
+  attemptCount: number;
+  modelCallCount: number;
+  durationMs: number;
+}
+
+export interface ScorerJudgeExecutionSuccess extends ScorerJudgeExecutionBase {
+  status: 'success';
+  output: JSONValue;
+  usage: ScorerJudgeUsage;
+  cost?: ScorerJudgeCost;
+}
+
+export interface ScorerJudgeErrorSummary {
+  name: string;
+  message: string;
+  code?: string;
+}
+
+export interface ScorerJudgeExecutionFailure extends ScorerJudgeExecutionBase {
+  status: 'failed';
+  output?: JSONValue;
+  rawOutput?: string;
+  usage?: ScorerJudgeUsage;
+  finishReason?: string;
+  error: ScorerJudgeErrorSummary;
+}
+
+export type ScorerJudgeExecution = ScorerJudgeExecutionSuccess | ScorerJudgeExecutionFailure;
+
+export interface ScorerJudgeStepResult {
+  executions: ScorerJudgeExecution[];
+}
+
+export type ScorerJudgeResults = Partial<Record<ScorerJudgeStepName, ScorerJudgeStepResult>>;
+
+type ScorerRunResultFields<
+  TAccumulatedResults extends Record<string, any> = Record<string, any>,
+  TInput = any,
+  TRunOutput = any,
+> = ScorerRun<TInput, TRunOutput> & {
+  scoreTraceId?: string;
+  reason?: TAccumulatedResults extends Record<'generateReasonStepResult', infer TReason> ? TReason : undefined;
+
+  // Prompts
+  preprocessPrompt?: string;
+  analyzePrompt?: string;
+  generateScorePrompt?: string;
+  generateReasonPrompt?: string;
+
+  // Results
+  preprocessStepResult?: TAccumulatedResults extends Record<'preprocessStepResult', infer TPreprocess>
+    ? TPreprocess
+    : undefined;
+  analyzeStepResult?: TAccumulatedResults extends Record<'analyzeStepResult', infer TAnalyze> ? TAnalyze : undefined;
+
+  judge?: ScorerJudgeResults;
+} & { runId: string };
+
+/**
+ * Result of `scorer.run()`.
+ *
+ * Either the run was scored (`score` is set) or a step returned `notScorable()`
+ * (`notScorable` is set and `score` is absent). Check `notScorable` before
+ * reading `score`:
+ *
+ * ```ts
+ * const result = await scorer.run(input)
+ * if (result.notScorable) {
+ *   // skipped — no score
+ * } else {
+ *   result.score // number
+ * }
+ * ```
+ */
+export type ScorerRunResult<
+  TAccumulatedResults extends Record<string, any> = Record<string, any>,
+  TInput = any,
+  TRunOutput = any,
+> = ScorerRunResultFields<TAccumulatedResults, TInput, TRunOutput> &
+  (
+    | {
+        score: TAccumulatedResults extends Record<'generateScoreStepResult', infer TScore> ? TScore : never;
+        notScorable?: undefined;
+      }
+    | {
+        score?: undefined;
+        /** Set when a step returned `notScorable()`. The remaining steps did not run. */
+        notScorable: NotScorableOutcome;
+      }
+  );
+
+export type ScorerRunResultSnapshot<TResult extends ScorerRunResult = ScorerRunResult> = Omit<TResult, 'score'> &
+  Partial<Pick<TResult, 'score'>>;
+
+export interface ScorerRunErrorOptions<TResult extends ScorerRunResult = ScorerRunResult> {
+  scorerId: string;
+  steps: ScorerStepName[];
+  failedStep: ScorerStepName;
+  completedSteps: ScorerStepName[];
+  result?: ScorerRunResultSnapshot<TResult>;
+  cause: unknown;
+}
+
+export class ScorerRunError<TResult extends ScorerRunResult = ScorerRunResult> extends MastraError {
+  public readonly failedStep: ScorerStepName;
+  public readonly completedSteps: ScorerStepName[];
+  public readonly result?: ScorerRunResultSnapshot<TResult>;
+
+  constructor(options: ScorerRunErrorOptions<TResult>) {
+    const cause = getErrorFromUnknown(options.cause, {
+      fallbackMessage: 'Scorer workflow failed',
+    });
+
+    super(
+      {
+        id: 'MASTR_SCORER_FAILED_TO_RUN_WORKFLOW_FAILED',
+        domain: ErrorDomain.SCORER,
+        category: ErrorCategory.USER,
+        text: `Scorer Run Failed: ${cause.message}`,
+        details: {
+          scorerId: options.scorerId,
+          steps: options.steps.join(', '),
+          failedStep: options.failedStep,
+          completedSteps: options.completedSteps.join(', '),
+        },
+      },
+      cause,
+    );
+
+    this.failedStep = options.failedStep;
+    this.completedSteps = options.completedSteps;
+    this.result = options.result;
+  }
+}
+
+const jsonValueSchema: z.ZodType<JSONValue> = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+
+const scorerJudgeUsageSchema = z.object({
+  inputTokens: z.number().optional(),
+  outputTokens: z.number().optional(),
+  totalTokens: z.number().optional(),
+  reasoningTokens: z.number().optional(),
+  cachedInputTokens: z.number().optional(),
+  cacheCreationInputTokens: z.number().optional(),
+});
+
+const scorerJudgeExecutionSuccessSchema = z.object({
+  status: z.literal('success'),
+  prompt: z.string(),
+  output: jsonValueSchema,
+  judgeModelId: z.string(),
+  judgeProvider: z.string().optional(),
+  usage: scorerJudgeUsageSchema,
+  attemptCount: z.number().int().positive(),
+  modelCallCount: z.number().int().positive(),
+  durationMs: z.number().int().nonnegative(),
+  cost: z
+    .object({
+      amount: z.number(),
+      unit: z.string(),
+      source: z.string(),
+    })
+    .optional(),
+});
+
+const scorerJudgeExecutionFailureSchema = z.object({
+  status: z.literal('failed'),
+  prompt: z.string(),
+  output: jsonValueSchema.optional(),
+  rawOutput: z.string().optional(),
+  judgeModelId: z.string(),
+  judgeProvider: z.string().optional(),
+  usage: scorerJudgeUsageSchema.optional(),
+  attemptCount: z.number().int().positive(),
+  modelCallCount: z.number().int().nonnegative(),
+  durationMs: z.number().int().nonnegative(),
+  finishReason: z.string().optional(),
+  error: z.object({
+    name: z.string(),
+    message: z.string(),
+    code: z.string().optional(),
+  }),
+});
+
+const scorerJudgeExecutionSchema = z.discriminatedUnion('status', [
+  scorerJudgeExecutionSuccessSchema,
+  scorerJudgeExecutionFailureSchema,
+]);
+
+const scorerJudgeStepResultSchema = z.object({
+  executions: z.array(scorerJudgeExecutionSchema),
+});
+
+const scorerJudgeResultsSchema = z.object({
+  preprocess: scorerJudgeStepResultSchema.optional(),
+  analyze: scorerJudgeStepResultSchema.optional(),
+  generateScore: scorerJudgeStepResultSchema.optional(),
+  generateReason: scorerJudgeStepResultSchema.optional(),
+});
+
+const scorerJudgeUsageKeys = [
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'reasoningTokens',
+  'cachedInputTokens',
+  'cacheCreationInputTokens',
+] as const satisfies readonly (keyof ScorerJudgeUsage)[];
+
+function normalizeScorerJudgeUsage(usage: unknown): ScorerJudgeUsage {
+  if (!usage || typeof usage !== 'object') {
+    return {};
+  }
+
+  const usageRecord = usage as Record<string, unknown>;
+  const inputTokens = usageRecord.inputTokens ?? usageRecord.promptTokens;
+  const outputTokens = usageRecord.outputTokens ?? usageRecord.completionTokens;
+  const totalTokens =
+    usageRecord.totalTokens ??
+    (typeof inputTokens === 'number' || typeof outputTokens === 'number'
+      ? (typeof inputTokens === 'number' ? inputTokens : 0) + (typeof outputTokens === 'number' ? outputTokens : 0)
+      : undefined);
+
+  return {
+    ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
+    ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
+    ...(typeof totalTokens === 'number' ? { totalTokens } : {}),
+    ...(typeof usageRecord.reasoningTokens === 'number' ? { reasoningTokens: usageRecord.reasoningTokens } : {}),
+    ...(typeof usageRecord.cachedInputTokens === 'number' ? { cachedInputTokens: usageRecord.cachedInputTokens } : {}),
+    ...(typeof usageRecord.cacheCreationInputTokens === 'number'
+      ? { cacheCreationInputTokens: usageRecord.cacheCreationInputTokens }
+      : {}),
+  };
+}
+
+function addScorerJudgeUsage(accumulated: ScorerJudgeUsage, usage: ScorerJudgeUsage): void {
+  for (const key of scorerJudgeUsageKeys) {
+    const value = usage[key];
+    if (value !== undefined) {
+      accumulated[key] = (accumulated[key] ?? 0) + value;
+    }
+  }
+}
+
+interface ScorerJudgeTelemetryAccumulator {
+  usage: ScorerJudgeUsage;
+  attemptCount: number;
+  recordedAttemptCount: number;
+  modelCallCount: number;
+  judgeModelId?: string;
+  judgeProvider?: string;
+  rawOutput?: string;
+  finishReason?: string;
+}
+
+const failedJudgeExecutionKey = '__mastraScorerFailedJudgeExecution';
+const failedScorerStepKey = '__mastraScorerFailedStep';
+
+function toScorerJudgeErrorSummary(error: unknown): ScorerJudgeErrorSummary {
+  const normalizedError = getErrorFromUnknown(error, {
+    fallbackMessage: 'Judge execution failed',
+    supportSerialization: false,
+  });
+  const errorRecord = error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+  const code =
+    typeof errorRecord?.id === 'string'
+      ? errorRecord.id
+      : typeof errorRecord?.code === 'string'
+        ? errorRecord.code
+        : undefined;
+
+  return {
+    name: normalizedError.name,
+    message: normalizedError.message,
+    ...(code ? { code } : {}),
+  };
+}
+
+function attachFailedJudgeExecution(error: unknown, execution: ScorerJudgeExecutionFailure): Error {
+  const normalizedError = getErrorFromUnknown(error, {
+    fallbackMessage: 'Judge execution failed',
+  });
+  const transportError = new Error(normalizedError.message, { cause: normalizedError });
+  transportError.name = normalizedError.name;
+  Object.defineProperty(transportError, failedJudgeExecutionKey, {
+    value: execution,
+    enumerable: true,
+    configurable: true,
+  });
+  return transportError;
+}
+
+function takeFailedJudgeExecution(error: unknown): ScorerJudgeExecutionFailure | undefined {
+  const visited = new Set<object>();
+  let current = error;
+
+  while (current && typeof current === 'object' && !visited.has(current)) {
+    visited.add(current);
+    const errorRecord = current as Record<string, unknown>;
+    if (failedJudgeExecutionKey in errorRecord) {
+      const execution = errorRecord[failedJudgeExecutionKey] as ScorerJudgeExecutionFailure | undefined;
+      delete errorRecord[failedJudgeExecutionKey];
+      return execution;
+    }
+    current = errorRecord.cause;
+  }
+
+  return undefined;
+}
+
+function attachFailedScorerStep(error: unknown, failedStep: ScorerStepName): Error {
+  const normalizedError = getErrorFromUnknown(error, {
+    fallbackMessage: 'Scorer step failed',
+  });
+  const transportError = new Error(normalizedError.message, { cause: normalizedError });
+  transportError.name = normalizedError.name;
+  Object.defineProperty(transportError, failedScorerStepKey, {
+    value: failedStep,
+    enumerable: true,
+    configurable: true,
+  });
+  return transportError;
+}
+
+function takeFailedScorerStep(error: unknown): ScorerStepName | undefined {
+  const visited = new Set<object>();
+  let current = error;
+
+  while (current && typeof current === 'object' && !visited.has(current)) {
+    visited.add(current);
+    const errorRecord = current as Record<string, unknown>;
+    if (failedScorerStepKey in errorRecord) {
+      const failedStep = errorRecord[failedScorerStepKey];
+      delete errorRecord[failedScorerStepKey];
+      return isScorerStepName(failedStep) ? failedStep : undefined;
+    }
+    current = errorRecord.cause;
+  }
+
+  return undefined;
+}
 
 // Conditional type for PromptObject context
 type PromptObjectContext<
@@ -295,8 +708,8 @@ type GenerateReasonFunctionStep<TAccumulated extends Record<string, any>, TInput
   | ((context: GenerateReasonContext<TAccumulated, TInput, TRunOutput>) => Promise<any>);
 
 type GenerateScoreFunctionStep<TAccumulated extends Record<string, any>, TInput, TRunOutput> =
-  | ((context: StepContext<TAccumulated, TInput, TRunOutput>) => number)
-  | ((context: StepContext<TAccumulated, TInput, TRunOutput>) => Promise<number>);
+  | ((context: StepContext<TAccumulated, TInput, TRunOutput>) => number | NotScorable)
+  | ((context: StepContext<TAccumulated, TInput, TRunOutput>) => Promise<number | NotScorable>);
 
 // Special prompt object type for generateScore that always returns a number
 interface GenerateScorePromptObject<TAccumulated extends Record<string, any>, TInput, TRunOutput> {
@@ -563,7 +976,34 @@ class MastraScorer<
     return new RequestContext(Object.entries(requestContext));
   }
 
-  async run(input: ScorerRun<TInput, TRunOutput>): ScorerRunResult<TAccumulatedResults, TInput, TRunOutput> {
+  /**
+   * Projects the run's RequestContext down to the keys that should be persisted
+   * on the scorer-run span input for repeatability.
+   *
+   * `serializeForSpan()` provides the safe base projection — the framework auth
+   * token is redacted and values are shaped for the trace serializer to bound.
+   * `requestContextKeys` then selects from it:
+   * - omitted / empty → nothing is persisted (secure default)
+   * - `['*']`         → the full (safe) context
+   * - specific keys   → only those keys (dot notation for nested values)
+   */
+  private selectRecordedRequestContext(
+    requestContext: RequestContext | undefined,
+    keys: string[] | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!requestContext || !keys || keys.length === 0) {
+      return undefined;
+    }
+
+    const safe = requestContext.serializeForSpan();
+    const selected = keys.includes('*') ? safe : selectFields(safe, keys);
+
+    return Object.keys(selected).length > 0 ? selected : undefined;
+  }
+
+  async run(input: ScorerRun<TInput, TRunOutput>): Promise<ScorerRunResult<TAccumulatedResults, TInput, TRunOutput>> {
+    const { _internal, ...scorerInput } = input;
+
     // Runtime check: execute only allowed after generateScore
     if (!this.hasGenerateScore) {
       throw new MastraError({
@@ -580,14 +1020,18 @@ class MastraScorer<
 
     // Apply prepareRun transformation before span creation to reduce data
     // flowing into both the observability span and the scorer pipeline.
-    const prepared = this.config.prepareRun ? await this.config.prepareRun(input) : input;
+    const prepared = this.config.prepareRun ? await this.config.prepareRun(scorerInput) : scorerInput;
 
     let runId = prepared.runId;
     if (!runId) {
-      runId = randomUUID();
+      runId = globalThis.crypto.randomUUID();
     }
 
     const normalizedRequestContext = this.normalizeRunRequestContext(prepared.requestContext);
+    const recordedRequestContext = this.selectRecordedRequestContext(
+      normalizedRequestContext,
+      prepared.requestContextKeys,
+    );
     const evalSpan = getOrCreateSpan({
       type: SpanType.SCORER_RUN,
       name: `scorer run: '${this.id}'`,
@@ -598,7 +1042,7 @@ class MastraScorer<
         output: prepared.output,
         groundTruth: prepared.groundTruth,
         expectedTrajectory: prepared.expectedTrajectory,
-        requestContext: normalizedRequestContext?.serializeForSpan(),
+        ...(recordedRequestContext ? { requestContext: recordedRequestContext } : {}),
       },
       attributes: {
         scorerId: this.id,
@@ -643,7 +1087,28 @@ class MastraScorer<
           }),
       });
     } catch (error) {
-      evalSpan?.error({ error: error as Error, endSpan: true });
+      const workflowFailure = getErrorFromUnknown(error, {
+        fallbackMessage: 'Scorer workflow failed',
+      });
+      const failedJudgeExecution = takeFailedJudgeExecution(workflowFailure);
+      const failedStep = takeFailedScorerStep(workflowFailure);
+      evalSpan?.error({ error: workflowFailure, endSpan: true });
+      if (failedStep) {
+        const finalStepResult = failedJudgeExecution
+          ? this.appendFailedJudgeExecution(undefined, failedStep, failedJudgeExecution)
+          : undefined;
+        const result = this.hasScorerResultFields(finalStepResult)
+          ? this.transformToScorerResult({ finalStepResult, originalInput: run })
+          : undefined;
+        throw new ScorerRunError<ScorerRunResult<TAccumulatedResults, TInput, TRunOutput>>({
+          scorerId: this.config.id ?? this.config.name,
+          steps: this.steps.map(step => step.name).filter(isScorerStepName),
+          failedStep,
+          completedSteps: [],
+          ...(result ? { result } : {}),
+          cause: workflowFailure,
+        });
+      }
       throw error;
     }
 
@@ -651,32 +1116,65 @@ class MastraScorer<
       const workflowFailure = getErrorFromUnknown(workflowResult.error, {
         fallbackMessage: 'Scorer workflow failed',
       });
+      const failedJudgeExecution = takeFailedJudgeExecution(workflowFailure);
+      const failedStepFromError = takeFailedScorerStep(workflowFailure);
+      const failureState = this.getWorkflowFailureState(workflowResult);
+      const failedStep = failedStepFromError ?? failureState.failedStep;
+      const { completedSteps, latestSuccessfulOutput } = failureState;
       evalSpan?.error({ error: workflowFailure, endSpan: true });
-      throw new MastraError(
-        {
-          id: 'MASTR_SCORER_FAILED_TO_RUN_WORKFLOW_FAILED',
-          domain: ErrorDomain.SCORER,
-          category: ErrorCategory.USER,
-          text: `Scorer Run Failed: ${workflowFailure.message}`,
-          details: {
-            scorerId: this.config.id ?? this.config.name,
-            steps: this.steps.map(s => s.name).join(', '),
+
+      if (!failedStep) {
+        throw new MastraError(
+          {
+            id: 'MASTR_SCORER_FAILED_TO_RUN_WORKFLOW_FAILED',
+            domain: ErrorDomain.SCORER,
+            category: ErrorCategory.USER,
+            text: `Scorer Run Failed: ${workflowFailure.message}`,
+            details: {
+              scorerId: this.config.id ?? this.config.name,
+              steps: this.steps.map(s => s.name).join(', '),
+            },
           },
-        },
-        workflowFailure,
-      );
+          workflowFailure,
+        );
+      }
+
+      const finalStepResult = failedJudgeExecution
+        ? this.appendFailedJudgeExecution(latestSuccessfulOutput, failedStep, failedJudgeExecution)
+        : latestSuccessfulOutput;
+      const result = this.hasScorerResultFields(finalStepResult)
+        ? this.transformToScorerResult({ finalStepResult, originalInput: run })
+        : undefined;
+      throw new ScorerRunError<ScorerRunResult<TAccumulatedResults, TInput, TRunOutput>>({
+        scorerId: this.config.id ?? this.config.name,
+        steps: this.steps.map(step => step.name).filter(isScorerStepName),
+        failedStep,
+        completedSteps,
+        ...(result ? { result } : {}),
+        cause: workflowFailure,
+      });
     }
 
-    const scorerResult = this.transformToScorerResult({ workflowResult, originalInput: run });
+    const scorerResult = this.transformToScorerResult({
+      finalStepResult: 'result' in workflowResult ? workflowResult.result : undefined,
+      originalInput: run,
+      includeUndefinedFields: true,
+    });
     evalSpan?.end({
       output: {
         success: true,
         score: typeof scorerResult.score === 'number' ? scorerResult.score : null,
         reason: typeof scorerResult.reason === 'string' ? scorerResult.reason : null,
+        ...(scorerResult.notScorable ? { notScorable: scorerResult.notScorable } : {}),
       },
     });
 
-    if (this.#mastra?.observability.addScore && typeof scorerResult.score === 'number') {
+    // A not-scorable run produces no score, so nothing is emitted to observability.
+    if (
+      _internal?.emitObservabilityScore !== false &&
+      this.#mastra?.observability.addScore &&
+      typeof scorerResult.score === 'number'
+    ) {
       try {
         const targetTraceId = input.targetTraceId ?? input.targetCorrelationContext?.traceId;
         const targetSpanId = input.targetSpanId ?? input.targetCorrelationContext?.spanId;
@@ -753,12 +1251,14 @@ class MastraScorer<
         description: `Scorer step: ${scorerStep.name}`,
         inputSchema: z.any(),
         outputSchema: z.any(),
-        execute: async ({ inputData, getInitData, ...rest }) => {
+        execute: async ({ inputData, getInitData, bail, ...rest }) => {
           const observabilityContext = resolveObservabilityContext(rest);
-          const { accumulatedResults = {}, generatedPrompts = {} } = inputData;
+          const { accumulatedResults = {}, generatedPrompts = {}, judge } = inputData;
           const { run } = getInitData<{ run: ScorerRun<TInput, TRunOutput> }>();
 
-          const context = this.createScorerContext(scorerStep.name, run, accumulatedResults);
+          const context = this.createScorerContext(scorerStep.name, run, accumulatedResults, {
+            mastra: this.#mastra,
+          });
           const currentSpan = observabilityContext.tracingContext.currentSpan;
           const scorerRunSpan =
             currentSpan?.type === SpanType.SCORER_RUN
@@ -784,6 +1284,7 @@ class MastraScorer<
           let stepResult: unknown;
           let prompt: string | undefined;
           let judgeModel: string | undefined;
+          let judgeExecution: ScorerJudgeExecution | undefined;
 
           try {
             await executeWithContext({
@@ -798,6 +1299,7 @@ class MastraScorer<
                   stepResult = promptStepResult.result;
                   prompt = promptStepResult.prompt;
                   judgeModel = promptStepResult.judgeModel;
+                  judgeExecution = promptStepResult.execution;
                 } else {
                   stepResult = await this.executeFunctionStep(scorerStep, executionContext);
                 }
@@ -805,7 +1307,7 @@ class MastraScorer<
             });
           } catch (error) {
             stepSpan?.error({ error: error as Error, endSpan: true });
-            throw error;
+            throw attachFailedScorerStep(error, scorerStep.name as ScorerStepName);
           }
 
           if (prompt !== undefined || judgeModel !== undefined) {
@@ -817,8 +1319,6 @@ class MastraScorer<
             });
           }
 
-          stepSpan?.end({ output: stepResult });
-
           const newGeneratedPrompts =
             prompt !== undefined
               ? {
@@ -826,6 +1326,36 @@ class MastraScorer<
                   [`${scorerStep.name}Prompt`]: prompt,
                 }
               : generatedPrompts;
+
+          const judgeStepName = scorerStep.name as ScorerJudgeStepName;
+          const newJudge = judgeExecution
+            ? {
+                ...(judge ?? {}),
+                [judgeStepName]: {
+                  executions: [...(judge?.[judgeStepName]?.executions ?? []), judgeExecution],
+                },
+              }
+            : judge;
+
+          if (isNotScorable(stepResult)) {
+            // The step declared the run has nothing to evaluate. End the
+            // pipeline here so no later step (and no judge model call) runs.
+            // Results from steps that already completed are kept.
+            const notScorable: NotScorableOutcome = {
+              step: scorerStep.name as ScorerStepName,
+              ...(stepResult.reason !== undefined ? { reason: stepResult.reason } : {}),
+            };
+            stepSpan?.end({ output: { notScorable } });
+
+            return bail({
+              notScorable,
+              accumulatedResults,
+              generatedPrompts: newGeneratedPrompts,
+              ...(newJudge ? { judge: newJudge } : {}),
+            });
+          }
+
+          stepSpan?.end({ output: stepResult });
 
           const newAccumulatedResults = {
             ...accumulatedResults,
@@ -836,6 +1366,7 @@ class MastraScorer<
             stepResult,
             accumulatedResults: newAccumulatedResults,
             generatedPrompts: newGeneratedPrompts,
+            ...(newJudge ? { judge: newJudge } : {}),
           };
         },
       });
@@ -849,7 +1380,8 @@ class MastraScorer<
       }),
       outputSchema: z.object({
         run: z.any(),
-        score: z.number(),
+        score: z.number().optional(),
+        notScorable: z.object({ step: z.string(), reason: z.string().optional() }).optional(),
         reason: z.string().optional(),
         preprocessResult: z.any().optional(),
         analyzeResult: z.any().optional(),
@@ -857,6 +1389,7 @@ class MastraScorer<
         analyzePrompt: z.string().optional(),
         generateScorePrompt: z.string().optional(),
         generateReasonPrompt: z.string().optional(),
+        judge: scorerJudgeResultsSchema.optional(),
       }),
       options: {
         validateInputs: false,
@@ -886,13 +1419,14 @@ class MastraScorer<
     stepName: string,
     run: ScorerRun<TInput, TRunOutput>,
     accumulatedResults: Record<string, any>,
+    executionContext: Pick<StepContext<Record<string, any>, TInput, TRunOutput>, 'mastra'>,
   ) {
     if (stepName === 'generateReason') {
       const score = accumulatedResults.generateScoreStepResult;
-      return { run, results: accumulatedResults, score };
+      return { run, results: accumulatedResults, score, ...executionContext };
     }
 
-    return { run, results: accumulatedResults };
+    return { run, results: accumulatedResults, ...executionContext };
   }
 
   private async executeFunctionStep(scorerStep: ScorerStepDefinition, context: any) {
@@ -903,7 +1437,8 @@ class MastraScorer<
     scorerStep: ScorerStepDefinition,
     observabilityContext: ObservabilityContext,
     context: any,
-  ): Promise<{ result: unknown; prompt: string; judgeModel?: string }> {
+  ): Promise<{ result: unknown; prompt: string; judgeModel?: string; execution: ScorerJudgeExecution }> {
+    const startedAt = performance.now();
     const originalStep = this.originalPromptObjects.get(scorerStep.name);
     if (!originalStep) {
       throw new Error(`Step "${scorerStep.name}" is not a prompt object`);
@@ -914,6 +1449,8 @@ class MastraScorer<
     const instructions = originalStep.judge?.instructions ?? this.config.judge?.instructions;
     const jsonPromptInjection =
       originalStep.judge?.jsonPromptInjection ?? this.config.judge?.jsonPromptInjection ?? 'auto';
+    const fallbackJsonPromptInjection =
+      originalStep.judge?.fallbackJsonPromptInjection ?? this.config.judge?.fallbackJsonPromptInjection;
     // Step-level tools override scorer-level tools. When present, the judge agent
     // can call them (in its own tool-call loop) before producing the step output.
     const tools = originalStep.judge?.tools ?? this.config.judge?.tools;
@@ -921,11 +1458,16 @@ class MastraScorer<
     const defaultMemoryOptions = this.config.judge?.defaultMemoryOptions;
     const stepMemoryOptions = originalStep.judge?.memory;
     const onStream = originalStep.judge?.onStream ?? this.config.judge?.onStream;
+    const onStepFinish = originalStep.judge?.onStepFinish ?? this.config.judge?.onStepFinish;
+    const onFinish = originalStep.judge?.onFinish ?? this.config.judge?.onFinish;
     const maxSteps = originalStep.judge?.maxSteps ?? this.config.judge?.maxSteps;
     const inputProcessors = originalStep.judge?.inputProcessors ?? this.config.judge?.inputProcessors;
     const outputProcessors = originalStep.judge?.outputProcessors ?? this.config.judge?.outputProcessors;
     const errorProcessors = originalStep.judge?.errorProcessors ?? this.config.judge?.errorProcessors;
+    const errorProcessorDefaults =
+      originalStep.judge?.errorProcessorDefaults ?? this.config.judge?.errorProcessorDefaults;
     const maxProcessorRetries = originalStep.judge?.maxProcessorRetries ?? this.config.judge?.maxProcessorRetries;
+    const modelSettings = originalStep.judge?.modelSettings ?? this.config.judge?.modelSettings;
     const memoryOptions = stepMemoryOptions
       ? {
           ...defaultMemoryOptions,
@@ -958,6 +1500,163 @@ class MastraScorer<
       this.#mastra,
     );
     const judgeModel = resolvedModel.modelId;
+    const telemetry: ScorerJudgeTelemetryAccumulator = {
+      usage: {},
+      attemptCount: 0,
+      recordedAttemptCount: 0,
+      modelCallCount: 0,
+      judgeModelId: judgeModel,
+      judgeProvider: resolvedModel.provider,
+    };
+    let pendingStepUsage: ScorerJudgeUsage = {};
+    let pendingStepCount = 0;
+    let completedOnFinishCount = 0;
+    let validatedOutput: JSONValue | undefined;
+    const recordAttempt = () => {
+      telemetry.attemptCount += 1;
+    };
+    const recordStreamResult = async (result: Awaited<ReturnType<Agent['stream']>>) => {
+      let consumeError: unknown;
+      if (typeof result.consumeStream === 'function') {
+        try {
+          await result.consumeStream();
+        } catch (error) {
+          consumeError = error;
+        }
+      }
+      const [totalUsageResult, stepsResult, textResult, finishReasonResult, objectResult] = await Promise.allSettled([
+        result.totalUsage,
+        result.steps,
+        result.text,
+        result.finishReason,
+        result.object,
+      ]);
+      const totalUsage = totalUsageResult.status === 'fulfilled' ? totalUsageResult.value : undefined;
+      const steps = stepsResult.status === 'fulfilled' && Array.isArray(stepsResult.value) ? stepsResult.value : [];
+      const rawOutput = textResult.status === 'fulfilled' ? textResult.value : undefined;
+      const finishReason = finishReasonResult.status === 'fulfilled' ? finishReasonResult.value : undefined;
+      const object = objectResult.status === 'fulfilled' ? objectResult.value : undefined;
+      if (scorerStep.name === 'generateReason' && typeof rawOutput === 'string') {
+        validatedOutput = rawOutput;
+      } else if (scorerStep.name === 'generateScore' && object && typeof object === 'object' && 'score' in object) {
+        const score = (object as { score?: unknown }).score;
+        if (typeof score === 'number') {
+          validatedOutput = score;
+        }
+      } else if (object !== undefined) {
+        validatedOutput = object as JSONValue;
+      }
+      const lastStep = steps.at(-1) as Record<string, unknown> | undefined;
+      const modelFinishReason = typeof lastStep?.finishReason === 'string' ? lastStep.finishReason : finishReason;
+      const completedUsage = totalUsage ?? pendingStepUsage;
+      const normalizedCompletedUsage = normalizeScorerJudgeUsage(completedUsage);
+      const hasReportedUsage = Object.values(normalizedCompletedUsage).some(value => value !== undefined && value > 0);
+      const hasRawOutput = typeof rawOutput === 'string' && rawOutput.length > 0;
+      const hasCompletedModelEvidence =
+        (consumeError === undefined || pendingStepCount > 0) &&
+        (pendingStepCount > 0 ||
+          hasReportedUsage ||
+          hasRawOutput ||
+          Boolean(modelFinishReason && modelFinishReason !== 'error'));
+
+      if (hasCompletedModelEvidence) {
+        telemetry.recordedAttemptCount += 1;
+        telemetry.modelCallCount += Math.max(steps.length, pendingStepCount, 1);
+        addScorerJudgeUsage(telemetry.usage, normalizedCompletedUsage);
+        if (typeof rawOutput === 'string') {
+          telemetry.rawOutput = rawOutput;
+        }
+      }
+      if (
+        typeof modelFinishReason === 'string' &&
+        (modelFinishReason !== 'error' || telemetry.finishReason === undefined)
+      ) {
+        telemetry.finishReason = modelFinishReason;
+      }
+
+      pendingStepUsage = {};
+      pendingStepCount = 0;
+
+      if (consumeError) {
+        throw consumeError;
+      }
+
+      if (completedOnFinishCount < telemetry.recordedAttemptCount) {
+        const lastStep = steps.at(-1);
+        const finishEvent = {
+          ...(lastStep ?? {}),
+          steps,
+          totalUsage: completedUsage,
+          model: {
+            modelId: telemetry.judgeModelId ?? judgeModel,
+            provider: telemetry.judgeProvider,
+          },
+        } as Parameters<MastraOnFinishCallback<unknown>>[0];
+        completedOnFinishCount += 1;
+        await onFinish?.(finishEvent);
+      }
+    };
+    const recordLegacyUsage = (usage: unknown, steps: unknown) => {
+      telemetry.recordedAttemptCount += 1;
+      telemetry.modelCallCount += Array.isArray(steps) ? Math.max(steps.length, 1) : 1;
+      addScorerJudgeUsage(telemetry.usage, normalizeScorerJudgeUsage(usage));
+    };
+    const createExecution = (output: JSONValue): ScorerJudgeExecution => ({
+      status: 'success',
+      prompt,
+      output,
+      judgeModelId: telemetry.judgeModelId ?? judgeModel,
+      ...(telemetry.judgeProvider ? { judgeProvider: telemetry.judgeProvider } : {}),
+      usage: telemetry.usage,
+      attemptCount: Math.max(telemetry.attemptCount, 1),
+      modelCallCount: Math.max(telemetry.modelCallCount, 1),
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+    const createFailedExecution = (error: unknown): ScorerJudgeExecutionFailure | undefined => {
+      if (telemetry.attemptCount === 0) {
+        return undefined;
+      }
+
+      const usage = { ...telemetry.usage };
+      let modelCallCount = telemetry.modelCallCount;
+      let rawOutput = telemetry.rawOutput;
+      let finishReason = telemetry.finishReason;
+      const hasUnrecordedAttempt = telemetry.recordedAttemptCount < telemetry.attemptCount;
+
+      if (hasUnrecordedAttempt) {
+        const errorRecord = error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+        const errorUsage = normalizeScorerJudgeUsage(errorRecord?.usage);
+        const unrecordedUsage = Object.keys(errorUsage).length > 0 ? errorUsage : pendingStepUsage;
+        addScorerJudgeUsage(usage, unrecordedUsage);
+        if (typeof errorRecord?.text === 'string') {
+          rawOutput = errorRecord.text;
+        }
+        if (typeof errorRecord?.finishReason === 'string') {
+          finishReason = errorRecord.finishReason;
+        }
+        const hasCompletedModelEvidence =
+          pendingStepCount > 0 ||
+          Object.keys(unrecordedUsage).length > 0 ||
+          rawOutput !== telemetry.rawOutput ||
+          finishReason !== telemetry.finishReason;
+        modelCallCount += Math.max(pendingStepCount, hasCompletedModelEvidence ? 1 : 0);
+      }
+
+      return {
+        status: 'failed',
+        prompt,
+        judgeModelId: telemetry.judgeModelId ?? judgeModel,
+        ...(telemetry.judgeProvider ? { judgeProvider: telemetry.judgeProvider } : {}),
+        ...(validatedOutput !== undefined ? { output: validatedOutput } : {}),
+        ...(Object.keys(usage).length > 0 ? { usage } : {}),
+        attemptCount: telemetry.attemptCount,
+        modelCallCount,
+        durationMs: Math.round(performance.now() - startedAt),
+        ...(finishReason ? { finishReason } : {}),
+        ...(rawOutput !== undefined ? { rawOutput } : {}),
+        error: toScorerJudgeErrorSummary(error),
+      };
+    };
 
     const judge = new Agent({
       id: 'judge',
@@ -969,6 +1668,7 @@ class MastraScorer<
       ...(inputProcessors ? { inputProcessors } : {}),
       ...(outputProcessors ? { outputProcessors } : {}),
       ...(errorProcessors ? { errorProcessors } : {}),
+      ...(errorProcessorDefaults !== undefined ? { errorProcessorDefaults } : {}),
       ...(maxProcessorRetries !== undefined ? { maxProcessorRetries } : {}),
     });
     if (this.#mastra) {
@@ -978,99 +1678,306 @@ class MastraScorer<
       ...observabilityContext,
       ...(memoryOptions ? { memory: memoryOptions } : {}),
       ...(maxSteps ? { maxSteps } : {}),
+      ...(modelSettings ? { modelSettings } : {}),
       ...(this.config.judge?.requestContext ? { requestContext: this.config.judge.requestContext } : {}),
     };
+    const createJudgeStreamRunOptions = () => ({
+      ...judgeRunOptions,
+      onStepFinish: async (event: Parameters<MastraOnStepFinishCallback<unknown>>[0]) => {
+        const eventRecord = event as unknown as Record<string, unknown>;
+        if (eventRecord.finishReason !== 'error') {
+          pendingStepCount += 1;
+          addScorerJudgeUsage(pendingStepUsage, normalizeScorerJudgeUsage(event.usage));
+          if (typeof eventRecord.text === 'string') {
+            telemetry.rawOutput = eventRecord.text;
+          }
+        }
+        if (event.model?.modelId) {
+          telemetry.judgeModelId = event.model.modelId;
+        }
+        if (event.model?.provider) {
+          telemetry.judgeProvider = event.model.provider;
+        }
+        if (typeof eventRecord.finishReason === 'string') {
+          telemetry.finishReason = eventRecord.finishReason;
+        }
+        await onStepFinish?.(event);
+      },
+      onFinish: async (event: Parameters<MastraOnFinishCallback<unknown>>[0]) => {
+        completedOnFinishCount += 1;
+        if (event.model?.modelId) {
+          telemetry.judgeModelId = event.model.modelId;
+        }
+        if (event.model?.provider) {
+          telemetry.judgeProvider = event.model.provider;
+        }
+        const eventRecord = event as unknown as Record<string, unknown>;
+        if (eventRecord.finishReason !== 'error') {
+          if (Object.keys(pendingStepUsage).length === 0) {
+            addScorerJudgeUsage(pendingStepUsage, normalizeScorerJudgeUsage(eventRecord.totalUsage));
+          }
+          if (Array.isArray(eventRecord.steps)) {
+            pendingStepCount = Math.max(pendingStepCount, eventRecord.steps.length);
+          }
+          if (typeof eventRecord.text === 'string') {
+            telemetry.rawOutput = eventRecord.text;
+          }
+        }
+        if (
+          typeof eventRecord.finishReason === 'string' &&
+          (eventRecord.finishReason !== 'error' || telemetry.finishReason === undefined)
+        ) {
+          telemetry.finishReason = eventRecord.finishReason;
+        }
+        await onFinish?.(event);
+      },
+    });
 
-    // GenerateScore output must be a number
-    if (scorerStep.name === 'generateScore') {
-      let result;
-      if (isSupportedLanguageModel(resolvedModel)) {
-        result = await tryStreamWithJsonFallback(judge, prompt, {
-          structuredOutput: {
-            schema: z.object({ score: z.number() }),
-            jsonPromptInjection,
-          },
-          ...judgeRunOptions,
-          ...(onStream ? { onStream } : {}),
-        });
-        const object = await result.object;
-        return { result: (object as { score: number }).score, prompt, judgeModel };
-      } else {
-        const schema = z.object({
-          score: z.number(),
-        });
-        const standardSchema = toStandardSchema(schema as PublicSchema);
-        result = await judge.generateLegacy(prompt, {
-          output: standardSchemaToJSONSchema(standardSchema),
-          ...judgeRunOptions,
-        });
-        return { result: (result.object as { score: number }).score, prompt, judgeModel };
-      }
+    try {
+      // GenerateScore output must be a number
+      if (scorerStep.name === 'generateScore') {
+        let result;
+        if (isSupportedLanguageModel(resolvedModel)) {
+          result = await tryStreamWithJsonFallback(judge, prompt, {
+            fallbackJsonPromptInjection,
+            structuredOutput: {
+              schema: z.object({ score: z.number() }),
+              jsonPromptInjection,
+            },
+            ...createJudgeStreamRunOptions(),
+            ...(onStream ? { onStream } : {}),
+            onStreamAttempt: recordAttempt,
+            onStreamFinish: recordStreamResult,
+          });
+          const object = await result.object;
+          const score = (object as { score: number }).score;
+          return { result: score, prompt, judgeModel, execution: createExecution(score) };
+        } else {
+          const schema = z.object({
+            score: z.number(),
+          });
+          const standardSchema = toStandardSchema(schema as PublicSchema);
+          recordAttempt();
+          result = await judge.generateLegacy(prompt, {
+            output: standardSchemaToJSONSchema(standardSchema),
+            ...judgeRunOptions,
+          });
+          recordLegacyUsage(result.usage, (result as { steps?: unknown }).steps);
+          const score = (result.object as { score: number }).score;
+          return { result: score, prompt, judgeModel, execution: createExecution(score) };
+        }
 
-      // GenerateReason output must be a string
-    } else if (scorerStep.name === 'generateReason') {
-      let result;
-      if (isSupportedLanguageModel(resolvedModel)) {
-        result = await judge.stream(prompt, judgeRunOptions);
-        void onStream?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
+        // GenerateReason output must be a string
+      } else if (scorerStep.name === 'generateReason') {
+        if (isSupportedLanguageModel(resolvedModel)) {
+          recordAttempt();
+          const result = await judge.stream(prompt, createJudgeStreamRunOptions());
+          void onStream?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
+          const reason = await (async () => {
+            try {
+              return await result.text;
+            } finally {
+              await recordStreamResult(result);
+            }
+          })();
+          return { result: reason, prompt, judgeModel, execution: createExecution(reason) };
+        }
+
+        recordAttempt();
+        const result = await judge.generateLegacy(prompt, judgeRunOptions);
+        recordLegacyUsage(result.usage, (result as { steps?: unknown }).steps);
+        const reason = result.text;
+        return { result: reason, prompt, judgeModel, execution: createExecution(reason) };
       } else {
-        result = await judge.generateLegacy(prompt, judgeRunOptions);
+        const promptStep = originalStep as PromptObject<any, any, any, TInput, TRunOutput>;
+        // Convert to StandardSchemaWithJSON at runtime to ensure ~standard.jsonSchema is available
+        // Cast to PublicSchema since outputSchema can be any schema type
+        const standardSchema = toStandardSchema(promptStep.outputSchema as PublicSchema);
+        let result;
+        if (isSupportedLanguageModel(resolvedModel)) {
+          // Use type assertion to any to bypass complex type checking - runtime schema is validated by toStandardSchema
+          result = await tryStreamWithJsonFallback(judge, prompt, {
+            fallbackJsonPromptInjection,
+            structuredOutput: {
+              schema: standardSchema as any,
+              jsonPromptInjection,
+            },
+            ...createJudgeStreamRunOptions(),
+            ...(onStream ? { onStream } : {}),
+            onStreamAttempt: recordAttempt,
+            onStreamFinish: recordStreamResult,
+          });
+          const object = (await result.object) as JSONValue;
+          return { result: object, prompt, judgeModel, execution: createExecution(object) };
+        } else {
+          recordAttempt();
+          result = await judge.generateLegacy(prompt, {
+            output: standardSchemaToJSONSchema(standardSchema),
+            ...judgeRunOptions,
+          });
+          recordLegacyUsage(result.usage, (result as { steps?: unknown }).steps);
+          const object = result.object as JSONValue;
+          return { result: object, prompt, judgeModel, execution: createExecution(object) };
+        }
       }
-      return { result: await result.text, prompt, judgeModel };
-    } else {
-      const promptStep = originalStep as PromptObject<any, any, any, TInput, TRunOutput>;
-      // Convert to StandardSchemaWithJSON at runtime to ensure ~standard.jsonSchema is available
-      // Cast to PublicSchema since outputSchema can be any schema type
-      const standardSchema = toStandardSchema(promptStep.outputSchema as PublicSchema);
-      let result;
-      if (isSupportedLanguageModel(resolvedModel)) {
-        // Use type assertion to any to bypass complex type checking - runtime schema is validated by toStandardSchema
-        result = await tryStreamWithJsonFallback(judge, prompt, {
-          structuredOutput: {
-            schema: standardSchema as any,
-            jsonPromptInjection,
-          },
-          ...judgeRunOptions,
-          ...(onStream ? { onStream } : {}),
-        });
-        const object = await result.object;
-        return { result: object, prompt, judgeModel };
-      } else {
-        result = await judge.generateLegacy(prompt, {
-          output: standardSchemaToJSONSchema(standardSchema),
-          ...judgeRunOptions,
-        });
-        return { result: result.object, prompt, judgeModel };
+    } catch (error) {
+      const failedExecution = createFailedExecution(error);
+      if (failedExecution) {
+        throw attachFailedJudgeExecution(error, failedExecution);
       }
+      throw error;
     }
   }
 
+  private appendFailedJudgeExecution(
+    finalStepResult: any,
+    failedStep: ScorerJudgeStepName,
+    failedExecution: ScorerJudgeExecutionFailure,
+  ): any {
+    const judge = finalStepResult?.judge as ScorerJudgeResults | undefined;
+
+    return {
+      ...(finalStepResult ?? {}),
+      judge: {
+        ...(judge ?? {}),
+        [failedStep]: {
+          executions: [...(judge?.[failedStep]?.executions ?? []), failedExecution],
+        },
+      },
+    };
+  }
+
+  private getWorkflowFailureState(workflowResult: any): {
+    failedStep?: ScorerStepName;
+    completedSteps: ScorerStepName[];
+    latestSuccessfulOutput?: unknown;
+  } {
+    const configuredSteps = this.steps.map(step => step.name).filter(isScorerStepName);
+    const executionPath: ScorerStepName[] = Array.isArray(workflowResult.stepExecutionPath)
+      ? [...new Set(workflowResult.stepExecutionPath.filter(isScorerStepName) as ScorerStepName[])]
+      : [];
+    const orderedSteps = executionPath.length > 0 ? executionPath : configuredSteps;
+    const completedSteps: ScorerStepName[] = [];
+    let failedStep: ScorerStepName | undefined;
+    let latestSuccessfulOutput: unknown;
+
+    for (const stepName of orderedSteps) {
+      const stepResult = workflowResult.steps?.[stepName];
+      if (stepResult?.status === 'success') {
+        completedSteps.push(stepName);
+        latestSuccessfulOutput = stepResult.output;
+      } else if (stepResult?.status === 'failed') {
+        failedStep = stepName;
+        break;
+      }
+    }
+
+    failedStep ??= configuredSteps.find(stepName => workflowResult.steps?.[stepName]?.status === 'failed');
+
+    return { failedStep, completedSteps, latestSuccessfulOutput };
+  }
+
+  private hasScorerResultFields(finalStepResult: any): boolean {
+    if (!finalStepResult || typeof finalStepResult !== 'object') {
+      return false;
+    }
+
+    const accumulatedResults = finalStepResult.accumulatedResults ?? {};
+    const generatedPrompts = finalStepResult.generatedPrompts ?? {};
+    const judge = finalStepResult.judge as ScorerJudgeResults | undefined;
+
+    return (
+      [
+        accumulatedResults.generateScoreStepResult,
+        accumulatedResults.generateReasonStepResult,
+        accumulatedResults.preprocessStepResult,
+        accumulatedResults.analyzeStepResult,
+        generatedPrompts.generateScorePrompt,
+        generatedPrompts.generateReasonPrompt,
+        generatedPrompts.preprocessPrompt,
+        generatedPrompts.analyzePrompt,
+      ].some(value => value !== undefined) || Boolean(judge && Object.keys(judge).length > 0)
+    );
+  }
+
   private transformToScorerResult({
-    workflowResult,
+    finalStepResult,
     originalInput,
+    includeUndefinedFields = false,
   }: {
-    workflowResult: any;
+    finalStepResult: any;
     originalInput: ScorerRun<TInput, TRunOutput> & { runId: string; scoreTraceId?: string };
-  }) {
-    const finalStepResult = workflowResult.result;
-    const accumulatedResults = finalStepResult?.accumulatedResults || {};
-    const generatedPrompts = finalStepResult?.generatedPrompts || {};
+    includeUndefinedFields?: boolean;
+  }): ScorerRunResult<TAccumulatedResults, TInput, TRunOutput> {
+    const accumulatedResults = finalStepResult?.accumulatedResults ?? {};
+    const generatedPrompts = finalStepResult?.generatedPrompts ?? {};
+    const judge = finalStepResult?.judge as ScorerJudgeResults | undefined;
+    const notScorable = finalStepResult?.notScorable as NotScorableOutcome | undefined;
+    const score = accumulatedResults.generateScoreStepResult;
+    const reason = accumulatedResults.generateReasonStepResult;
+    const preprocessStepResult = accumulatedResults.preprocessStepResult;
+    const analyzeStepResult = accumulatedResults.analyzeStepResult;
+    const generateScorePrompt = generatedPrompts.generateScorePrompt;
+    const generateReasonPrompt = generatedPrompts.generateReasonPrompt;
+    const preprocessPrompt = generatedPrompts.preprocessPrompt;
+    const analyzePrompt = generatedPrompts.analyzePrompt;
+
+    if (includeUndefinedFields) {
+      // A not-scorable run carries no `score` key at all, so `'score' in result`
+      // checks downstream (storage, thresholds) treat it as unscored.
+      return {
+        ...originalInput,
+        ...(notScorable ? { notScorable } : { score }),
+        generateScorePrompt,
+        reason,
+        generateReasonPrompt,
+        preprocessStepResult,
+        preprocessPrompt,
+        analyzeStepResult,
+        analyzePrompt,
+        ...(judge && Object.keys(judge).length > 0 ? { judge } : {}),
+      } as ScorerRunResult<TAccumulatedResults, TInput, TRunOutput>;
+    }
 
     return {
       ...originalInput,
-      score: accumulatedResults.generateScoreStepResult,
-      generateScorePrompt: generatedPrompts.generateScorePrompt,
-      reason: accumulatedResults.generateReasonStepResult,
-      generateReasonPrompt: generatedPrompts.generateReasonPrompt,
-      preprocessStepResult: accumulatedResults.preprocessStepResult,
-      preprocessPrompt: generatedPrompts.preprocessPrompt,
-      analyzeStepResult: accumulatedResults.analyzeStepResult,
-      analyzePrompt: generatedPrompts.analyzePrompt,
-    };
+      ...(notScorable ? { notScorable } : score !== undefined ? { score } : {}),
+      ...(generateScorePrompt !== undefined ? { generateScorePrompt } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+      ...(generateReasonPrompt !== undefined ? { generateReasonPrompt } : {}),
+      ...(preprocessStepResult !== undefined ? { preprocessStepResult } : {}),
+      ...(preprocessPrompt !== undefined ? { preprocessPrompt } : {}),
+      ...(analyzeStepResult !== undefined ? { analyzeStepResult } : {}),
+      ...(analyzePrompt !== undefined ? { analyzePrompt } : {}),
+      ...(judge && Object.keys(judge).length > 0 ? { judge } : {}),
+    } as ScorerRunResult<TAccumulatedResults, TInput, TRunOutput>;
   }
 }
 
 // Overload: enum type shortcuts (e.g., type: 'agent')
+/**
+ * Creates a scorer builder for evaluating input/output pairs.
+ * Add a `generateScore` stage before running the scorer.
+ *
+ * @example
+ * ```typescript
+ * import { createScorer } from '@mastra/core/evals';
+ *
+ * const scorer = createScorer({
+ *   id: 'response-presence',
+ *   description: 'Check whether the agent produced any output messages.',
+ *   type: 'agent',
+ * }).generateScore(({ run }) => (run.output.length > 0 ? 1 : 0));
+ * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Scorer documentation](https://mastra.ai/reference/evals/create-scorer)
+ * if packaged docs are unavailable.
+ */
 export function createScorer<TID extends string, TType extends keyof ScorerTypeShortcuts>(
   config: Omit<ScorerConfig<TID, any, any>, 'type'> & {
     type: TType;
@@ -1104,6 +2011,12 @@ export function createScorer(config: any): any {
 export type MastraScorerEntry = {
   scorer: MastraScorer<any, any, any, any>;
   sampling?: ScoringSamplingConfig;
+  /**
+   * Declarative eligibility filter, evaluated before sampling (filter →
+   * sample): the sampling rate applies to qualifying traffic only. JSON-safe,
+   * so it survives durable-agent serialization. See `evals/predicate.ts`.
+   */
+  filter?: ScoringFilter;
 };
 
 export type MastraScorers = Record<string, MastraScorerEntry>;
@@ -1356,7 +2269,7 @@ function filterMessages(messages: MastraDBMessage[], options: FilterRunOptions):
   });
 }
 
-// Export types and interfaces for use in test files
-export type { ScorerConfig, ScorerRun, PromptObject };
+// Export types and interfaces for adapters and test files
+export type { ScorerConfig, ScorerRun, ScorerTypeShortcuts, StepContext, PromptObject };
 
 export { MastraScorer };

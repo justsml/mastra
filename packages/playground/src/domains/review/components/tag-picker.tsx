@@ -1,8 +1,12 @@
 import { Input } from '@mastra/playground-ui/components/Input';
 import { Popover, PopoverTrigger, PopoverContent } from '@mastra/playground-ui/components/Popover';
 import { Txt } from '@mastra/playground-ui/components/Txt';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { X, Plus } from 'lucide-react';
 import { useState, useRef } from 'react';
+import { ComputedTag } from '@/domains/observability/components/computed-tag';
 
 export function TagPicker({
   tags,
@@ -38,26 +42,34 @@ export function TagPicker({
   };
 
   return (
-    <div className="flex items-center gap-1 flex-wrap">
+    <div className="flex flex-wrap items-center gap-1">
       {tags.map(tag => (
-        <span
-          key={tag}
-          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md bg-accent1/10 text-accent1 text-[10px] font-medium"
-        >
+        <ComputedTag key={tag} value={tag} className="gap-0.5 pr-1">
           {tag}
-          <button type="button" onClick={() => removeTag(tag)} className="hover:text-accent1/70">
-            <X className="w-2.5 h-2.5" />
+          <button
+            type="button"
+            aria-label={`Remove tag ${tag}`}
+            onClick={() => removeTag(tag)}
+            className="cursor-pointer hover:opacity-70"
+          >
+            <X className="h-2.5 w-2.5" />
           </button>
-        </span>
+        </ComputedTag>
       ))}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
-            className="inline-flex items-center gap-0.5 px-1 py-0.5 rounded text-[10px] text-neutral3 hover:text-neutral5 hover:bg-surface3 transition-colors"
+            className={cn(
+              quietTextHover,
+              controlStateColorTransition,
+              'inline-flex items-center gap-0.5 rounded px-1 py-0.5 hover:bg-fill-subtle',
+            )}
           >
-            <Plus className="w-3 h-3" />
-            tag
+            <Plus className="h-3 w-3" />
+            <Txt as="span" variant="meta" className="block">
+              tag
+            </Txt>
           </button>
         </PopoverTrigger>
         <PopoverContent className="w-52 p-2" align="start">
@@ -67,31 +79,35 @@ export function TagPicker({
             onChange={e => setSearch(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Search or create tag..."
-            className="h-7 text-xs mb-1"
+            className="mb-1 h-7 text-caption"
             autoFocus
           />
-          <div className="max-h-32 overflow-y-auto space-y-0.5">
+          <div className="max-h-32 space-y-0.5 overflow-y-auto">
             {filtered.map(tag => (
               <button
                 key={tag}
                 type="button"
                 onClick={() => addTag(tag)}
-                className="w-full text-left px-2 py-1 text-xs rounded hover:bg-surface3 text-neutral4"
+                className="w-full rounded px-2 py-1 text-left text-muted-foreground hover:bg-fill-subtle"
               >
-                {tag}
+                <Txt as="span" variant="caption" className="block">
+                  {tag}
+                </Txt>
               </button>
             ))}
             {canCreate && (
               <button
                 type="button"
                 onClick={() => addTag(search.trim())}
-                className="w-full text-left px-2 py-1 text-xs rounded hover:bg-surface3 text-accent1"
+                className="w-full rounded px-2 py-1 text-left text-info-indicator hover:bg-fill-subtle"
               >
-                Create &quot;{search.trim()}&quot;
+                <Txt as="span" variant="caption" className="block">
+                  Create &quot;{search.trim()}&quot;
+                </Txt>
               </button>
             )}
             {filtered.length === 0 && !canCreate && (
-              <Txt variant="ui-xs" className="text-neutral3 px-2 py-1 block">
+              <Txt variant="meta" tone="muted" className="block px-2 py-1">
                 No tags available
               </Txt>
             )}

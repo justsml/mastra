@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
   dispatchEvent: vi.fn(),
+  getThreadLifecycleGeneration: vi.fn(() => 0),
   showError: vi.fn(),
   showInfo: vi.fn(),
   showFormattedError: vi.fn(),
@@ -18,6 +19,7 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('../event-dispatch.js', () => ({
   dispatchEvent: mocks.dispatchEvent,
+  getThreadLifecycleGeneration: mocks.getThreadLifecycleGeneration,
 }));
 
 vi.mock('../display.js', () => ({
@@ -31,6 +33,7 @@ vi.mock('../status-line.js', () => ({
   updateStatusLine: mocks.updateStatusLine,
 }));
 
+import { AssistantRenderRegistry } from '../assistant-render-registry.js';
 import { MastraTUI } from '../mastra-tui.js';
 
 function createHookResult(overrides: Record<string, unknown> = {}) {
@@ -56,6 +59,7 @@ function createBareTui(hookManager?: Record<string, unknown>) {
 
   tui.state = {
     hookManager,
+    assistantRenderRegistry: new AssistantRenderRegistry(),
     ui: { stop: vi.fn(), requestRender: vi.fn() },
     idleCounter: { setTimingState: vi.fn(), update: vi.fn() },
   };
@@ -123,11 +127,28 @@ describe('MastraTUI hook wiring', () => {
     expect(clearRunId).toHaveBeenCalledTimes(1);
   });
 
+  it('does not run post-dispatch thread synchronization for a stale lifecycle', async () => {
+    const tui = createBareTui() as ReturnType<typeof createBareTui> & {
+      refreshBackgroundActivity: ReturnType<typeof vi.fn>;
+      syncThreadActivePackMetadata: ReturnType<typeof vi.fn>;
+    };
+    tui.state.session = { thread: { getId: vi.fn(() => 'thread-a') } };
+    tui.refreshBackgroundActivity = vi.fn();
+    tui.syncThreadActivePackMetadata = vi.fn();
+    mocks.getThreadLifecycleGeneration.mockReturnValueOnce(0).mockReturnValueOnce(2);
+
+    await tui.handleEvent({ type: 'thread_changed', threadId: 'thread-a', previousThreadId: 'thread-b' });
+
+    expect(tui.refreshBackgroundActivity).not.toHaveBeenCalled();
+    expect(tui.syncThreadActivePackMetadata).not.toHaveBeenCalled();
+  });
+
   it('does not run Stop hook for non-agent_end events', async () => {
     const runStop = vi.fn().mockResolvedValue(createHookResult());
     const runAgentStart = vi.fn().mockResolvedValue(createHookResult());
     const setRunId = vi.fn();
-    const tui = createBareTui({ runStop, runAgentStart, setRunId });
+    const getRunId = vi.fn(() => undefined);
+    const tui = createBareTui({ runStop, runAgentStart, setRunId, getRunId });
 
     await tui.handleEvent({ type: 'agent_start' });
 
@@ -228,6 +249,17 @@ describe('MastraTUI hook wiring', () => {
     expect(tui.caffeinateProcess).toBeNull();
   });
 
+  it('tears down only once when stop is called repeatedly', () => {
+    const runSessionEnd = vi.fn().mockResolvedValue(createHookResult());
+    const tui = createBareTui({ runSessionEnd });
+
+    tui.stop();
+    tui.stop();
+
+    expect(runSessionEnd).toHaveBeenCalledOnce();
+    expect((tui.state.ui as { stop: ReturnType<typeof vi.fn> }).stop).toHaveBeenCalledOnce();
+  });
+
   it('does nothing on non-darwin platforms', async () => {
     vi.stubGlobal('process', { platform: 'linux', env: {} });
     const tui = createBareTui();
@@ -250,8 +282,9 @@ describe('MastraTUI hook wiring', () => {
 
   it('generates a run_id and sets it before firing AgentStart on agent_start', async () => {
     const setRunId = vi.fn();
+    const getRunId = vi.fn(() => undefined);
     const runAgentStart = vi.fn().mockResolvedValue(createHookResult());
-    const tui = createBareTui({ setRunId, runAgentStart });
+    const tui = createBareTui({ setRunId, getRunId, runAgentStart });
 
     await tui.handleEvent({ type: 'agent_start' });
 
@@ -275,7 +308,10 @@ describe('MastraTUI hook wiring', () => {
     expect(runAgentEnd.mock.invocationCallOrder[0]).toBeLessThan(clearRunId.mock.invocationCallOrder[0]);
   });
 
-  it('fires PermissionRequest on tool_approval_required with tool context', async () => {
+  // PermissionRequest dispatch moved to the receipt-time tap (#20861) — see
+  // permission-hooks-receipt.test.ts for the positive assertions. These
+  // negatives pin that the queued handler no longer double-dispatches.
+  it('does not fire PermissionRequest from the queued handler on tool_approval_required', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
 
@@ -286,12 +322,10 @@ describe('MastraTUI hook wiring', () => {
       args: { command: 'rm -rf /' },
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('tool_approval', 'call-1', 'execute_command', {
-      command: 'rm -rf /',
-    });
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
-  it('fires PermissionRequest on sandbox access suspension with suspend payload', async () => {
+  it('does not fire PermissionRequest from the queued handler on sandbox access suspension', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
     const suspendPayload = { kind: 'sandbox_access_request', path: '/tmp/project', reason: 'read files' };
@@ -304,10 +338,10 @@ describe('MastraTUI hook wiring', () => {
       suspendPayload,
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('sandbox_access', 'call-2', 'request_access', suspendPayload);
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
-  it('fires PermissionRequest on plan approval suspension with suspend payload', async () => {
+  it('does not fire PermissionRequest from the queued handler on plan approval suspension', async () => {
     const runPermissionRequest = vi.fn().mockResolvedValue(createHookResult());
     const tui = createBareTui({ runPermissionRequest });
     const suspendPayload = { path: '.mastracode/plans/change.md' };
@@ -320,7 +354,7 @@ describe('MastraTUI hook wiring', () => {
       suspendPayload,
     });
 
-    expect(runPermissionRequest).toHaveBeenCalledWith('plan_approval', 'call-3', 'submit_plan', suspendPayload);
+    expect(runPermissionRequest).not.toHaveBeenCalled();
   });
 
   it('does not fire PermissionRequest on ask_user suspension', async () => {

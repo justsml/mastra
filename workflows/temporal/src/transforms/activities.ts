@@ -3,6 +3,7 @@ import { generate } from '@babel/generator';
 import { parse } from '@babel/parser';
 import * as t from '@babel/types';
 import { rollup } from 'rollup';
+import type { SourceMapInput } from 'rollup';
 import {
   collectCreateStepFactoryBindings,
   collectImportedNames,
@@ -10,6 +11,7 @@ import {
   createExportedStepStatement,
   getCreateStepCallFromExpression,
   getCreateStepId,
+  getObjectPropertyName,
   getStepNameFromCall,
   hasCreateWorkflowCall,
   isCreateStepCall,
@@ -35,7 +37,7 @@ export interface BuildTemporalActivitiesModuleResult {
 export function collectTemporalActivityBindings(sourceText: string, filePath: string): TemporalActivityBinding[] {
   const ast = parse(sourceText, {
     sourceType: 'module',
-    plugins: parserPlugins as any,
+    plugins: parserPlugins,
     sourceFilename: filePath,
   });
 
@@ -119,6 +121,166 @@ function rebaseModulePath(modulePath: string, sourceFilePath: string, outputFile
   return normalizeImportPath(relativePath, path.extname(resolvedPath));
 }
 
+function parseWorkflowChain(
+  node: t.Node,
+): { createWorkflowCall: t.CallExpression; methods: { name: string; args: t.Node[] }[] } | null {
+  const methods: { name: string; args: t.Node[] }[] = [];
+  let current = node;
+
+  while (t.isCallExpression(current) && t.isMemberExpression(current.callee) && !current.callee.computed) {
+    if (!t.isIdentifier(current.callee.property)) {
+      return null;
+    }
+    methods.unshift({ name: current.callee.property.name, args: current.arguments as t.Node[] });
+    current = current.callee.object;
+  }
+
+  if (!t.isCallExpression(current) || !t.isIdentifier(current.callee, { name: 'createWorkflow' })) {
+    return null;
+  }
+
+  return { createWorkflowCall: current, methods };
+}
+
+function getStaticWorkflowId(call: t.CallExpression, filePath: string): string {
+  const [config] = call.arguments;
+  if (!t.isObjectExpression(config)) {
+    throw new Error(`Unable to determine workflow config in ${filePath}`);
+  }
+
+  for (const property of config.properties) {
+    if (!t.isObjectProperty(property) || getObjectPropertyName(property) !== 'id') {
+      continue;
+    }
+    if (t.isStringLiteral(property.value)) {
+      return property.value.value;
+    }
+    if (t.isTemplateLiteral(property.value) && property.value.expressions.length === 0) {
+      return property.value.quasis[0]?.value.cooked ?? '';
+    }
+  }
+
+  throw new Error(`Workflow id must be a static string in ${filePath}`);
+}
+
+function toExportName(id: string): string {
+  return id
+    .replace(/[^a-zA-Z0-9]+(.)/g, (_match, char: string) => char.toUpperCase())
+    .replace(/^[^a-zA-Z_$]+/, '')
+    .replace(/^(.)/, (char: string) => char.toLowerCase());
+}
+
+function collectStaticFunctionBindings(program: t.Program): Set<string> {
+  const bindings = new Set<string>();
+  for (const statement of program.body) {
+    const declaration = t.isExportNamedDeclaration(statement) ? statement.declaration : statement;
+    if (t.isFunctionDeclaration(declaration) && declaration.id) {
+      bindings.add(declaration.id.name);
+      continue;
+    }
+    if (!t.isVariableDeclaration(declaration) || declaration.kind !== 'const') {
+      continue;
+    }
+    for (const declarator of declaration.declarations) {
+      if (
+        t.isIdentifier(declarator.id) &&
+        (t.isArrowFunctionExpression(declarator.init) || t.isFunctionExpression(declarator.init))
+      ) {
+        bindings.add(declarator.id.name);
+      }
+    }
+  }
+  return bindings;
+}
+
+function collectTopLevelBindingNames(program: t.Program): Set<string> {
+  const bindings = new Set<string>();
+  for (const statement of program.body) {
+    for (const name of Object.keys(t.getBindingIdentifiers(statement))) {
+      bindings.add(name);
+    }
+  }
+  return bindings;
+}
+
+function createMappingActivityStatements(
+  workflowExpression: t.Expression,
+  filePath: string,
+  staticFunctionBindings: Set<string>,
+  usedExportNames: Set<string>,
+  requestContextClassName: string,
+  addBinding: (exportName: string, stepId: string) => void,
+): t.Statement[] {
+  const chain = parseWorkflowChain(workflowExpression);
+  if (!chain) {
+    return [];
+  }
+
+  const workflowId = getStaticWorkflowId(chain.createWorkflowCall, filePath);
+  const statements: t.Statement[] = [];
+  let mappingOrdinal = 0;
+
+  for (const method of chain.methods) {
+    if (method.name !== 'map') {
+      continue;
+    }
+
+    const [callback] = method.args;
+    if (t.isObjectExpression(callback)) {
+      throw new Error(
+        `.map() in workflow ${workflowId} (${filePath}) does not yet support declarative object mappings`,
+      );
+    }
+    if (
+      !t.isArrowFunctionExpression(callback) &&
+      !t.isFunctionExpression(callback) &&
+      !(t.isIdentifier(callback) && staticFunctionBindings.has(callback.name))
+    ) {
+      throw new Error(
+        `.map() in workflow ${workflowId} (${filePath}) requires an inline function or a statically declared function identifier`,
+      );
+    }
+
+    const mappingId = `mapping_${workflowId}_${mappingOrdinal++}`;
+    const baseExportName = toExportName(mappingId);
+    let exportName = baseExportName;
+    let exportSuffix = 1;
+    while (usedExportNames.has(exportName)) {
+      exportName = `${baseExportName}${exportSuffix++}`;
+    }
+    usedExportNames.add(exportName);
+    const contextNames = ['requestContext', 'runId', 'resourceId', 'workflowId'];
+    const params = t.objectPattern([
+      t.objectProperty(t.identifier('inputData'), t.identifier('inputData'), false, true),
+      t.objectProperty(t.identifier('initData'), t.identifier('initData'), false, true),
+      ...contextNames.map(name => t.objectProperty(t.identifier(name), t.identifier(name), false, true)),
+    ]);
+    const callbackContext = t.objectExpression([
+      t.objectProperty(t.identifier('inputData'), t.identifier('inputData'), false, true),
+      t.objectProperty(t.identifier('getInitData'), t.arrowFunctionExpression([], t.identifier('initData'))),
+      t.objectProperty(
+        t.identifier('requestContext'),
+        t.newExpression(t.identifier(requestContextClassName), [t.identifier('requestContext')]),
+      ),
+      ...contextNames
+        .filter(name => name !== 'requestContext')
+        .map(name => t.objectProperty(t.identifier(name), t.identifier(name), false, true)),
+    ]);
+    const callbackExpression = t.cloneNode(callback, true) as t.Expression;
+    const body = t.callExpression(callbackExpression, [callbackContext]);
+    statements.push(
+      t.exportNamedDeclaration(
+        t.variableDeclaration('const', [
+          t.variableDeclarator(t.identifier(exportName), t.arrowFunctionExpression([params], body, true)),
+        ]),
+      ),
+    );
+    addBinding(exportName, mappingId);
+  }
+
+  return statements;
+}
+
 function collectWorkflowBindingNames(ast: t.File): Set<string> {
   const workflowNames = new Set<string>();
 
@@ -192,35 +354,49 @@ function hasLocalMastraBinding(ast: t.File): boolean {
 function createTemporalActivitiesHelperStatements(
   mastraImportPath: string | null,
   hasMastraBinding: boolean,
+  requestContextClassName: string,
 ): t.Statement[] {
-  const helperSource = mastraImportPath
-    ? `
-        function createStep(args) {
-          return async (params) => {
-            const { mastra } = await import(${JSON.stringify(mastraImportPath)});
-            return args.execute({ ...params, mastra });
-          };
-        }
-      `
-    : hasMastraBinding
-      ? `
-        function createStep(args) {
-          return async (params) => {
-            return args.execute({ ...params, mastra });
-          };
-        }
-      `
-      : `
-        function createStep(args) {
-          return async (params) => {
-            return args.execute(params);
-          };
-        }
-      `;
+  const helperSource = `
+    function withRequestContext(params) {
+      const { requestContext, initData, ...rest } = params;
+      return {
+        ...rest,
+        requestContext: new ${requestContextClassName}(requestContext),
+        getInitData: () => initData,
+      };
+    }
+
+    ${
+      mastraImportPath
+        ? `
+          function createStep(args) {
+            return async (params) => {
+              const { mastra } = await import(${JSON.stringify(mastraImportPath)});
+              return args.execute({ ...withRequestContext(params), mastra });
+            };
+          }
+        `
+        : hasMastraBinding
+          ? `
+            function createStep(args) {
+              return async (params) => {
+                return args.execute({ ...withRequestContext(params), mastra });
+              };
+            }
+          `
+          : `
+            function createStep(args) {
+              return async (params) => {
+                return args.execute(withRequestContext(params));
+              };
+            }
+          `
+    }
+  `;
 
   return parse(helperSource, {
     sourceType: 'module',
-    plugins: parserPlugins as any,
+    plugins: parserPlugins,
   }).program.body;
 }
 
@@ -231,15 +407,19 @@ export async function buildTemporalActivitiesModule(
 ): Promise<BuildTemporalActivitiesModuleResult> {
   const activityBindings: TemporalActivityBinding[] = [];
   const seenActivityBindingNames = new Set<string>();
-  const addActivityBinding = (exportName: string, call: t.CallExpression): void => {
-    const stepId = getCreateStepId(call);
-
-    if (!stepId || seenActivityBindingNames.has(exportName)) {
+  const addGeneratedActivityBinding = (exportName: string, stepId: string): void => {
+    if (seenActivityBindingNames.has(exportName)) {
       return;
     }
 
     seenActivityBindingNames.add(exportName);
     activityBindings.push({ exportName, stepId });
+  };
+  const addActivityBinding = (exportName: string, call: t.CallExpression): void => {
+    const stepId = getCreateStepId(call);
+    if (stepId) {
+      addGeneratedActivityBinding(exportName, stepId);
+    }
   };
 
   const bundle = await rollup({
@@ -252,15 +432,29 @@ export async function buildTemporalActivitiesModule(
         transform(code, id) {
           const ast = parse(code, {
             sourceType: 'module',
-            plugins: parserPlugins as any,
+            plugins: parserPlugins,
             sourceFilename: id,
           });
 
-          const statements: t.Statement[] = [];
+          const usedExportNames = collectTopLevelBindingNames(ast.program);
+          let requestContextClassName = 'TemporalRequestContext';
+          let requestContextSuffix = 1;
+          while (usedExportNames.has(requestContextClassName)) {
+            requestContextClassName = `TemporalRequestContext${requestContextSuffix++}`;
+          }
+          usedExportNames.add(requestContextClassName);
+
+          const statements: t.Statement[] = [
+            t.importDeclaration(
+              [t.importSpecifier(t.identifier(requestContextClassName), t.identifier('RequestContext'))],
+              t.stringLiteral('@mastra/core/di'),
+            ),
+          ];
           const seenNames = new Set<string>();
           const strippedNames = new Set<string>();
           const workflowBindingNames = collectWorkflowBindingNames(ast);
           const stepFactoryBindings = collectCreateStepFactoryBindings(ast.program);
+          const staticFunctionBindings = collectStaticFunctionBindings(ast.program);
           const sourceFilePath = id;
           const hasMastraBinding = hasLocalMastraBinding(ast);
           let helperInserted = false;
@@ -270,7 +464,9 @@ export async function buildTemporalActivitiesModule(
               return;
             }
 
-            statements.push(...createTemporalActivitiesHelperStatements(null, hasMastraBinding));
+            statements.push(
+              ...createTemporalActivitiesHelperStatements(null, hasMastraBinding, requestContextClassName),
+            );
             helperInserted = true;
           };
 
@@ -382,6 +578,16 @@ export async function buildTemporalActivitiesModule(
                 if (hasCreateWorkflowCall(declaration.init)) {
                   workflowBindingNames.add(declaration.id.name);
                   strippedNames.add(declaration.id.name);
+                  statements.push(
+                    ...createMappingActivityStatements(
+                      declaration.init,
+                      sourceFilePath,
+                      staticFunctionBindings,
+                      usedExportNames,
+                      requestContextClassName,
+                      addGeneratedActivityBinding,
+                    ),
+                  );
                   collectInlineCreateSteps(declaration.init, seenNames, statements, addActivityBinding);
                   continue;
                 }
@@ -450,6 +656,16 @@ export async function buildTemporalActivitiesModule(
                 if (hasCreateWorkflowCall(declaration.init)) {
                   workflowBindingNames.add(declaration.id.name);
                   strippedNames.add(declaration.id.name);
+                  statements.push(
+                    ...createMappingActivityStatements(
+                      declaration.init,
+                      sourceFilePath,
+                      staticFunctionBindings,
+                      usedExportNames,
+                      requestContextClassName,
+                      addGeneratedActivityBinding,
+                    ),
+                  );
                   collectInlineCreateSteps(declaration.init, seenNames, statements, addActivityBinding);
                   continue;
                 }
@@ -564,7 +780,12 @@ export async function buildTemporalActivitiesModule(
             sourceMaps: true,
           });
 
-          return transformedSource;
+          return {
+            code: transformedSource.code,
+            map: transformedSource.map
+              ? ({ ...transformedSource.map, file: transformedSource.map.file ?? undefined } as SourceMapInput)
+              : undefined,
+          };
         },
       },
     ],

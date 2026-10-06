@@ -8,11 +8,34 @@ import { createMastraCode } from '@mastra/code-sdk';
 import { createMastraCodeAnalytics } from '@mastra/code-sdk/analytics';
 import { isStreamDestroyedError } from '@mastra/code-sdk/error-classification';
 import { hasHeadlessFlag, runMCCli } from '@mastra/code-sdk/headless/index';
-import { createBrowserFromSettings, loadSettings } from '@mastra/code-sdk/onboarding/settings';
+import {
+  createBrowserFromSettings,
+  loadSettings,
+  resolveStagehandModel,
+  toActiveBrowserSettings,
+} from '@mastra/code-sdk/onboarding/settings';
 import { formatScaffoldSuccess, scaffoldPlugin } from '@mastra/code-sdk/plugins/scaffold';
-import { setupDebugLogging } from '@mastra/code-sdk/utils/debug-log';
+import {
+  stopProcessMemoryDiagnosticsWithTimeout,
+  type ProcessMemoryDiagnostics,
+} from '@mastra/code-sdk/process-memory-diagnostics';
+import { setupDebugLogging, truncateLogFile } from '@mastra/code-sdk/utils/debug-log';
 import { drainPipedStdin, reopenStdinFromTTY } from '@mastra/code-sdk/utils/stdin-pipe';
 import { releaseAllThreadLocks } from '@mastra/code-sdk/utils/thread-lock';
+import { TUI_CO_AUTHOR } from './commit-attribution.js';
+import { initialMessageOptions, pipedInputConflict, takeInitialPrompt } from './initial-prompt.js';
+import {
+  createOneShotFatalErrorHandler,
+  createShutdownCoordinator,
+  startTuiProcessMemoryDiagnostics,
+} from './process-memory-diagnostics-lifecycle.js';
+import {
+  formatResumeHint,
+  parseResumeThreadId,
+  shouldRejectResumeWithoutTTY,
+  shouldRunHeadless,
+} from './resume-command.js';
+import { resolveTuiSubagents } from './subagent-settings.js';
 import { detectTerminalTheme } from './tui/detect-theme.js';
 import { MastraTUI } from './tui/index.js';
 import { applyThemeMode, restoreTerminalForeground } from './tui/theme.js';
@@ -23,8 +46,18 @@ let mcpManager: Awaited<ReturnType<typeof createMastraCode>>['mcpManager'];
 let hookManager: Awaited<ReturnType<typeof createMastraCode>>['hookManager'];
 let authStorage: Awaited<ReturnType<typeof createMastraCode>>['authStorage'];
 let signalsPubSub: Awaited<ReturnType<typeof createMastraCode>>['signalsPubSub'];
+let storageMaintenance: Awaited<ReturnType<typeof createMastraCode>>['storageMaintenance'];
+let stopPluginSignalProviders: Awaited<ReturnType<typeof createMastraCode>>['stopPluginSignalProviders'] | undefined;
+let threadScheduler: Awaited<ReturnType<typeof createMastraCode>>['threadScheduler'] | undefined;
+let stopNotificationDispatch: Awaited<ReturnType<typeof createMastraCode>>['stopNotificationDispatch'] | undefined;
 let analytics: ReturnType<typeof createMastraCodeAnalytics> | undefined;
 let tui: MastraTUI | undefined;
+let processMemoryDiagnostics: ProcessMemoryDiagnostics | undefined;
+let storageClosed = false;
+let cleanupPromise: Promise<void> | null = null;
+let getResumeThreadId: (() => string | null) | undefined;
+
+const CRASH_LOG_PATH = '/tmp/mastra-crash.log';
 
 function isTruthyEnv(name: string): boolean {
   return ['1', 'true', 'yes', 'on'].includes(process.env[name]?.trim().toLowerCase() ?? '');
@@ -50,19 +83,25 @@ process.on('unhandledRejection', reason => {
   handleFatalError(reason instanceof Error ? reason : new Error(String(reason)));
 });
 
-async function tuiMain(pipedInput?: string | null) {
+async function tuiMain(startupMessage: ReturnType<typeof initialMessageOptions> = {}, resumeThreadId?: string) {
   const settings = loadSettings();
+  processMemoryDiagnostics = await startTuiProcessMemoryDiagnostics(process.env, warning => {
+    console.info(`⚠ ${warning}`);
+  });
   let browserPromise: ReturnType<typeof createBrowserFromSettings> | undefined;
-  const loadBrowser = () => {
-    browserPromise ??= createBrowserFromSettings(settings.browser);
+  const loadBrowser = (chatModelId: string | undefined) => {
+    browserPromise ??= createBrowserFromSettings(settings.browser, { chatModelId });
     return browserPromise;
   };
 
   const initialState = resolveInitialStateFromEnv();
   const result = await createMastraCode({
+    createInitialThread: false,
+    coAuthor: TUI_CO_AUTHOR,
     unixSocketPubSub: !isTruthyEnv('MASTRACODE_DISABLE_UNIX_SOCKET_PUBSUB'),
     disableMcp: isTruthyEnv('MASTRACODE_DISABLE_MCP'),
     disableHooks: isTruthyEnv('MASTRACODE_DISABLE_HOOKS'),
+    subagents: resolveTuiSubagents(settings.preferences.subagentsEnabled),
     ...(isTruthyEnv('MASTRACODE_DISABLE_MEMORY') ? { memory: false as never } : {}),
     ...(initialState ? { initialState: initialState as never } : {}),
   });
@@ -71,6 +110,10 @@ async function tuiMain(pipedInput?: string | null) {
   hookManager = result.hookManager;
   authStorage = result.authStorage;
   signalsPubSub = result.signalsPubSub;
+  storageMaintenance = result.storageMaintenance;
+  stopPluginSignalProviders = result.stopPluginSignalProviders;
+  threadScheduler = result.threadScheduler;
+  stopNotificationDispatch = result.stopNotificationDispatch;
 
   if (result.storageWarning) {
     console.info(`⚠ ${result.storageWarning}`);
@@ -108,6 +151,7 @@ async function tuiMain(pipedInput?: string | null) {
   // createMastraCode() brought up shared resources and minted the single
   // session that all work runs through. The AgentController owns no session of its own.
   const session = result.session;
+  getResumeThreadId = () => (tui ? tui.getResumeThreadId() : session.thread.getId());
 
   analytics = createMastraCodeAnalytics({ version: getCurrentVersion() });
   analytics.capture('mastracode_session_started', {
@@ -127,38 +171,85 @@ async function tuiMain(pipedInput?: string | null) {
     mcpManager,
     pluginManager: result.pluginManager,
     storageMaintenance: result.storageMaintenance,
+    processMemoryDiagnostics,
+    knowledgeInspector: result.knowledgeInspector,
+    threadScheduler: result.threadScheduler,
     appName: 'Mastra Code',
     version: getCurrentVersion(),
     inlineQuestions: true,
+    initialModelOverride: Boolean(initialState?.currentModelId),
+    ...(resumeThreadId ? { resumeThreadId } : {}),
     githubSignals: result.githubSignals,
-    ...(pipedInput ? { initialMessage: `The following was piped via stdin:\n\n${pipedInput}` } : {}),
+    backgroundToolsEnabled: result.backgroundToolsEnabled,
+    backgroundCompletionEvents: result.backgroundCompletionEvents,
+    exit: exitCode => void shutdownAndExit(exitCode),
+    ...startupMessage,
   });
   tui.run().catch(error => {
     handleFatalError(error);
   });
 
   if (settings.browser.enabled) {
-    void loadBrowser()
+    // Captured once: the Stagehand instance is fixed at launch and shared by every thread.
+    const chatModelId = session.model.get();
+    void loadBrowser(chatModelId)
       .then(browser => {
         if (!browser) return;
         controller.setBrowser(browser);
-        void session.state.set({ activeBrowserSettings: settings.browser } as any).catch(() => {});
+        void session.state
+          .set({
+            activeBrowserSettings: toActiveBrowserSettings(settings.browser),
+            activeBrowserModel: resolveStagehandModel(settings.browser, { chatModelId }),
+          } as any)
+          .catch(() => {});
       })
       .catch(() => {});
   }
 }
 
-const asyncCleanup = async () => {
-  releaseAllThreadLocks();
-  const closeSignalsPubSub = (signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
-  await Promise.allSettled([
-    mcpManager?.disconnect(),
-    controller?.getMastra()?.stopWorkers(),
-    controller?.stopIntervals(),
-    closeSignalsPubSub?.(),
-    analytics?.shutdown(),
-  ]);
+const asyncCleanup = (): Promise<void> => {
+  cleanupPromise ??= (async () => {
+    releaseAllThreadLocks();
+    // Stop plugin-contributed signal providers (and the plugin reload listener)
+    // before quiescing workers: a provider that keeps polling past this point
+    // could dispatch into a controller that is shutting down.
+    try {
+      stopPluginSignalProviders?.();
+    } catch {
+      // Best-effort — the process is exiting.
+    }
+    const diagnosticsShutdown = processMemoryDiagnostics
+      ? stopProcessMemoryDiagnosticsWithTimeout(processMemoryDiagnostics, message => console.warn(message))
+      : undefined;
+    // Schedules live only in this process; stop their timers so none fires mid-shutdown.
+    threadScheduler?.stop();
+    // Release this process's notification dispatch leases before the pubsub that holds them closes.
+    await stopNotificationDispatch?.().catch(() => {});
+    await Promise.allSettled([mcpManager?.disconnect(), controller?.stopIntervals()]);
+    // Mastra owns the workspaces and must destroy them to stop retained language
+    // servers before storage is closed.
+    await Promise.allSettled([controller?.getMastra()?.shutdown(), analytics?.shutdown()]);
+    // The signals pubsub is Mastra's event bus: in-flight runs and background
+    // tasks drain through it during shutdown, so close it only afterwards. Call
+    // close() on the object; a detached method loses `this` and rejects silently.
+    const pubsubToClose = signalsPubSub as { close?: () => Promise<void> | void } | undefined;
+    await Promise.allSettled([pubsubToClose?.close?.()]);
+    // Checkpoint WAL and close the local storage connection after all producers
+    // and timers are quiesced. Idempotent — repeated signals (SIGINT then SIGHUP)
+    // close only once. LibSQLStore.close()/LibSQLVector.close() truncate the WAL
+    // and switch back to DELETE journal mode for a clean shutdown.
+    if (!storageClosed) {
+      storageClosed = true;
+      await storageMaintenance?.closeStorage?.().catch(() => {
+        // Swallow — best-effort cleanup during shutdown. The process is exiting.
+      });
+    }
+    await diagnosticsShutdown;
+  })();
+  return cleanupPromise;
 };
+
+const shutdownAndExit = createShutdownCoordinator(asyncCleanup, exitCode => process.exit(exitCode));
 
 process.on('beforeExit', () => {
   void asyncCleanup();
@@ -194,19 +285,27 @@ process.on('exit', () => {
   }
   restoreTerminalForeground();
   releaseAllThreadLocks();
+  try {
+    const threadId = getResumeThreadId?.();
+    if (threadId) {
+      process.stdout.write(`\n${formatResumeHint(threadId)}\n`);
+    }
+  } catch {
+    // session state or stdout may already be closed during exit
+  }
 });
 
-// For all termination signals: stop the TUI FIRST (synchronous, disables keyboard
-// protocol immediately) before doing any async cleanup. This ensures the terminal
-// escape sequences are written even if asyncCleanup hangs or the process is killed
-// during cleanup.
+// Start durable diagnostics shutdown before synchronous TUI teardown so a stalled
+// terminal cleanup cannot prevent the final profile capture. The exit handler still
+// provides a failsafe terminal reset if teardown throws.
 const handleTermSignal = () => {
+  void asyncCleanup();
   try {
     tui?.stop();
   } catch {
     // ignored — exit handler has failsafe reset
   }
-  void asyncCleanup().finally(() => process.exit(0));
+  void shutdownAndExit(0);
 };
 process.on('SIGINT', handleTermSignal);
 process.on('SIGTERM', handleTermSignal);
@@ -250,9 +349,13 @@ function readFlag(args: string[], flag: string): string | undefined {
   return value;
 }
 
-function handleFatalError(error: unknown): never {
+const handleFatalError = createOneShotFatalErrorHandler((error: unknown): void => {
   // Always write to real stderr, even if console.error was overridden
-  const write = (msg: string) => process.stderr.write(msg + '\n');
+  const write = (msg: string) => {
+    try {
+      process.stderr.write(msg + '\n');
+    } catch {}
+  };
 
   if (hasEconnrefused(error)) {
     const settings = loadSettings();
@@ -264,7 +367,12 @@ function handleFatalError(error: unknown): never {
         `\n\nTo switch back to LibSQL:` +
         `\n  Set MASTRA_STORAGE_BACKEND=libsql or change the backend in /settings\n`,
     );
-    process.exit(1);
+    void asyncCleanup();
+    try {
+      tui?.stop();
+    } catch {}
+    void shutdownAndExit(1);
+    return;
   }
 
   const msg = `Fatal error: ${error instanceof Error ? error.message : String(error)}`;
@@ -272,26 +380,86 @@ function handleFatalError(error: unknown): never {
   // Write crash log to file so it persists even if terminal closes
   try {
     const crashLog = `[${new Date().toISOString()}] ${msg}\n${error instanceof Error && error.stack ? error.stack + '\n' : ''}`;
-    fs.appendFileSync('/tmp/mastra-crash.log', crashLog);
+    truncateLogFile(CRASH_LOG_PATH);
+    fs.appendFileSync(CRASH_LOG_PATH, crashLog);
+    truncateLogFile(CRASH_LOG_PATH);
   } catch {}
   if (error instanceof Error && error.stack) {
     write(error.stack);
   }
-  process.exit(1);
-}
+  void asyncCleanup();
+  try {
+    tui?.stop();
+  } catch {}
+  void shutdownAndExit(1);
+});
 
 async function main() {
   if (process.argv[2] === 'plugin') {
     return pluginMain(process.argv.slice(3));
   }
 
-  if (hasHeadlessFlag(process.argv) || process.argv.includes('--help') || process.argv.includes('-h')) {
-    return runMCCli();
+  // Storage maintenance without the TUI, so a database can still be pruned and
+  // compacted when the interactive session won't start. Checked before the
+  // headless branch below, which would otherwise claim `prune --help`.
+  if (process.argv[2] === 'prune') {
+    const { runPruneCommand } = await import('@mastra/code-sdk/utils/prune-cli');
+    return process.exit(await runPruneCommand(process.argv.slice(3)));
+  }
+
+  const loginIndex = process.argv.findIndex(
+    (arg, index) => index >= 2 && arg !== '--acp' && arg !== '--dangerous-auto-approve',
+  );
+  if (process.argv[loginIndex] === 'login') {
+    const { runLoginCommand } = await import('./login-command.js');
+    const code = await runLoginCommand({ args: process.argv.slice(loginIndex + 1) });
+    await new Promise(resolve => process.stdout.write('', resolve));
+    return process.exit(code);
+  }
+
+  const initialPrompt = takeInitialPrompt(process.argv, process.env);
+  if (initialPrompt.error) {
+    process.stderr.write(`${initialPrompt.error}\n`);
+    process.exit(1);
+  }
+  if (initialPrompt.flag) process.argv = initialPrompt.argv;
+  // The flag only means something to the interactive TUI. Paths that can't run
+  // it reject the flag instead of dropping the prompt; an env var prompt is
+  // just ignored there.
+  const rejectInitialPromptFlag = (reason: string) => {
+    if (!initialPrompt.flag) return;
+    process.stderr.write(`${initialPrompt.flag} starts the interactive TUI; ${reason}\n`);
+    process.exit(1);
+  };
+
+  let resumeThreadId: string | undefined;
+  try {
+    resumeThreadId = parseResumeThreadId(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const headless = hasHeadlessFlag(process.argv);
+  if (shouldRunHeadless(process.argv, resumeThreadId, headless)) {
+    if (headless) rejectInitialPromptFlag('use --prompt for headless runs');
+    return runMCCli(undefined, { coAuthor: TUI_CO_AUTHOR });
   }
 
   if (process.argv.includes('--acp')) {
+    rejectInitialPromptFlag('it cannot be combined with --acp');
     const { acpMain } = await import('@mastra/code-sdk/acp/index');
-    return acpMain({ dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve') });
+    return acpMain({
+      dangerousAutoApprove: process.argv.includes('--dangerous-auto-approve'),
+      coAuthor: TUI_CO_AUTHOR,
+    });
+  }
+
+  if (shouldRejectResumeWithoutTTY(resumeThreadId, Boolean(process.stdin.isTTY))) {
+    process.stderr.write('mastracode resume requires an interactive terminal.\n');
+    process.exitCode = 1;
+    return;
   }
 
   // When stdin is piped (e.g. `cat foo | mastracode`), drain the pipe fully
@@ -306,12 +474,19 @@ async function main() {
     // stdin is consumed/closed and the TUI needs a live TTY for keyboard input.
     const reopenedStdin = reopenStdinFromTTY();
     if (!reopenedStdin) {
+      rejectInitialPromptFlag('no TTY is available, so use --prompt for headless runs');
       process.stderr.write('No TTY available — falling back to headless mode.\n');
-      return runMCCli(pipedInput);
+      return runMCCli(pipedInput, { coAuthor: TUI_CO_AUTHOR });
     }
   }
 
-  return tuiMain(pipedInput);
+  const conflict = pipedInputConflict(initialPrompt, pipedInput);
+  if (conflict) {
+    process.stderr.write(`${conflict}\n`);
+    process.exit(1);
+  }
+
+  return tuiMain(initialMessageOptions(initialPrompt, pipedInput), resumeThreadId);
 }
 
 main().catch(error => {

@@ -8,14 +8,16 @@ import type {
   ProcessorState,
   ErrorProcessorOrWorkflow,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../../../processors';
-import { RequestContext } from '../../../request-context';
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '../../../request-context';
 import { getNeedsApprovalFn } from '../../../tools/toolchecks';
 import type { CoreTool, RequireToolApproval, ToolApprovalContext } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
-import { MessageList } from '../../message-list';
+import type { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
+import type { ToolsInput } from '../../types';
 import { globalRunRegistry } from '../run-registry';
 import type {
   RunRegistryEntry,
@@ -27,6 +29,7 @@ import type {
   DurableAgenticWorkflowInput,
   RegistryModelListEntry,
 } from '../types';
+import { createRunMessageList } from './run-message-list';
 
 /**
  * Runtime dependencies that need to be resolved at step execution time.
@@ -51,8 +54,8 @@ export interface ResolvedRuntimeDependencies {
   workspace?: Workspace;
   /** Resolved input processors (rebuilt from the agent when the registry is empty) */
   inputProcessors?: InputProcessorOrWorkflow[];
-  /** Uncombined input processors for processLLMRequest */
-  llmRequestInputProcessors?: InputProcessorOrWorkflow[];
+  /** Uncombined processors for processLLMRequest: input processors plus error-phase processors */
+  llmRequestInputProcessors?: LLMRequestProcessorOrWorkflow[];
   /** Resolved output processors */
   outputProcessors?: OutputProcessorOrWorkflow[];
   /** Resolved error processors */
@@ -83,19 +86,45 @@ export interface ResolveRuntimeOptions {
   agentId: string;
   /** Workflow input containing serialized state */
   input: DurableAgenticWorkflowInput;
+  /**
+   * The step's run-level RequestContext, used when the step input carries no
+   * `requestContextEntries` snapshot. See `restoreRequestContext`.
+   */
+  requestContext?: RequestContext;
   /** Logger for debugging */
   logger?: { debug?: (...args: any[]) => void; error?: (...args: any[]) => void };
 }
 
 /**
  * Restore a RequestContext from the JSON-safe `requestContextEntries`
- * snapshot serialized onto the workflow input (see preparation.ts). Returns
- * an empty context when no snapshot is present.
+ * snapshot serialized onto the workflow input (see preparation.ts).
+ *
+ * `entries` is absent on a step input even when the run itself has a context:
+ * the snapshot is propagated at the run level, not copied onto every step.
+ * `runLevel` is that run-level context, which the execution engine has already
+ * rebuilt in the step's scope — falling back to it is what keeps request-scoped
+ * resolution (tenant/user, workspace, dynamic model/memory) working for tools
+ * rebuilt on a cross-process worker, including a delegated subagent's.
  */
-function restoreRequestContext(entries?: Record<string, unknown>): RequestContext {
-  return entries
-    ? new RequestContext(Object.entries(entries) as Iterable<readonly [string, unknown]>)
-    : new RequestContext();
+export function restoreRequestContext(entries?: Record<string, unknown>, runLevel?: RequestContext): RequestContext {
+  if (entries) {
+    // Drop any persisted token from legacy snapshots written before the token
+    // was excluded from persistence — a stale bearer token must never be restored.
+    const restored: RequestContext = new RequestContext<unknown>(
+      Object.entries(entries).filter(([key]) => key !== MASTRA_AUTH_TOKEN_KEY),
+    );
+    // The framework-managed bearer token is deliberately never persisted into
+    // `requestContextEntries` (see preparation.ts), so carry the *live* token
+    // over from the run-level context when one exists. Without this, tools
+    // that forward auth (e.g. same-auth MCP servers) would lose the token on
+    // any path where the snapshot takes precedence during an authenticated run.
+    const liveToken = runLevel?.getRaw?.(MASTRA_AUTH_TOKEN_KEY);
+    if (liveToken !== undefined) {
+      restored.setRaw(MASTRA_AUTH_TOKEN_KEY, liveToken);
+    }
+    return restored;
+  }
+  return runLevel ?? new RequestContext();
 }
 
 /**
@@ -138,7 +167,8 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   const existingEntry = globalRunRegistry.get(runId);
   const messageList = existingEntry?.messageList
     ? existingEntry.messageList.deserialize(input.messageListState)
-    : new MessageList({
+    : createRunMessageList({
+        mastra,
         threadId: input.state.threadId,
         resourceId: input.state.resourceId,
       }).deserialize(input.messageListState);
@@ -165,13 +195,17 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   const registryModel = globalEntry?.model as (MastraLanguageModel & { __metadataOnly?: boolean }) | undefined;
   const hasHydratedEntry =
     !!globalEntry && globalEntry.isPlaceholder !== true && !!registryModel && registryModel.__metadataOnly !== true;
-  let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
+  // Prefer the full toolset over `tools`: after the first step `tools` holds the
+  // per-step snapshot the model was shown (possibly narrowed by processors such
+  // as ToolSearchProcessor), and seeding from it would drop every tool the
+  // processors withheld on the previous step (issue #22933).
+  let tools: Record<string, CoreTool> = globalEntry?.baseTools ?? globalEntry?.tools ?? {};
   let model: MastraLanguageModel = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
   let workspace: Workspace | undefined = globalEntry?.workspace;
   let memory: MastraMemory | undefined = globalEntry?.memory;
   let inputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.inputProcessors;
-  let llmRequestInputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.llmRequestInputProcessors;
+  let llmRequestInputProcessors: LLMRequestProcessorOrWorkflow[] | undefined = globalEntry?.llmRequestInputProcessors;
   let outputProcessors: OutputProcessorOrWorkflow[] | undefined = globalEntry?.outputProcessors;
   let errorProcessors: ErrorProcessorOrWorkflow[] | undefined = globalEntry?.errorProcessors;
   let processorStates: Map<string, ProcessorState> | undefined = globalEntry?.processorStates;
@@ -190,7 +224,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // the workflow input (mirrors durable-agent.ts resume handling), so
       // request-scoped tools / workspace / memory / processors resolve with
       // the same configuration as the original call site.
-      const resolveRequestContext = restoreRequestContext(input.requestContextEntries);
+      const resolveRequestContext = restoreRequestContext(input.requestContextEntries, options.requestContext);
 
       tools = await agent.getToolsForExecution({
         runId,
@@ -199,6 +233,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         requestContext: resolveRequestContext,
         memoryConfig: input.state.memoryConfig,
         autoResumeSuspendedTools: input.options?.autoResumeSuspendedTools,
+        clientTools: input.options?.clientTools as ToolsInput | undefined,
       });
 
       model =
@@ -226,9 +261,17 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // the cross-process system prompt. Mirrors preparation.ts.
       try {
         inputProcessors = await (agent as any).listInputProcessors?.(resolveRequestContext);
-        llmRequestInputProcessors = await (agent as any).__listLLMRequestProcessors?.(resolveRequestContext);
         outputProcessors = await (agent as any).listOutputProcessors?.(resolveRequestContext);
-        errorProcessors = await (agent as any).listErrorProcessors?.(resolveRequestContext);
+        // A call-time `errorProcessors: []` replaced the resolved list, defaults included. Honor
+        // it here too, and resolve the error list once so both lanes share its instances.
+        const errorProcessorOverride = input.options?.emptyErrorProcessorOverride ? [] : undefined;
+        errorProcessors = (
+          await (agent as any).__resolveRunErrorProcessors?.(resolveRequestContext, errorProcessorOverride)
+        )?.errorProcessors;
+        llmRequestInputProcessors = await (agent as any).__listLLMRequestProcessors?.(
+          resolveRequestContext,
+          errorProcessors,
+        );
         // A fresh processor-state map is correct here: on a cross-process worker
         // there is no prior state to carry, and processors are re-run per step.
         processorStates = globalEntry?.processorStates ?? new Map<string, ProcessorState>();
@@ -255,6 +298,10 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     logger?.debug?.(`[DurableAgent:${agentId}] No tools resolved for run ${runId}`);
   }
 
+  // Build this before the registry write-back. On a remote worker that
+  // write-back is what makes finish-time persistence available to later steps.
+  const saveQueueManager = makeSaveQueueManager(memory, mastra);
+
   // Write the rebuilt state back into the per-process registry so sibling
   // durable steps in THIS process (e.g. the tool-call step that runs after the
   // LLM step on the same worker) reuse it instead of rebuilding per call. Only
@@ -270,6 +317,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       modelList,
       workspace,
       memory,
+      saveQueueManager,
       inputProcessors,
       llmRequestInputProcessors,
       outputProcessors,
@@ -283,10 +331,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     }
   }
 
-  // 3. Get or create SaveQueueManager
-  const saveQueueManager = makeSaveQueueManager(memory, mastra);
-
-  // 4. Reconstruct _internal for compatibility with existing code
+  // 3. Reconstruct _internal for compatibility with existing code
   const _internal = resolveInternalState({
     state: input.state,
     memory,
@@ -319,6 +364,14 @@ export interface RebuiltRunTools {
   workspace?: Workspace;
   memory?: MastraMemory;
   saveQueueManager?: SaveQueueManager;
+  /**
+   * The restored RequestContext the rebuilt tools were BUILT with (their
+   * closures capture this instance, not the step's own). Exposed so the
+   * tool-call step can read back by-reference signals a tool wrapper writes
+   * to its build-time context — e.g. the delegation bail flag — which would
+   * otherwise be invisible cross-process.
+   */
+  requestContext: RequestContext;
 }
 
 /**
@@ -350,16 +403,30 @@ export async function rebuildRunToolsFromMastra(options: {
   options?: SerializableDurableOptions;
   /** JSON-safe request-context snapshot from the workflow input (see preparation.ts). */
   requestContextEntries?: Record<string, unknown>;
+  /**
+   * The step's run-level RequestContext, used when `requestContextEntries` is
+   * absent. See `restoreRequestContext`.
+   */
+  requestContext?: RequestContext;
   logger?: { debug?: (...args: any[]) => void };
 }): Promise<RebuiltRunTools | undefined> {
-  const { mastra, runId, agentId, state, options: execOptions, requestContextEntries, logger } = options;
+  const {
+    mastra,
+    runId,
+    agentId,
+    state,
+    options: execOptions,
+    requestContextEntries,
+    requestContext,
+    logger,
+  } = options;
   if (!mastra) return undefined;
 
   try {
     const agent = mastra.getAgentById(agentId);
     // Restore the caller's request context so request-scoped tools, workspace
     // and memory resolve with the same configuration as the original call.
-    const resolveRequestContext = restoreRequestContext(requestContextEntries);
+    const resolveRequestContext = restoreRequestContext(requestContextEntries, requestContext);
 
     const tools = await agent.getToolsForExecution({
       runId,
@@ -368,6 +435,7 @@ export async function rebuildRunToolsFromMastra(options: {
       requestContext: resolveRequestContext,
       memoryConfig: state.memoryConfig,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      clientTools: execOptions?.clientTools as ToolsInput | undefined,
     });
 
     const memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
@@ -387,7 +455,7 @@ export async function rebuildRunToolsFromMastra(options: {
       globalRunRegistry.set(runId, patch as RunRegistryEntry);
     }
 
-    return { tools, workspace, memory, saveQueueManager };
+    return { tools, workspace, memory, saveQueueManager, requestContext: resolveRequestContext };
   } catch (error) {
     logger?.debug?.(`[DurableAgent:${agentId}] Failed to rebuild tools from Mastra for run ${runId}: ${error}`);
     return undefined;
@@ -477,7 +545,8 @@ export function resolveTool(toolName: string, mastra?: Mastra): CoreTool | undef
  *    `(toolName, args, ...)`. Throwing defaults to "require approval" (safe).
  *  - Boolean global / tool-level `requireApproval` seed the decision.
  *  - A per-tool `needsApprovalFn` (e.g. skill tools) is authoritative when
- *    present and overrides the seed.
+ *    present and overrides the seed. It receives `{ requestContext, workspace }`
+ *    as its second argument, exactly like the non-durable loop.
  *
  * In durable execution the function form lives on the run registry, not on
  * the serialized workflow input — pass the resolved value from the caller.
@@ -511,7 +580,10 @@ export async function toolRequiresApproval(
   const needsApprovalFn = getNeedsApprovalFn(tool);
   if (needsApprovalFn) {
     try {
-      requires = !!(await needsApprovalFn(args ?? {}));
+      requires = !!(await needsApprovalFn(args ?? {}, {
+        requestContext: approvalContext?.requestContext,
+        workspace: approvalContext?.workspace,
+      }));
     } catch {
       // On error, default to requiring approval (safe default)
       requires = true;

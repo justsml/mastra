@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   AgentsStorage,
@@ -192,6 +190,7 @@ export class AgentsMSSQL extends AgentsStorage {
       workspace: this.parseJson(row.workspace, 'workspace') as AgentVersion['workspace'],
       skills: this.parseJson(row.skills, 'skills') as AgentVersion['skills'],
       skillsFormat: (row.skillsFormat as 'xml' | 'json' | 'markdown' | null | undefined) ?? undefined,
+      durable: this.parseJson(row.durable, 'durable') as AgentVersion['durable'],
       changedFields: this.parseJson(row.changedFields, 'changedFields') as AgentVersion['changedFields'],
       changeMessage: (row.changeMessage as string | null | undefined) ?? undefined,
       createdAt: row.createdAt instanceof Date ? row.createdAt : new Date(row.createdAt as string),
@@ -233,7 +232,7 @@ export class AgentsMSSQL extends AgentsStorage {
         },
       });
       const { id: _id, authorId: _authorId, metadata: _metadata, ...snapshotConfig } = agent;
-      const versionId = randomUUID();
+      const versionId = globalThis.crypto.randomUUID();
       await this.createVersion({
         id: versionId,
         agentId: agent.id,
@@ -462,6 +461,7 @@ export class AgentsMSSQL extends AgentsStorage {
           workspace: input.workspace ?? null,
           skills: input.skills ?? null,
           skillsFormat: input.skillsFormat ?? null,
+          durable: input.durable ?? null,
           changedFields: input.changedFields ?? null,
           changeMessage: input.changeMessage ?? null,
           createdAt: now,

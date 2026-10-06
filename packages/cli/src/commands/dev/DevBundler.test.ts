@@ -19,11 +19,13 @@ vi.mock('commander', () => {
     addHelpText: any;
     action: any;
     argument: any;
+    addArgument: any;
     command: any;
+    alias: any;
     description: any;
     option: any;
     requiredOption: any;
-    parse: any;
+    parseAsync: any;
     help: any;
 
     constructor() {
@@ -32,20 +34,29 @@ vi.mock('commander', () => {
       this.addHelpText = vi.fn().mockReturnThis();
       this.action = vi.fn().mockReturnThis();
       this.argument = vi.fn().mockReturnThis();
+      this.addArgument = vi.fn().mockReturnThis();
       this.command = vi.fn().mockReturnThis();
+      this.alias = vi.fn().mockReturnThis();
       this.description = vi.fn().mockReturnThis();
       this.option = vi.fn().mockReturnThis();
       this.requiredOption = vi.fn().mockReturnThis();
-      this.parse = vi.fn();
+      this.parseAsync = vi.fn().mockResolvedValue(undefined);
       this.help = vi.fn();
     }
   }
 
+  class ArgumentMock {
+    choices = vi.fn().mockReturnThis();
+    default = vi.fn().mockReturnThis();
+  }
+
   return {
     Command: CommandMock,
+    Argument: ArgumentMock,
   };
 });
-// Don't reference top-level variables in mock definitions
+const getExistingFiles = vi.hoisted(() => vi.fn((files: string[]) => files));
+
 vi.mock('@mastra/deployer/build', () => {
   return {
     createWatcher: vi.fn().mockResolvedValue({
@@ -60,13 +71,24 @@ vi.mock('@mastra/deployer/build', () => {
     getWatcherInputOptions: vi.fn().mockResolvedValue({ plugins: [] }),
     prepareFsAgentsEntry: vi.fn(),
     writeFsAgentsEntry: vi.fn(),
+    FileService: class {
+      getExistingFiles = getExistingFiles;
+    },
   };
 });
+
+vi.mock('@mastra/deployer', () => ({
+  FileService: class {
+    getExistingFiles = getExistingFiles;
+  },
+}));
 
 vi.mock('fs-extra', () => {
   return {
     pathExists: vi.fn().mockResolvedValue(false),
     copy: vi.fn().mockResolvedValue(undefined),
+    emptyDir: vi.fn().mockResolvedValue(undefined),
+    ensureDir: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -78,6 +100,7 @@ describe('DevBundler', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    getExistingFiles.mockImplementation((files: string[]) => files);
     // Mock process.exit to prevent it from actually exiting during tests
     process.exit = vi.fn() as any;
   });
@@ -85,6 +108,98 @@ describe('DevBundler', () => {
   afterEach(() => {
     process.env.NODE_ENV = originalEnv;
     process.exit = originalExit;
+  });
+
+  describe('prepare', () => {
+    it('preserves dev.lock across emptyDir', async () => {
+      const { writeFile, readFile, mkdir, rm } = await import('node:fs/promises');
+      const { join } = await import('node:path');
+
+      const tmpDir = '.test-tmp-prepare-dev';
+      const lockPath = join(tmpDir, 'dev.lock');
+      const lockData = JSON.stringify({ pid: 12345, host: 'localhost', port: 4111 });
+
+      try {
+        await mkdir(tmpDir, { recursive: true });
+        await writeFile(lockPath, lockData, 'utf-8');
+
+        const devBundler = new DevBundler();
+        await devBundler.prepare(tmpDir);
+
+        // The lock file still exists with the same contents after prepare()
+        const restored = await readFile(lockPath, 'utf-8');
+        expect(restored).toBe(lockData);
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('works when no dev.lock exists', async () => {
+      const { rm } = await import('node:fs/promises');
+      const devBundler = new DevBundler();
+      const tmpDir = '.test-tmp-prepare-nolock-dev';
+
+      try {
+        await devBundler.prepare(tmpDir);
+        // Should not throw even without a lock file
+        expect(true).toBe(true);
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('copies Studio assets in non-Factory mode', async () => {
+      const fsExtra = await import('fs-extra');
+      const devBundler = new DevBundler();
+      const tmpDir = '.test-tmp-prepare-studio-copy';
+
+      try {
+        await devBundler.prepare(tmpDir);
+        expect(fsExtra.copy).toHaveBeenCalledWith(
+          expect.stringContaining('studio'),
+          expect.stringContaining('studio'),
+          expect.any(Object),
+        );
+      } finally {
+        const { rm } = await import('node:fs/promises');
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('skips Studio assets in Factory mode', async () => {
+      const fsExtra = await import('fs-extra');
+      const devBundler = new DevBundler(undefined, true);
+      const tmpDir = '.test-tmp-prepare-studio-skip';
+
+      try {
+        await devBundler.prepare(tmpDir);
+        expect(fsExtra.copy).not.toHaveBeenCalled();
+      } finally {
+        const { rm } = await import('node:fs/promises');
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('getEnvFiles', () => {
+    it('layers default dotenv files from base to development override', async () => {
+      const bundler = new DevBundler();
+
+      await expect(bundler.getEnvFiles()).resolves.toEqual(['.env', '.env.local', '.env.development']);
+    });
+
+    it('uses only an explicit env file', async () => {
+      const bundler = new DevBundler('.env.custom');
+
+      await expect(bundler.getEnvFiles()).resolves.toEqual(['.env.custom']);
+    });
+
+    it('falls back to layered defaults when an explicit env file does not exist', async () => {
+      getExistingFiles.mockImplementation((files: string[]) => (files[0] === '.env.custom' ? [] : files));
+      const bundler = new DevBundler('.env.custom');
+
+      await expect(bundler.getEnvFiles()).resolves.toEqual(['.env', '.env.local', '.env.development']);
+    });
   });
 
   describe('watch', () => {
@@ -200,6 +315,56 @@ describe('DevBundler', () => {
       } finally {
         await remove(tmpDir);
       }
+    });
+
+    it('selects dev.entry.js template in non-Factory mode', async () => {
+      const devBundler = new DevBundler();
+      const { createWatcher } = await import('@mastra/deployer/build');
+      const tmpDir = '.test-tmp';
+
+      try {
+        await devBundler.watch('test-entry.js', tmpDir, []);
+        const input = vi.mocked(createWatcher).mock.calls[0]![0] as any;
+        expect(input.input.index).toContain('dev.entry.js');
+        expect(input.input.index).not.toContain('factory-dev');
+      } finally {
+        await remove(tmpDir);
+      }
+    });
+
+    it('selects factory-dev.entry.js template in Factory mode', async () => {
+      const devBundler = new DevBundler(undefined, true);
+      const { createWatcher } = await import('@mastra/deployer/build');
+      const tmpDir = '.test-tmp';
+
+      try {
+        await devBundler.watch('test-entry.js', tmpDir, []);
+        const input = vi.mocked(createWatcher).mock.calls[0]![0] as any;
+        expect(input.input.index).toContain('factory-dev.entry.js');
+      } finally {
+        await remove(tmpDir);
+      }
+    });
+  });
+
+  describe('entry templates', () => {
+    async function readTemplate(name: string): Promise<string> {
+      const { readFile } = await import('node:fs/promises');
+      const { join, dirname } = await import('node:path');
+      const { fileURLToPath } = await import('node:url');
+      const testDir = dirname(fileURLToPath(import.meta.url));
+      return readFile(join(testDir, '..', '..', 'public', 'templates', name), 'utf-8');
+    }
+
+    it('factory-dev.entry.js passes studio: false to createNodeServer', async () => {
+      const content = await readTemplate('factory-dev.entry.js');
+      expect(content).toContain('studio: false');
+      expect(content).not.toMatch(/studio:\s*true/);
+    });
+
+    it('dev.entry.js passes studio: true to createNodeServer', async () => {
+      const content = await readTemplate('dev.entry.js');
+      expect(content).toContain('studio: true');
     });
   });
 });

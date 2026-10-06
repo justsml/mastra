@@ -4,10 +4,13 @@ import type { Inngest } from 'inngest';
 // Extract Inngest's native flow control configuration types from createFunction first argument
 export type InngestCreateFunctionConfig = Parameters<Inngest['createFunction']>[0];
 
-// Extract specific flow control properties (excluding batching)
+// Extract specific flow control properties (excluding batching).
+// `retries` is function-level: Inngest re-invokes the function when an SDK request fails
+// (process restart, OOM, 5xx/timeout). Step-code errors are retried by executeStepWithRetry
+// and thrown from step.run() as NonRetriableError, so Inngest does not retry them again.
 export type InngestFlowControlConfig = Pick<
   InngestCreateFunctionConfig,
-  'concurrency' | 'rateLimit' | 'throttle' | 'debounce' | 'priority'
+  'concurrency' | 'rateLimit' | 'throttle' | 'debounce' | 'priority' | 'retries'
 >;
 
 // Cron config for scheduled workflows
@@ -23,8 +26,9 @@ export type InngestWorkflowConfig<
   TState,
   TInput,
   TOutput,
-  TSteps extends Step<string, any, any, any, any, any, InngestEngineType>[],
-> = WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps> &
+  TSteps extends Step<string, any, any, any, any, any, InngestEngineType, any>[],
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> = WorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext> &
   InngestFlowControlConfig &
   InngestFlowCronConfig<TInput, TState>;
 

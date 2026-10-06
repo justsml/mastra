@@ -6,6 +6,7 @@ import type { WorkspacePackageInfo } from '../../bundler/workspaceDependencies';
 import type { DependencyMetadata } from '../types';
 import type * as UtilsModule from '../utils';
 import { createVirtualDependencies, bundleExternals } from './bundleExternals';
+import { normalizeExternals } from './externals';
 
 // Mock the utilities that bundleExternals depends on
 vi.mock('../utils', async importOriginal => {
@@ -431,6 +432,7 @@ describe('bundleExternals', () => {
 
     const result = await bundleExternals(depsToOptimize, testDir, {
       projectRoot: testDir,
+      bundlerOptions: normalizeExternals(undefined),
     });
 
     // Verify return structure
@@ -452,6 +454,44 @@ describe('bundleExternals', () => {
     // Verify usedExternals is a plain object
     expect(typeof result.usedExternals).toBe('object');
     expect(result.usedExternals).not.toBeInstanceOf(Map);
+  });
+
+  it('should apply module aliases before externalizing dependencies', async () => {
+    const packageDir = join(testDir, 'node_modules', 'fixture-package');
+    const shimFile = join(testDir, 'ajv-shim.js');
+    await ensureDir(packageDir);
+    await Promise.all([
+      writeFile(
+        join(packageDir, 'package.json'),
+        JSON.stringify({ name: 'fixture-package', version: '1.0.0', type: 'module', main: 'index.js' }),
+      ),
+      writeFile(join(packageDir, 'index.js'), `import Ajv from 'ajv'; export const marker = new Ajv();`),
+      writeFile(shimFile, `export default class Ajv { constructor() { this.marker = 'MASTRA_AJV_SHIM'; } }`),
+    ]);
+
+    const packageEntry = join(packageDir, 'index.js');
+    const depsToOptimize = new Map<string, DependencyMetadata>([
+      [
+        packageEntry,
+        {
+          exports: ['marker'],
+          rootPath: packageDir,
+          isWorkspace: false,
+        },
+      ],
+    ]);
+
+    const result = await bundleExternals(depsToOptimize, testDir, {
+      projectRoot: testDir,
+      bundlerOptions: {
+        ...normalizeExternals(['ajv']),
+        alias: { ajv: shimFile },
+      },
+    });
+    const code = result.output.map(output => ('code' in output ? output.code : '')).join('\n');
+
+    expect(code).toContain('MASTRA_AJV_SHIM');
+    expect(code).not.toContain("from 'ajv'");
   });
 
   it('should handle different bundler options configurations', async () => {
@@ -479,7 +519,7 @@ describe('bundleExternals', () => {
     const result = await bundleExternals(depsToOptimize, testDir, {
       projectRoot: testDir,
       bundlerOptions: {
-        externals: ['custom-external'],
+        ...normalizeExternals(['custom-external']),
         transpilePackages: ['some-package'],
         isDev: true,
       },
@@ -490,7 +530,9 @@ describe('bundleExternals', () => {
     expect(Array.from(result.fileNameToDependencyMap.values())[0]).toBe('react');
 
     // Test with minimal options
-    const result2 = await bundleExternals(depsToOptimize, testDir, {});
+    const result2 = await bundleExternals(depsToOptimize, testDir, {
+      bundlerOptions: normalizeExternals(undefined),
+    });
 
     expect(result2.output).toBeDefined();
     expect(result2.fileNameToDependencyMap).toBeInstanceOf(Map);
@@ -512,8 +554,8 @@ describe('bundleExternals', () => {
     const result = await bundleExternals(depsToOptimize, testDir, {
       projectRoot: testDir,
       bundlerOptions: {
+        ...normalizeExternals(['some-external']),
         isDev: false,
-        externals: ['some-external'],
         transpilePackages: ['some-package'],
       },
     });
@@ -559,6 +601,7 @@ describe('bundleExternals', () => {
       projectRoot: join(testDir, 'app'),
       workspaceMap,
       bundlerOptions: {
+        ...normalizeExternals(undefined),
         isDev: false,
       },
     });
@@ -621,6 +664,7 @@ describe('bundleExternals', () => {
       projectRoot: join(testDir, 'app'),
       workspaceMap,
       bundlerOptions: {
+        ...normalizeExternals(undefined),
         isDev: true,
       },
     });
@@ -657,6 +701,7 @@ describe('bundleExternals', () => {
 
     const result = await bundleExternals(depsToOptimize, testDir, {
       projectRoot: testDir,
+      bundlerOptions: normalizeExternals(undefined),
     });
 
     // Validate all output chunks have .mjs extension
@@ -687,6 +732,7 @@ describe('bundleExternals', () => {
 
     const nullPathResult = await bundleExternals(depsWithNullPath, testDir, {
       projectRoot: testDir,
+      bundlerOptions: normalizeExternals(undefined),
     });
 
     expect(nullPathResult.output).toBeDefined();
@@ -708,6 +754,7 @@ describe('bundleExternals', () => {
     const mixedResult = await bundleExternals(mixedDeps, testDir, {
       workspaceRoot: testDir,
       projectRoot: join(testDir, 'app'),
+      bundlerOptions: normalizeExternals(undefined),
       workspaceMap: new Map([
         [
           '@workspace/internal',
@@ -729,7 +776,7 @@ describe('bundleExternals', () => {
       testDir,
       {
         bundlerOptions: {
-          externals: ['test'],
+          ...normalizeExternals(['test']),
           transpilePackages: ['pkg'],
           isDev: false,
         },
@@ -763,7 +810,7 @@ describe('bundleExternals', () => {
       const result = await bundleExternals(depsToOptimize, testDir, {
         projectRoot: testDir,
         bundlerOptions: {
-          externals: true,
+          ...normalizeExternals(true),
         },
       });
 
@@ -827,7 +874,7 @@ describe('bundleExternals', () => {
         projectRoot: join(testDir, 'app'),
         workspaceMap,
         bundlerOptions: {
-          externals: true,
+          ...normalizeExternals(true),
           isDev: true,
         },
       });
@@ -882,7 +929,7 @@ describe('bundleExternals', () => {
         projectRoot: join(testDir, 'app'),
         workspaceMap,
         bundlerOptions: {
-          externals: true,
+          ...normalizeExternals(true),
           isDev: false,
         },
       });
@@ -923,7 +970,7 @@ describe('bundleExternals', () => {
       const result = await bundleExternals(depsToOptimize, testDir, {
         projectRoot: testDir,
         bundlerOptions: {
-          externals: true,
+          ...normalizeExternals(true),
         },
       });
 
@@ -969,7 +1016,7 @@ describe('bundleExternals', () => {
       const result = await bundleExternals(depsToOptimize, testDir, {
         projectRoot: testDir,
         bundlerOptions: {
-          externals: true,
+          ...normalizeExternals(true),
         },
       });
 
@@ -1011,9 +1058,7 @@ describe('bundleExternals', () => {
 
       const result = await bundleExternals(depsToOptimize, testDir, {
         projectRoot: testDir,
-        bundlerOptions: {
-          externals: ['custom-external'],
-        },
+        bundlerOptions: normalizeExternals(['custom-external']),
       });
 
       // When externals is an array, deps should still be bundled

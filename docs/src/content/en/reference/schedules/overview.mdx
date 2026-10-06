@@ -1,6 +1,6 @@
 ---
 title: "Reference: mastra.schedules | Schedules"
-description: "API reference for mastra.schedules, the service for creating and managing agent and workflow cron schedules."
+description: "mastra.schedules is the CRUD service for persisted cron schedules. Use it to create, list, update, pause, resume, manually run, and delete schedules for agents or workflows."
 packages:
   - "@mastra/core"
 ---
@@ -11,7 +11,7 @@ packages:
 
 `mastra.schedules` is the CRUD service for persisted cron schedules. Use it to create, list, update, pause, resume, manually run, and delete schedules for agents or workflows.
 
-For usage patterns and concepts, see [Schedules](/docs/long-running-agents/schedules).
+For usage patterns and concepts, see [Schedules](/docs/harness/schedules).
 
 ## Usage example
 
@@ -281,8 +281,8 @@ const schedules = await mastra.schedules.list({
           },
           {
             name: 'status',
-            type: "'active' | 'paused'",
-            description: 'Return only schedules with this status.',
+            type: "'active' | 'paused' | 'completed'",
+            description: 'Return only schedules with this status. The default listing omits completed schedules.',
             isOptional: true,
           },
         ],
@@ -296,7 +296,7 @@ const schedules = await mastra.schedules.list({
 
 #### `update(id, patch)`
 
-Updates a schedule. Changing `cron` or `timezone` recomputes the next fire time. Updating `status` from `paused` to `active` also recomputes the next fire time.
+Updates a schedule. Changing `cron` or `timezone` recomputes the next fire time. Updating `status` from `paused` to `active` also recomputes the next fire time. A schedule becomes `completed` once its cron has no future occurrence. A cadence edit that leaves no future occurrence completes the row even when it was `paused`. Editing the cadence of a completed schedule reactivates it when the new cadence can still fire, and leaves it completed when it can't.
 
 ```typescript
 const updated = await mastra.schedules.update('pinger', {
@@ -305,7 +305,7 @@ const updated = await mastra.schedules.update('pinger', {
 })
 ```
 
-Agent schedule patches can update `cron`, `timezone`, `prompt`, `name`, `signalType`, `tagName`, `attributes`, `providerOptions`, `ifActive`, `ifIdle`, `metadata`, and `status`. `threadId` and `resourceId` aren't patchable; create a new schedule when the thread target needs to change.
+Agent schedule patches can update `cron`, `timezone`, `prompt`, `name`, `signalType`, `tagName`, `attributes`, `providerOptions`, `ifActive`, `ifIdle`, `metadata`, and `status`. `threadId` and `resourceId` aren't patchable. Create a new schedule when the thread target needs to change.
 
 Workflow schedule patches can update `cron`, `timezone`, `inputData`, `initialState`, `requestContext`, `metadata`, and `status`. Agent-only patch fields such as `prompt`, `signalType`, and `ifIdle` throw on workflow schedules.
 
@@ -321,7 +321,7 @@ const paused = await mastra.schedules.pause('pinger')
 
 #### `resume(id)`
 
-Resumes a paused schedule and recomputes the next fire time from the current time.
+Resumes a paused schedule and recomputes the next fire time from the current time. A paused schedule whose cron has no future occurrence is completed instead of resumed.
 
 ```typescript
 const active = await mastra.schedules.resume('pinger')

@@ -1,0 +1,70 @@
+import { Button } from '@mastra/playground-ui/components/Button';
+import { Target } from 'lucide-react';
+
+import { useChatSessionContext } from '../context/useChatSessionContext';
+import { useChatRuntime } from '../context/useChatRuntime';
+import {
+  useClearAgentControllerGoalMutation,
+  usePauseAgentControllerGoalMutation,
+  useResumeAgentControllerGoalMutation,
+} from '../../../../hooks/useAgentControllerGoalMutations';
+import { AGENT_CONTROLLER_ID } from '../services/constants';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+
+const goalBar = 'flex shrink-0 items-center gap-2.5 border-b border-border bg-badge-pink-subtle px-4 py-2';
+
+export function GoalPanel() {
+  const { resourceId, sessionEnabled, projectPath, baseUrl } = useChatSessionContext();
+  const { goal } = useChatRuntime();
+  const hookArgs = {
+    agentControllerId: AGENT_CONTROLLER_ID,
+    resourceId,
+    scope: projectPath,
+    baseUrl,
+    enabled: sessionEnabled,
+  };
+  const pauseGoalMutation = usePauseAgentControllerGoalMutation(hookArgs);
+  const resumeGoalMutation = useResumeAgentControllerGoalMutation(hookArgs);
+  const clearGoalMutation = useClearAgentControllerGoalMutation(hookArgs);
+
+  if (!sessionEnabled || !goal) return null;
+
+  const progress = `${goal.iteration}/${goal.maxRuns}`;
+
+  return (
+    <div className={goalBar}>
+      <span className="text-badge-pink-indicator inline-flex">
+        <Target size={15} />
+      </span>
+      <Txt as="span" variant="column" className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+        {goal.objective}
+      </Txt>
+      <Txt as="span" variant="caption" tone="muted" className="bg-fill rounded-full px-2 py-px tabular-nums">
+        {progress}
+      </Txt>
+      {goal.reason && (
+        <Txt
+          as="span"
+          variant="caption"
+          tone="muted"
+          className="max-w-52 overflow-hidden text-ellipsis whitespace-nowrap"
+        >
+          {goal.reason}
+        </Txt>
+      )}
+      {goal.status === 'active' && (
+        <Button size="sm" onClick={() => void pauseGoalMutation.mutateAsync()}>
+          Pause
+        </Button>
+      )}
+      {goal.status === 'paused' && (
+        <Button variant="primary" size="sm" onClick={() => void resumeGoalMutation.mutateAsync()}>
+          Resume
+        </Button>
+      )}
+      <Button size="sm" onClick={() => void clearGoalMutation.mutateAsync()}>
+        Clear
+      </Button>
+    </div>
+  );
+}

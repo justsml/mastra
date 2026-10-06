@@ -18,7 +18,14 @@ import { handleError } from './error';
 // Route Definitions
 // ============================================================================
 
-type ProcessorPhase = 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep';
+type ProcessorPhase =
+  | 'input'
+  | 'inputStep'
+  | 'outputStream'
+  | 'outputResult'
+  | 'outputStep'
+  | 'toolResult'
+  | 'llmRequest';
 
 /**
  * Helper to extract text from messages for outputStep testing.
@@ -49,7 +56,7 @@ function detectProcessorPhases(processor: any): ProcessorPhase[] {
   if (isProcessorWorkflow(processor)) {
     // Workflow processors can potentially handle all phases
     // The createStep in workflows handles each phase and it's a no-op if not implemented
-    return ['input', 'inputStep', 'outputStream', 'outputResult', 'outputStep'];
+    return ['input', 'inputStep', 'outputStream', 'outputResult', 'outputStep', 'toolResult'];
   }
 
   // For individual processors, detect by checking which methods exist
@@ -68,6 +75,12 @@ function detectProcessorPhases(processor: any): ProcessorPhase[] {
   }
   if (typeof processor.processOutputStep === 'function') {
     phases.push('outputStep');
+  }
+  if (typeof processor.processToolResult === 'function') {
+    phases.push('toolResult');
+  }
+  if (typeof processor.processLLMRequest === 'function') {
+    phases.push('llmRequest');
   }
   return phases;
 }
@@ -210,6 +223,13 @@ export const EXECUTE_PROCESSOR_ROUTE = createRoute({
         throw new HTTPException(400, { message: 'Phase is required' });
       }
 
+      if (phase === 'llmRequest') {
+        // processLLMRequest operates on the provider prompt, not on messages
+        throw new HTTPException(400, {
+          message: 'llmRequest phase cannot be executed directly. It runs on the provider prompt during an agent call.',
+        });
+      }
+
       if (!messages || !Array.isArray(messages)) {
         throw new HTTPException(400, { message: 'Messages array is required' });
       }
@@ -237,7 +257,7 @@ export const EXECUTE_PROCESSOR_ROUTE = createRoute({
         try {
           // Build inputData based on phase - each phase has different required fields
           const baseInputData = {
-            phase: phase as 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep',
+            phase: phase as 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult',
             messages: messageList.get.all.db(),
             messageList,
             retryCount: 0,
@@ -296,6 +316,19 @@ export const EXECUTE_PROCESSOR_ROUTE = createRoute({
                 part: null,
                 streamParts: [],
                 state: {},
+              };
+              break;
+            case 'toolResult':
+              inputData = {
+                ...inputData,
+                stepNumber: 0,
+                toolName: '',
+                toolCallId: '',
+                args: undefined,
+                toolResultValue: undefined,
+                providerExecuted: false,
+                systemMessages: [],
+                steps: [],
               };
               break;
           }

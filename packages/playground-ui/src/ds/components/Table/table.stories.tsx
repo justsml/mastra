@@ -41,14 +41,14 @@ export const Default: Story = {
           <Row>
             <TxtCell>Item Two</TxtCell>
             <Cell>
-              <Badge variant="default">Pending</Badge>
+              <Badge>Pending</Badge>
             </Cell>
             <TxtCell>Jan 13, 2026</TxtCell>
           </Row>
           <Row>
             <TxtCell>Item Three</TxtCell>
             <Cell>
-              <Badge variant="error">Error</Badge>
+              <Badge variant="destructive">Error</Badge>
             </Cell>
             <TxtCell>Jan 12, 2026</TxtCell>
           </Row>
@@ -130,7 +130,7 @@ export const WithEntryCell: Story = {
           <Row>
             <EntryCell name="Data Analysis Agent" description="Processes analytics data" icon={<Bot />} />
             <Cell>
-              <Badge variant="default">Idle</Badge>
+              <Badge>Idle</Badge>
             </Cell>
           </Row>
         </Tbody>

@@ -3,11 +3,34 @@ import type { SlackAppManifest, SlackAppCredentials } from './types';
 const SLACK_API_BASE = 'https://slack.com/api';
 const SLACK_API_TIMEOUT_MS = 30_000;
 
-export interface SlackManifestClientConfig {
-  token: string;
-  refreshToken: string;
+/**
+ * Self-managed credentials: the client rotates its own App Configuration
+ * token pair via `tooling.tokens.rotate`. Mutually exclusive with
+ * {@link SlackManifestClientDelegatedConfig}.
+ */
+export interface SlackManifestClientSelfManagedConfig {
+  token?: string;
+  refreshToken?: string;
   onTokenRotation?: (tokens: { token: string; refreshToken: string }) => Promise<void>;
+  tokenResolver?: never;
 }
+
+/**
+ * Delegated credentials: an external credential manager (e.g. the Mastra
+ * platform) owns the refresh cycle. The client never calls
+ * `tooling.tokens.rotate` itself — the resolver returns a currently-valid
+ * access token before each manifest call. Direct credentials (`token`,
+ * `refreshToken`) and `onTokenRotation` cannot be combined with a resolver.
+ */
+export interface SlackManifestClientDelegatedConfig {
+  /** Resolve a fresh App Configuration access token on demand. */
+  tokenResolver: () => Promise<string>;
+  token?: never;
+  refreshToken?: never;
+  onTokenRotation?: never;
+}
+
+export type SlackManifestClientConfig = SlackManifestClientSelfManagedConfig | SlackManifestClientDelegatedConfig;
 
 /**
  * Client for Slack's App Manifest API.
@@ -17,12 +40,14 @@ export class SlackManifestClient {
   #token: string;
   #refreshToken: string;
   #onTokenRotation?: (tokens: { token: string; refreshToken: string }) => Promise<void>;
+  #tokenResolver?: () => Promise<string>;
   #rotationPromise: Promise<void> | null = null;
 
   constructor(config: SlackManifestClientConfig) {
-    this.#token = config.token;
-    this.#refreshToken = config.refreshToken;
+    this.#token = config.token ?? '';
+    this.#refreshToken = config.refreshToken ?? '';
     this.#onTokenRotation = config.onTokenRotation;
+    this.#tokenResolver = config.tokenResolver;
   }
 
   /**
@@ -50,6 +75,9 @@ export class SlackManifestClient {
    *
    * Concurrent callers share the same in-flight rotation to avoid burning
    * single-use refresh tokens.
+   *
+   * When a `tokenResolver` is configured, no rotation happens here — the
+   * resolver is asked for a fresh access token instead.
    */
   async rotateToken(): Promise<void> {
     if (this.#rotationPromise) return this.#rotationPromise;
@@ -62,6 +90,20 @@ export class SlackManifestClient {
   }
 
   async #doRotateToken(): Promise<void> {
+    // Delegated mode: an external credential manager owns the refresh cycle.
+    // Ask it for a fresh access token instead of rotating ourselves.
+    if (this.#tokenResolver) {
+      this.#token = await this.#tokenResolver();
+      return;
+    }
+
+    if (!this.#refreshToken) {
+      throw new Error(
+        'SlackManifestClient has no refresh token or token resolver. ' +
+          'Provide a refreshToken or a tokenResolver at construction.',
+      );
+    }
+
     const response = await fetch(`${SLACK_API_BASE}/tooling.tokens.rotate`, {
       method: 'POST',
       headers: {
@@ -185,6 +227,47 @@ export class SlackManifestClient {
     if (!data.ok) {
       throw new Error(`App deletion failed: ${data.error}`);
     }
+  }
+
+  /**
+   * Check whether a Slack app still exists.
+   *
+   * Uses the read-only `apps.manifest.export` endpoint as an existence probe.
+   * Returns `false` when Slack reports the app is missing/inaccessible
+   * (e.g. it was deleted from the Slack admin UI), `true` when it exports
+   * successfully. Network/transport errors are re-thrown so callers can
+   * distinguish "app is gone" from "couldn't reach Slack".
+   */
+  async appExists(appId: string): Promise<boolean> {
+    await this.rotateToken();
+
+    const response = await fetch(`${SLACK_API_BASE}/apps.manifest.export`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.#token}`,
+      },
+      body: JSON.stringify({ app_id: appId }),
+      signal: AbortSignal.timeout(SLACK_API_TIMEOUT_MS),
+    });
+
+    const data = (await response.json()) as {
+      ok: boolean;
+      error?: string;
+    };
+
+    if (data.ok) return true;
+
+    // Only a definitive "app is gone" answer counts as non-existence. Slack
+    // returns `app_not_found` when the app was deleted and `invalid_app_id`
+    // when the id is malformed. Any other error (rate limiting, auth, outage)
+    // is transient — re-throw so callers don't tear down a valid installation
+    // on a temporary failure.
+    if (data.error === 'app_not_found' || data.error === 'invalid_app_id') {
+      return false;
+    }
+
+    throw new Error(`Failed to check whether Slack app exists: ${data.error ?? 'unknown_error'}`);
   }
 
   /**

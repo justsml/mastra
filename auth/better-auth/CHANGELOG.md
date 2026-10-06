@@ -1,5 +1,148 @@
 # @mastra/auth-better-auth
 
+## 1.1.6
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.6-alpha.0
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.1.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.4
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const mastraAuth = new MastraAuthBetterAuth({ auth });
+  const user = await mastraAuth.authenticateToken(token, request);
+  // Populated even when the sign-in flow never called `setActive`.
+  console.log(user?.session.activeOrganizationId);
+  ```
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.4-alpha.1
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+## 1.1.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.3
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
+## 1.1.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
+## 1.1.2
+
+### Patch Changes
+
+- Added a deferred instance mode and organization management to MastraAuthBetterAuth so it can be passed directly to a server host without a wrapper adapter. The provider can now be constructed with just a secret and will build its Better Auth instance (including running migrations) against the host database during init. It also bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and exposes the Better Auth HTTP handler (handleAuthRequest) so hosts can mount it under /auth/api/*. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
+  **Before**
+
+  ```ts
+  import { betterAuth } from 'better-auth';
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ auth: betterAuth({/* ... */}) });
+  ```
+
+  **After** (bring-your-own instance still works)
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ secret: process.env.BETTER_AUTH_SECRET! });
+  // host calls auth.init({ database, publicUrl, allowedOrigins }) during startup
+  ```
+
+- Updated the minimum better-auth version to 1.6.13 to pull in the fix for a stored cross-site scripting vulnerability in better-auth's OIDC provider and MCP plugins (GHSA-86j7-9j95-vpqj). ([#19584](https://github.com/mastra-ai/mastra/pull/19584))
+
+- Fixed Better Auth bearer token authentication and implemented user lookup in `@mastra/auth-better-auth` (fixes [#19110](https://github.com/mastra-ai/mastra/issues/19110)). ([#19629](https://github.com/mastra-ai/mastra/pull/19629))
+
+  **Bearer tokens now work after credentials sign-in**
+
+  `signIn`/`signUp` return Better Auth's raw session token, but Better Auth only accepts _signed_ session cookies. Sending that token as `Authorization: Bearer <token>` previously always failed authentication. The provider now signs unsigned tokens with the Better Auth secret before verifying the session — matching the semantics of Better Auth's bearer plugin. The session cookie name is also resolved from the Better Auth instance, so secure-cookie setups (`__Secure-` prefix) work too.
+
+  **`getUser()` and `getUsers()` are now implemented**
+
+  Previously `getUser()` was a stub that always returned `null`, breaking Studio user lookup and author enrichment. It now resolves users by ID through Better Auth's internal database adapter, and `getUsers()` supports batch lookups.
+
+## 1.1.2-alpha.2
+
+### Patch Changes
+
+- Added a deferred instance mode and organization management to MastraAuthBetterAuth so it can be passed directly to a server host without a wrapper adapter. The provider can now be constructed with just a secret and will build its Better Auth instance (including running migrations) against the host database during init. It also bootstraps a personal organization for new users (ensureOrganization), checks organization admin roles (isOrganizationAdmin), and exposes the Better Auth HTTP handler (handleAuthRequest) so hosts can mount it under /auth/api/*. ([#19765](https://github.com/mastra-ai/mastra/pull/19765))
+
+  **Before**
+
+  ```ts
+  import { betterAuth } from 'better-auth';
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ auth: betterAuth({/* ... */}) });
+  ```
+
+  **After** (bring-your-own instance still works)
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const auth = new MastraAuthBetterAuth({ secret: process.env.BETTER_AUTH_SECRET! });
+  // host calls auth.init({ database, publicUrl, allowedOrigins }) during startup
+  ```
+
 ## 1.1.2-alpha.1
 
 ### Patch Changes

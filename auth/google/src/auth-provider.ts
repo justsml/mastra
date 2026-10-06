@@ -9,24 +9,18 @@ import type {
   ISSOProvider,
   ISessionProvider,
   IUserProvider,
+  MastraAuthRequest,
   Session,
   SSOCallbackResult,
   SSOLoginConfig,
 } from '@internal/auth';
+import { getRequestHeader } from '@internal/auth';
 import { MastraAuthProvider } from '@internal/auth/provider';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { JWTPayload } from 'jose';
 
 import type { GoogleUser, MastraAuthGoogleOptions } from './types';
 import { mapGoogleClaimsToUser } from './types';
-
-type HonoRequestLike = {
-  raw?: Request;
-  headers?: Headers;
-  header(name: string): string | undefined;
-};
-
-type MastraAuthRequest = Request | HonoRequestLike;
 
 const GOOGLE_AUTHORIZATION_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -49,14 +43,6 @@ interface StatePayload {
   e: number;
   /** OIDC nonce tied to the ID token. */
   n: string;
-}
-
-function getRequestHeader(request: MastraAuthRequest, name: string): string | null {
-  if (request instanceof Request) {
-    return request.headers.get(name);
-  }
-
-  return request.raw?.headers.get(name) ?? request.headers?.get(name) ?? request.header(name) ?? null;
 }
 
 function normalizeDomain(domain: string | undefined | null): string | undefined {
@@ -422,20 +408,13 @@ export class MastraAuthGoogle extends MastraAuthProvider<GoogleUser> implements 
         expiresAt: number;
       };
 
-      if (sessionData.expiresAt < Date.now()) {
+      if (!Number.isFinite(sessionData.expiresAt) || sessionData.expiresAt < Date.now()) {
         return null;
       }
 
-      const userExpiresAt = getExpirationMs(sessionData.user.expiresAt);
-      if (userExpiresAt !== undefined && (!Number.isFinite(userExpiresAt) || userExpiresAt < Date.now())) {
-        return null;
-      }
-
+      // The session lifetime (cookieMaxAge) governs cookie sessions, not the ~1h Google ID token exp.
       const { expiresAt: _expiresAt, ...sessionUser } = sessionData.user;
-      const user: GoogleUser = {
-        ...sessionUser,
-        ...(userExpiresAt !== undefined ? { expiresAt: new Date(userExpiresAt) } : {}),
-      };
+      const user: GoogleUser = { ...sessionUser, expiresAt: new Date(sessionData.expiresAt) };
 
       if (!this.isHostedDomainAllowed(user.hostedDomain)) {
         return null;

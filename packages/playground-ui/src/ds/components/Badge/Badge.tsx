@@ -1,59 +1,186 @@
-import { cva } from 'class-variance-authority';
-import type { VariantProps } from 'class-variance-authority';
-import React from 'react';
+import type { HTMLAttributes, ReactNode } from 'react';
 
 import { Icon } from '../../icons/Icon';
+import { productColors, productSubtleColors } from '../ProductAvatar/product-identity';
 import { transitions } from '@/ds/primitives/transitions';
 import { cn } from '@/lib/utils';
 
-const badgeVariants = cva('inline-flex w-fit max-w-full shrink-0 items-center rounded-full border font-mono', {
-  variants: {
-    variant: {
-      default: 'border-border1 bg-surface4 text-neutral5',
-      success: 'border-notice-success/20 bg-notice-success/20 text-notice-success-fg',
-      error: 'border-notice-destructive/20 bg-notice-destructive/20 text-notice-destructive-fg',
-      info: 'border-notice-info/20 bg-notice-info/20 text-notice-info-fg',
-      warning: 'border-notice-warning/20 bg-notice-warning/20 text-notice-warning-fg',
-    },
-    size: {
-      md: 'h-badge-default gap-1 text-ui-sm',
-      sm: 'h-form-xs gap-1 text-ui-xs',
-      xs: 'h-5 gap-0.5 text-ui-xs',
-    },
-    withIcon: {
-      true: '',
-      false: '',
-    },
-  },
-  compoundVariants: [
-    { size: 'md', withIcon: false, className: 'px-2.5' },
-    { size: 'md', withIcon: true, className: 'pl-2 pr-2.5' },
-    { size: 'sm', withIcon: false, className: 'px-2' },
-    { size: 'sm', withIcon: true, className: 'pl-1.5 pr-2' },
-    { size: 'xs', withIcon: false, className: 'px-1.5' },
-    { size: 'xs', withIcon: true, className: 'pl-1 pr-1.5' },
-  ],
-  defaultVariants: {
-    variant: 'default',
-    size: 'md',
-    withIcon: false,
-  },
-});
+export type BadgeEmphasis = 'strong' | 'subtle';
+export type BadgeIndicator = 'dot' | 'pulse';
 
-export interface BadgeProps
-  extends React.HTMLAttributes<HTMLDivElement>, Omit<VariantProps<typeof badgeVariants>, 'withIcon'> {
-  icon?: React.ReactNode;
-  children?: React.ReactNode;
-}
+type BadgeToneStyles = Record<BadgeEmphasis, string> & { indicator: string };
 
-export const Badge = ({ icon, variant, size, className, children, ...props }: BadgeProps) => {
+const green = {
+  strong: 'bg-badge-green-strong text-badge-green-foreground',
+  subtle: 'bg-badge-green-subtle text-badge-green-foreground',
+  indicator: 'bg-badge-green-indicator',
+};
+const red = {
+  strong: 'bg-badge-red-strong text-badge-red-foreground',
+  subtle: 'bg-badge-red-subtle text-badge-red-foreground',
+  indicator: 'bg-badge-red-indicator',
+};
+const amber = {
+  strong: 'bg-badge-amber-strong text-badge-amber-foreground',
+  subtle: 'bg-badge-amber-subtle text-badge-amber-foreground',
+  indicator: 'bg-badge-amber-indicator',
+};
+const blue = {
+  strong: 'bg-badge-blue-strong text-badge-blue-foreground',
+  subtle: 'bg-badge-blue-subtle text-badge-blue-foreground',
+  indicator: 'bg-badge-blue-indicator',
+};
+
+const badgeToneStyles = {
+  studio: {
+    strong: productColors.studio,
+    subtle: productSubtleColors.studio,
+    indicator: 'bg-product-studio-foreground',
+  },
+  server: {
+    strong: productColors.server,
+    subtle: productSubtleColors.server,
+    indicator: 'bg-product-server-foreground',
+  },
+  observability: {
+    strong: productColors.observability,
+    subtle: productSubtleColors.observability,
+    indicator: 'bg-product-observability-foreground',
+  },
+  factory: {
+    strong: productColors.factory,
+    subtle: productSubtleColors.factory,
+    indicator: 'bg-product-factory-foreground',
+  },
+  workers: {
+    strong: productColors.workers,
+    subtle: productSubtleColors.workers,
+    indicator: 'bg-product-workers-foreground',
+  },
+  'persistent-server': {
+    strong: productColors['persistent-server'],
+    subtle: productSubtleColors['persistent-server'],
+    indicator: 'bg-product-persistent-server-foreground',
+  },
+  neutral: {
+    strong: 'bg-fill text-badge-neutral-foreground',
+    subtle: 'bg-fill-subtle text-badge-neutral-foreground',
+    indicator: 'bg-muted-foreground',
+  },
+  success: { ...green, indicator: 'bg-success-indicator' },
+  destructive: {
+    strong: 'bg-badge-red-strong text-badge-red-foreground',
+    subtle: 'bg-badge-red-subtle text-badge-red-foreground',
+    indicator: 'bg-destructive-indicator',
+  },
+  info: { ...blue, indicator: 'bg-info-indicator' },
+  warning: {
+    strong: 'bg-badge-amber-strong text-warning-foreground',
+    subtle: 'bg-badge-amber-subtle text-warning-foreground',
+    indicator: 'bg-warning-indicator',
+  },
+  green,
+  red,
+  amber,
+  blue,
+  purple: {
+    strong: 'bg-badge-purple-strong text-badge-purple-foreground',
+    subtle: 'bg-badge-purple-subtle text-badge-purple-foreground',
+    indicator: 'bg-badge-purple-indicator',
+  },
+  orange: {
+    strong: 'bg-badge-orange-strong text-badge-orange-foreground',
+    subtle: 'bg-badge-orange-subtle text-badge-orange-foreground',
+    indicator: 'bg-badge-orange-indicator',
+  },
+  cyan: {
+    strong: 'bg-badge-cyan-strong text-badge-cyan-foreground',
+    subtle: 'bg-badge-cyan-subtle text-badge-cyan-foreground',
+    indicator: 'bg-badge-cyan-indicator',
+  },
+  pink: {
+    strong: 'bg-badge-pink-strong text-badge-pink-foreground',
+    subtle: 'bg-badge-pink-subtle text-badge-pink-foreground',
+    indicator: 'bg-badge-pink-indicator',
+  },
+} satisfies Record<string, BadgeToneStyles>;
+
+export type BadgeVariant = keyof typeof badgeToneStyles;
+
+const badgeSizeStyles = {
+  xs: {
+    badge: 'h-[18px] gap-0.5 text-meta',
+    withoutLeadingVisual: 'px-1.5',
+    withLeadingVisual: 'pl-1 pr-1.5',
+    indicator: 'size-1',
+  },
+  sm: {
+    badge: 'h-5 gap-1 text-meta',
+    withoutLeadingVisual: 'px-1.5',
+    withLeadingVisual: 'px-1.5',
+    indicator: 'size-1',
+  },
+  md: {
+    badge: 'h-5 gap-1 text-column tracking-normal',
+    withoutLeadingVisual: 'px-2',
+    withLeadingVisual: 'pl-1.5 pr-2',
+    indicator: 'size-1.5',
+  },
+};
+
+export type BadgeSize = keyof typeof badgeSizeStyles;
+
+type BadgeLeadingVisual = { icon?: ReactNode; indicator?: never } | { icon?: never; indicator?: BadgeIndicator };
+
+export type BadgeProps = HTMLAttributes<HTMLSpanElement> &
+  BadgeLeadingVisual & {
+    variant?: BadgeVariant;
+    emphasis?: BadgeEmphasis;
+    size?: BadgeSize;
+    children?: ReactNode;
+  };
+
+export const Badge = ({
+  icon,
+  indicator,
+  variant = 'neutral',
+  emphasis = 'strong',
+  size = 'md',
+  className,
+  children,
+  ...props
+}: BadgeProps) => {
+  const hasIcon = Boolean(icon);
+  const withLeadingVisual = hasIcon || indicator !== undefined;
+  const sizeStyles = badgeSizeStyles[size];
+  const paddingClass = withLeadingVisual ? sizeStyles.withLeadingVisual : sizeStyles.withoutLeadingVisual;
+
   return (
-    <div
-      className={cn(badgeVariants({ variant, size, withIcon: Boolean(icon) }), transitions.colors, className)}
+    <span
+      className={cn(
+        'inline-flex w-fit max-w-full shrink-0 items-center rounded-[7px]',
+        'shadow-inset',
+        badgeToneStyles[variant][emphasis],
+        sizeStyles.badge,
+        paddingClass,
+        transitions.colors,
+        className,
+      )}
       {...props}
     >
-      {icon && <Icon size="sm">{icon}</Icon>}
+      {indicator !== undefined ? (
+        <span
+          aria-hidden="true"
+          className={cn(
+            'shrink-0 rounded-full',
+            badgeToneStyles[variant].indicator,
+            sizeStyles.indicator,
+            indicator === 'pulse' && 'motion-safe:animate-pulse motion-reduce:animate-none',
+          )}
+        />
+      ) : null}
+      {hasIcon ? <Icon size="xs">{icon}</Icon> : null}
       {children}
-    </div>
+    </span>
   );
 };

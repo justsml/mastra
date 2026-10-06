@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { createRef, useState } from 'react';
 import { afterEach, assert, describe, expect, it, vi } from 'vitest';
 
-import { Composer, ComposerActions, ComposerAttachments, ComposerBox, ComposerInput } from './composer';
+import { Composer, ComposerActions, ComposerAttachments, ComposerBox, ComposerInput, ComposerRing } from './composer';
 
 afterEach(() => {
   cleanup();
@@ -104,6 +104,22 @@ describe('Composer', () => {
     });
   });
 
+  describe('when the input viewport height is configured', () => {
+    it('applies the limit to the scrolling viewport instead of the textarea', () => {
+      render(
+        <Composer>
+          <ComposerInput aria-label="Message" maxHeight="16rem" />
+        </Composer>,
+      );
+
+      const input = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Message' });
+      const viewport = document.querySelector<HTMLElement>('[style*="max-height"]');
+      assert(viewport);
+      expect(viewport.style.maxHeight).toBe('16rem');
+      expect(input.style.maxHeight).toBe('');
+    });
+  });
+
   describe('when optional regions are omitted', () => {
     it('renders only the provided input region', () => {
       render(
@@ -172,7 +188,79 @@ describe('Composer', () => {
       const pulse = document.querySelector('[data-slot="composer-sending-pulse"]');
       assert(pulse);
       expect(pulse.getAttribute('aria-hidden')).toBe('true');
+      expect(pulse.childElementCount).toBe(3);
     });
+  });
+
+  describe('when the ring is idle', () => {
+    it('aims the glow relative to the ring when moving over its input', () => {
+      render(
+        <ComposerRing>
+          <ComposerBox>
+            <ComposerInput aria-label="Message" />
+          </ComposerBox>
+        </ComposerRing>,
+      );
+
+      const ring = document.querySelector<HTMLElement>('[data-slot="composer-ring"]');
+      assert(ring);
+      expect(ring.getAttribute('data-busy')).toBe('false');
+
+      vi.spyOn(ring, 'getBoundingClientRect').mockReturnValue(new DOMRect(20, 30, 200, 100));
+      const input = screen.getByRole('textbox', { name: 'Message' });
+      fireEvent(input, new MouseEvent('pointermove', { bubbles: true, clientX: 320, clientY: 80 }));
+
+      expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('90deg');
+      expect(ring.style.getPropertyValue('--composer-spotlight-x')).toBe('300px');
+      expect(ring.style.getPropertyValue('--composer-spotlight-y')).toBe('50px');
+
+      fireEvent(window, new MouseEvent('pointermove', { clientX: 0, clientY: 0 }));
+      expect(ring.style.getPropertyValue('--composer-spotlight-x')).toBe('300px');
+    });
+  });
+
+  describe('when the ring is busy', () => {
+    it('stops tracking while busy and resumes when idle', () => {
+      const { rerender } = render(
+        <ComposerRing busy>
+          <ComposerBox>
+            <ComposerInput aria-label="Message" />
+          </ComposerBox>
+        </ComposerRing>,
+      );
+
+      const ring = document.querySelector<HTMLElement>('[data-slot="composer-ring"]');
+      assert(ring);
+      fireEvent(ring, new MouseEvent('pointermove', { bubbles: true, clientX: 100, clientY: 0 }));
+      expect(ring.getAttribute('data-busy')).toBe('true');
+      expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('');
+      expect(ring.style.getPropertyValue('--composer-spotlight-x')).toBe('');
+
+      rerender(<ComposerRing />);
+      fireEvent(ring, new MouseEvent('pointermove', { bubbles: true, clientX: 100, clientY: 0 }));
+      expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('90deg');
+
+      rerender(<ComposerRing busy />);
+      fireEvent(ring, new MouseEvent('pointermove', { bubbles: true, clientX: 0, clientY: 100 }));
+      expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('90deg');
+    });
+  });
+
+  it('preserves caller pointer handlers and styles, including cancellation', () => {
+    const onPointerEnter = vi.fn();
+    const onPointerMove = vi.fn<React.PointerEventHandler<HTMLDivElement>>(event => event.preventDefault());
+    render(<ComposerRing onPointerEnter={onPointerEnter} onPointerMove={onPointerMove} style={{ opacity: 0.5 }} />);
+    const ring = document.querySelector<HTMLElement>('[data-slot="composer-ring"]');
+    assert(ring);
+
+    fireEvent(ring, new MouseEvent('pointerover', { bubbles: true, clientX: 100, clientY: 0 }));
+    expect(onPointerEnter).toHaveBeenCalledOnce();
+    expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('90deg');
+    expect(ring.style.opacity).toBe('0.5');
+
+    fireEvent(ring, new MouseEvent('pointermove', { bubbles: true, cancelable: true, clientX: 0, clientY: 100 }));
+    expect(onPointerMove).toHaveBeenCalledOnce();
+    expect(ring.style.getPropertyValue('--composer-ring-angle')).toBe('90deg');
   });
 
   describe('when no sending pulse has been triggered', () => {

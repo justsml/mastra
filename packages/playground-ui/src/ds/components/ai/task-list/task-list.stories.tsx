@@ -1,5 +1,7 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
+import { useEffect, useState } from 'react';
 import { TaskList } from './task-list';
+import type { TaskListItem } from './task-list';
 
 const meta: Meta<typeof TaskList> = {
   title: 'AI/Task List',
@@ -45,8 +47,41 @@ export const OneActiveTask: Story = {
   },
 };
 
-export const Empty: Story = {
-  args: { tasks: [], hideWhenEmpty: false },
+export const Collapsed: Story = {
+  args: { ...MixedProgress.args, defaultOpen: false },
+};
+
+export const LongList: Story = {
+  args: {
+    tasks: [
+      { id: 'signal', content: 'Collect existing review signal', status: 'completed', activeForm: 'Collecting signal' },
+      {
+        id: 'gate',
+        content: 'Run quality gate in the sandbox',
+        status: 'completed',
+        activeForm: 'Running quality gate',
+      },
+      { id: 'history', content: 'Trace history and architecture', status: 'completed', activeForm: 'Tracing history' },
+      {
+        id: 'verdict',
+        content: 'Form a verdict with an adversarial check',
+        status: 'in_progress',
+        activeForm: 'Forming a verdict with an adversarial check',
+      },
+      {
+        id: 'publish',
+        content: 'Publish the review on the pull request',
+        status: 'pending',
+        activeForm: 'Publishing the review',
+      },
+      {
+        id: 'handoff',
+        content: 'Request the stage transition and post the handoff',
+        status: 'pending',
+        activeForm: 'Posting the handoff',
+      },
+    ],
+  },
 };
 
 export const Completed: Story = {
@@ -56,5 +91,23 @@ export const Completed: Story = {
       { id: 'tests', content: 'Run tests', status: 'completed', activeForm: 'Running tests' },
       { id: 'build', content: 'Build package', status: 'completed', activeForm: 'Building package' },
     ],
+  },
+};
+
+const statusAtStep = (index: number, step: number): TaskListItem['status'] => {
+  if (index < step) return 'completed';
+  if (index === step) return 'in_progress';
+  return 'pending';
+};
+
+export const Live: Story = {
+  render: function LiveStory() {
+    const tasks = LongList.args?.tasks ?? [];
+    const [step, setStep] = useState(0);
+    useEffect(() => {
+      const interval = setInterval(() => setStep(current => (current + 1) % tasks.length), 1800);
+      return () => clearInterval(interval);
+    }, [tasks.length]);
+    return <TaskList tasks={tasks.map((task, index) => ({ ...task, status: statusAtStep(index, step) }))} />;
   },
 };

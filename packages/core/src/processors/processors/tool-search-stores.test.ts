@@ -34,11 +34,21 @@ function argsWithMessages(
 }
 
 describe('deriveLoadedNamesFromMessages', () => {
-  it('reads names from a search_tools result (results[].name)', () => {
+  it('reads names from an autoLoad search_tools result (loaded[])', () => {
+    const args = argsWithMessages([
+      {
+        toolName: 'search_tools',
+        result: { results: [{ name: 'weather' }, { name: 'calendar' }], loaded: ['weather', 'calendar'] },
+      },
+    ]);
+    expect([...deriveLoadedNamesFromMessages(args)].sort()).toEqual(['calendar', 'weather']);
+  });
+
+  it('does not treat plain search_tools hits (no loaded[]) as loaded', () => {
     const args = argsWithMessages([
       { toolName: 'search_tools', result: { results: [{ name: 'weather' }, { name: 'calendar' }] } },
     ]);
-    expect([...deriveLoadedNamesFromMessages(args)].sort()).toEqual(['calendar', 'weather']);
+    expect([...deriveLoadedNamesFromMessages(args)]).toEqual([]);
   });
 
   it('reads names from a load_tool result (loaded[])', () => {
@@ -48,10 +58,27 @@ describe('deriveLoadedNamesFromMessages', () => {
 
   it('unions across multiple invocations and ignores other tools', () => {
     const args = argsWithMessages([
-      { toolName: 'search_tools', result: { results: [{ name: 'weather' }] } },
+      { toolName: 'search_tools', result: { results: [{ name: 'weather' }], loaded: ['weather'] } },
       { toolName: 'load_tool', result: { loaded: ['calendar'] } },
     ]);
     expect([...deriveLoadedNamesFromMessages(args)].sort()).toEqual(['calendar', 'weather']);
+  });
+
+  it('reads the single-name load_tool result shape ({ success: true, toolName })', () => {
+    const args = argsWithMessages([
+      {
+        toolName: 'load_tool',
+        result: { success: true, message: 'Tool "weather" loaded successfully.', toolName: 'weather' },
+      },
+    ]);
+    expect([...deriveLoadedNamesFromMessages(args)]).toEqual(['weather']);
+  });
+
+  it('ignores toolName on failed load_tool results (not-found shape)', () => {
+    const args = argsWithMessages([
+      { toolName: 'load_tool', result: { success: false, message: 'Tool "weather" not found.', toolName: 'weather' } },
+    ]);
+    expect(deriveLoadedNamesFromMessages(args).size).toBe(0);
   });
 
   it('returns empty when messages are missing', () => {

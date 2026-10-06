@@ -18,12 +18,19 @@ import type {
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import { Pool } from 'pg';
+import { parseSchemaName, schemaNamePrefix } from '../../shared/schema-name';
 import type { DbClient, QueryValues, TxClient } from '../client';
 import { PoolAdapter } from '../client';
 import { buildConstraintName } from './constraint-utils';
+import { isDuplicateRelationError, isDuplicateSchemaError } from './pg-errors';
+import { toPgJson } from './sanitize-json';
+import { getSchemaSnapshot } from './schema-snapshot';
+import type { SchemaSnapshot } from './schema-snapshot';
 
 // Re-export DbClient for external use
 export type { DbClient } from '../client';
+
+const POSTGRES_MAX_BIND_PARAMETERS = 65_535;
 
 /**
  * Configuration for standalone domain usage.
@@ -37,8 +44,10 @@ export type PgDomainConfig = PgDomainClientConfig | PgDomainPoolConfig | PgDomai
  * Pass an existing database client (DbClient)
  */
 export interface PgDomainClientConfig {
-  /** The database client */
+  /** The writer database client */
   client: DbClient;
+  /** Optional reader database client. Falls back to `client`. */
+  readClient?: DbClient;
   /** Optional schema name (defaults to 'public') */
   schemaName?: string;
   /** When true, default indexes will not be created during initialization */
@@ -51,8 +60,10 @@ export interface PgDomainClientConfig {
  * Pass an existing pg.Pool
  */
 export interface PgDomainPoolConfig {
-  /** Pre-configured pg.Pool */
+  /** Pre-configured writer pg.Pool */
   pool: Pool;
+  /** Optional reader pg.Pool. Falls back to `pool`. */
+  readPool?: Pool;
   /** Optional schema name (defaults to 'public') */
   schemaName?: string;
   /** When true, default indexes will not be created during initialization */
@@ -92,6 +103,7 @@ export type PgDomainRestConfig = {
  */
 export function resolvePgConfig(config: PgDomainConfig): {
   client: DbClient;
+  readClient: DbClient;
   schemaName?: string;
   skipDefaultIndexes?: boolean;
   indexes?: CreateIndexOptions[];
@@ -100,6 +112,7 @@ export function resolvePgConfig(config: PgDomainConfig): {
   if ('client' in config) {
     return {
       client: config.client,
+      readClient: config.readClient ?? config.client,
       schemaName: config.schemaName,
       skipDefaultIndexes: config.skipDefaultIndexes,
       indexes: config.indexes,
@@ -108,8 +121,10 @@ export function resolvePgConfig(config: PgDomainConfig): {
 
   // Existing pool
   if ('pool' in config) {
+    const client = new PoolAdapter(config.pool);
     return {
-      client: new PoolAdapter(config.pool),
+      client,
+      readClient: config.readPool && config.readPool !== config.pool ? new PoolAdapter(config.readPool) : client,
       schemaName: config.schemaName,
       skipDefaultIndexes: config.skipDefaultIndexes,
       indexes: config.indexes,
@@ -144,8 +159,10 @@ export function resolvePgConfig(config: PgDomainConfig): {
     );
   });
 
+  const client = new PoolAdapter(pool);
   return {
-    client: new PoolAdapter(pool),
+    client,
+    readClient: client,
     schemaName: config.schemaName,
     skipDefaultIndexes: config.skipDefaultIndexes,
     indexes: config.indexes,
@@ -153,7 +170,7 @@ export function resolvePgConfig(config: PgDomainConfig): {
 }
 
 export function getSchemaName(schema?: string) {
-  return schema ? `"${parseSqlIdentifier(schema, 'schema name')}"` : '"public"';
+  return schema ? `"${parseSchemaName(schema)}"` : '"public"';
 }
 
 export function getTableName({ indexName, schemaName }: { indexName: string; schemaName?: string }) {
@@ -223,7 +240,7 @@ export function generateTableSQL({
 
   const finalColumns = [...columns, ...timeZColumns, ...tableConstraints].join(',\n');
   // Sanitize schema name before using it in constraint names to ensure valid SQL identifiers
-  const parsedSchemaName = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+  const parsedSchemaName = schemaName ? schemaNamePrefix(schemaName) : '';
   // Use the original (long) base name so existing databases that already have
   // the constraint under this name are detected by the IF NOT EXISTS check.
   // buildConstraintName will truncate only when a schema prefix pushes the
@@ -237,7 +254,7 @@ export function generateTableSQL({
     schemaName: parsedSchemaName || undefined,
   });
   const quotedSchemaName = getSchemaName(schemaName);
-  const schemaFilter = parsedSchemaName || 'public';
+  const schemaFilter = schemaName ? parseSchemaName(schemaName) : 'public';
 
   const sql = `
             CREATE TABLE IF NOT EXISTS ${getTableName({ indexName: tableName, schemaName: quotedSchemaName })} (
@@ -334,7 +351,14 @@ export function generateTimestampTriggerSQL(tableName: string, schemaName?: stri
   const quotedSchemaName = getSchemaName(schemaName);
   const fullTableName = getTableName({ indexName: tableName, schemaName: quotedSchemaName });
   const functionName = `${quotedSchemaName}.trigger_set_timestamps`;
-  const triggerName = `"${parseSqlIdentifier(`${tableName}_timestamps`, 'trigger name')}"`;
+  const parsedTriggerName = parseSqlIdentifier(`${tableName}_timestamps`, 'trigger name');
+  const triggerName = `"${parsedTriggerName}"`;
+
+  // Literals for the pg_trigger guard below. The identifiers are already
+  // validated by parseSqlIdentifier, so they cannot carry a quote.
+  const triggerNameLiteral = `'${parsedTriggerName}'`;
+  const tableNameLiteral = `'${parseSqlIdentifier(tableName, 'table name')}'`;
+  const schemaNameLiteral = schemaName ? `'${parseSchemaName(schemaName)}'` : `'public'`;
 
   return `CREATE OR REPLACE FUNCTION ${functionName}()
 RETURNS TRIGGER AS $$
@@ -354,12 +378,38 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS ${triggerName} ON ${fullTableName};
+DO $mastra_timestamps_trigger$
+BEGIN
+    -- Recreating the trigger unconditionally would take an ACCESS EXCLUSIVE
+    -- lock on the table (DROP TRIGGER does, even when nothing changes), and
+    -- init runs on every process start. Skip when the trigger is already
+    -- exactly what the CREATE below would produce.
+    --
+    -- tgtype 23 = ROW (1) | BEFORE (2) | INSERT (4) | UPDATE (16), so a trigger
+    -- whose timing or events differ still falls through and gets rebuilt. The
+    -- behaviour itself lives in the function, which is replaced above on every
+    -- init, so an upgraded function body lands without touching the trigger.
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_trigger tg
+        JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE tg.tgname = ${triggerNameLiteral}
+          AND c.relname = ${tableNameLiteral}
+          AND n.nspname = ${schemaNameLiteral}
+          AND NOT tg.tgisinternal
+          AND tg.tgtype = 23
+          AND tg.tgfoid = '${functionName}()'::regprocedure
+    ) THEN
+        DROP TRIGGER IF EXISTS ${triggerName} ON ${fullTableName};
 
-CREATE TRIGGER ${triggerName}
-    BEFORE INSERT OR UPDATE ON ${fullTableName}
-    FOR EACH ROW
-    EXECUTE FUNCTION ${functionName}();`;
+        CREATE TRIGGER ${triggerName}
+            BEFORE INSERT OR UPDATE ON ${fullTableName}
+            FOR EACH ROW
+            EXECUTE FUNCTION ${functionName}();
+    END IF;
+END
+$mastra_timestamps_trigger$;`;
 }
 
 /**
@@ -367,6 +417,7 @@ CREATE TRIGGER ${triggerName}
  */
 export interface PgDBInternalConfig {
   client: DbClient;
+  readClient?: DbClient;
   schemaName?: string;
   skipDefaultIndexes?: boolean;
 }
@@ -389,11 +440,15 @@ function assertPositiveLimit(limit: number): void {
 
 export class PgDB extends MastraBase {
   public client: DbClient;
+  public readClient: DbClient;
   public schemaName?: string;
   public skipDefaultIndexes?: boolean;
 
   /** Cache of actual table columns: tableName -> Set<columnName> */
   private tableColumnsCache = new Map<string, Set<string>>();
+
+  /** Cache of column Postgres data types: tableName -> columnName -> data_type */
+  private columnTypeCache = new Map<string, Map<string, string>>();
 
   constructor(config: PgDBInternalConfig) {
     super({
@@ -402,8 +457,115 @@ export class PgDB extends MastraBase {
     });
 
     this.client = config.client;
+    this.readClient = config.readClient ?? config.client;
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
+  }
+
+  /**
+   * Catalog snapshot for the current init window, or `null` outside it.
+   *
+   * When non-null, the init-path methods below answer existence questions from
+   * it instead of round-tripping to the server, and record the objects they
+   * create so later callers in the same init see them. See
+   * {@link SchemaSnapshot} for why it is scoped to init only.
+   */
+  private get schemaSnapshot(): SchemaSnapshot | null {
+    return getSchemaSnapshot(this.client, this.schemaName);
+  }
+
+  /**
+   * Whether the snapshot proves `generateTableSQL` would be a no-op for this
+   * table — i.e. the CREATE statement can be skipped.
+   *
+   * For most tables that is just "the table exists". `workflow_snapshot` is the
+   * exception: its generated SQL also carries a DO block that back-fills the
+   * `(workflow_name, run_id)` unique constraint and promotes it to the table's
+   * replica identity, so a table created by an older version still needs the
+   * statement to run.
+   */
+  private snapshotShowsTableConverged(snapshot: SchemaSnapshot, tableName: TABLE_NAMES): boolean {
+    if (!snapshot.tables.has(tableName)) return false;
+
+    if (tableName === TABLE_WORKFLOW_SNAPSHOT) {
+      const constraintName = buildConstraintName({
+        baseName: 'mastra_workflow_snapshot_workflow_name_run_id_key',
+        schemaName: this.schemaName ? schemaNamePrefix(this.schemaName) : undefined,
+      }).toLowerCase();
+      return snapshot.indexes.has(constraintName) && snapshot.replicaIdentityIndexes.has(constraintName);
+    }
+
+    return true;
+  }
+
+  /** Column set for `tableName` in the snapshot, created empty if absent. */
+  private snapshotColumns(snapshot: SchemaSnapshot, tableName: string): Set<string> {
+    let columns = snapshot.columns.get(tableName);
+    if (!columns) {
+      columns = new Set<string>();
+      snapshot.columns.set(tableName, columns);
+    }
+    return columns;
+  }
+
+  /**
+   * Records an out-of-band `ALTER TABLE … RENAME TO` in the init snapshot.
+   *
+   * Init-time migrations that issue raw DDL on `this.client` (instead of going
+   * through createTable/alterTable/createIndex, which maintain the snapshot
+   * themselves) MUST report it through these `note*` methods. A snapshot that
+   * still lists a renamed-away table makes a later createTable() in the same
+   * init skip the rebuild the migration depends on — stranding data. No-op
+   * outside the init window.
+   *
+   * Indexes riding along with a rename keep their names, so the snapshot's
+   * index set stays accurate without changes here.
+   */
+  noteTableRenamed(oldName: string, newName: string): void {
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) {
+      if (snapshot.tables.delete(oldName)) snapshot.tables.add(newName);
+      const columns = snapshot.columns.get(oldName);
+      if (columns) {
+        snapshot.columns.delete(oldName);
+        snapshot.columns.set(newName, columns);
+      }
+    }
+    this.tableColumnsCache.delete(oldName);
+    this.columnTypeCache.delete(oldName);
+    this.tableColumnsCache.delete(newName);
+    this.columnTypeCache.delete(newName);
+  }
+
+  /**
+   * Records an out-of-band `DROP TABLE` in the init snapshot. See
+   * {@link noteTableRenamed} for why raw-DDL migrations must call this.
+   *
+   * The dropped table's indexes vanish with it, but the snapshot's flat index
+   * set cannot map names back to tables. Stale entries only make a later
+   * createIndex() skip a recreate until the next init re-reads the catalog —
+   * the same self-healing bound the rest of the snapshot design accepts.
+   */
+  noteTableDropped(tableName: string): void {
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) {
+      snapshot.tables.delete(tableName);
+      snapshot.columns.delete(tableName);
+      snapshot.columnTypes.delete(tableName);
+    }
+    this.tableColumnsCache.delete(tableName);
+    this.columnTypeCache.delete(tableName);
+  }
+
+  /**
+   * Records an out-of-band `ALTER TABLE … ADD COLUMN` in the init snapshot.
+   * See {@link noteTableRenamed} for why raw-DDL migrations must call this.
+   */
+  noteColumnAdded(tableName: string, column: string): void {
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) this.snapshotColumns(snapshot, tableName).add(column);
+    this.tableColumnsCache.delete(tableName);
+    this.columnTypeCache.delete(tableName);
   }
 
   /**
@@ -451,12 +613,68 @@ export class PgDB extends MastraBase {
   async hasColumn(table: string, column: string): Promise<boolean> {
     const schema = this.schemaName || 'public';
 
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) {
+      const columns = snapshot.columns.get(table);
+      if (!columns) return false;
+      return columns.has(column) || columns.has(column.toLowerCase());
+    }
+
     const result = await this.client.oneOrNone(
       `SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND (column_name = $3 OR column_name = $4)`,
       [schema, table, column, column.toLowerCase()],
     );
 
     return !!result;
+  }
+
+  /**
+   * Returns the Postgres data type of a column (e.g. `jsonb`, `json`, `text`),
+   * or null when the table or column does not exist.
+   *
+   * Answered from the init snapshot when one is installed, so a warm `init()`
+   * issues no catalog probe. Outside init, results are cached per instance and
+   * the cache is invalidated alongside {@link tableColumnsCache} whenever DDL
+   * changes a table.
+   */
+  async getColumnType(table: string, column: string): Promise<string | null> {
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) {
+      const types = snapshot.columnTypes.get(table);
+      const known = types?.get(column) ?? types?.get(column.toLowerCase());
+      if (known) return known;
+      // The table exists in the snapshot but the column does not: nothing to probe for.
+      // A table created during this init has no snapshot types yet, so fall through.
+      if (types) return null;
+    }
+
+    const cached = this.columnTypeCache.get(table)?.get(column);
+    if (cached !== undefined) return cached;
+
+    const schema = this.schemaName || 'public';
+    const result = await this.client.oneOrNone<{ data_type: string }>(
+      `SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND (column_name = $3 OR column_name = $4)`,
+      [schema, table, column, column.toLowerCase()],
+    );
+
+    const dataType = result?.data_type ?? null;
+    if (dataType) {
+      if (snapshot) {
+        let snapshotTypes = snapshot.columnTypes.get(table);
+        if (!snapshotTypes) {
+          snapshotTypes = new Map<string, string>();
+          snapshot.columnTypes.set(table, snapshotTypes);
+        }
+        snapshotTypes.set(column, dataType);
+      }
+      let types = this.columnTypeCache.get(table);
+      if (!types) {
+        types = new Map();
+        this.columnTypeCache.set(table, types);
+      }
+      types.set(column, dataType);
+    }
+    return dataType;
   }
 
   /**
@@ -468,7 +686,7 @@ export class PgDB extends MastraBase {
       const columnSchema = schema?.[key];
 
       if (columnSchema?.type === 'jsonb' && value !== null && value !== undefined) {
-        return JSON.stringify(value);
+        return toPgJson(value);
       }
       return value;
     });
@@ -505,11 +723,11 @@ export class PgDB extends MastraBase {
     const columnSchema = schema?.[columnName];
 
     if (columnSchema?.type === 'jsonb') {
-      return JSON.stringify(value);
+      return toPgJson(value);
     }
 
     if (typeof value === 'object') {
-      return JSON.stringify(value);
+      return toPgJson(value);
     }
 
     return value;
@@ -523,6 +741,17 @@ export class PgDB extends MastraBase {
     // Use static registry to coordinate schema setup across all PgDB instances
     let registryEntry = schemaSetupRegistry.get(this.schemaName);
     if (registryEntry?.complete) {
+      return;
+    }
+
+    // During the init window, a snapshot holding tables for this schema proves
+    // the schema exists (the snapshot queries are scoped to it), so the
+    // `information_schema.schemata` probe below would be a warm init's one
+    // remaining per-process round trip. Skip it and mark setup complete. A
+    // cold schema yields an empty snapshot and falls through to the probe.
+    const snapshot = this.schemaSnapshot;
+    if (snapshot && snapshot.tables.size > 0) {
+      schemaSetupRegistry.set(this.schemaName, { promise: null, complete: true });
       return;
     }
 
@@ -547,11 +776,18 @@ export class PgDB extends MastraBase {
               await this.client.none(`CREATE SCHEMA IF NOT EXISTS ${quotedSchemaName}`);
               this.logger.info(`Schema "${schemaNameCapture}" created successfully`);
             } catch (error) {
-              this.logger.error(`Failed to create schema "${schemaNameCapture}"`, { error });
-              throw new Error(
-                `Unable to create schema "${schemaNameCapture}". This requires CREATE privilege on the database. ` +
-                  `Either create the schema manually or grant CREATE privilege to the user.`,
-              );
+              // `CREATE SCHEMA IF NOT EXISTS` is not atomic; a concurrent
+              // backend can race past the existence probe and create the
+              // schema first. Treat duplicate-schema errors as success.
+              if (isDuplicateSchemaError(error)) {
+                this.logger.debug(`Schema "${schemaNameCapture}" was created by another process`);
+              } else {
+                this.logger.error(`Failed to create schema "${schemaNameCapture}"`, { error });
+                throw new Error(
+                  `Unable to create schema "${schemaNameCapture}". This requires CREATE privilege on the database. ` +
+                    `Either create the schema manually or grant CREATE privilege to the user.`,
+                );
+              }
             }
           }
 
@@ -629,6 +865,145 @@ export class PgDB extends MastraBase {
     }
   }
 
+  private getChunkRowLimit(columnCount: number): number {
+    if (columnCount === 0) {
+      return 0;
+    }
+    return Math.max(1, Math.floor(POSTGRES_MAX_BIND_PARAMETERS / columnCount));
+  }
+
+  private getSpanConflictIdentifier(record: Record<string, any>): string | undefined {
+    const traceId = record.traceId as unknown;
+    const spanId = record.spanId as unknown;
+
+    if (traceId === undefined || spanId === undefined) {
+      return undefined;
+    }
+
+    return `${String(traceId)}|${String(spanId)}`;
+  }
+
+  private async normalizeForInsert(
+    tableName: TABLE_NAMES,
+    record: Record<string, any>,
+  ): Promise<{
+    columns: string[];
+    values: QueryValues;
+    conflictKey: string | undefined;
+  }> {
+    this.addTimestampZColumns(record);
+    const filteredRecord = await this.filterRecordToKnownColumns(tableName, record);
+    const columns = Object.keys(filteredRecord).map(column => parseSqlIdentifier(column, 'column name'));
+    const values = this.prepareValuesForInsert(filteredRecord, tableName);
+
+    return {
+      columns,
+      values,
+      conflictKey: tableName === TABLE_SPANS ? this.getSpanConflictIdentifier(filteredRecord) : undefined,
+    };
+  }
+
+  private buildMultiRowInsertStatement({
+    tableName,
+    columns,
+    rows,
+  }: {
+    tableName: TABLE_NAMES;
+    columns: string[];
+    rows: QueryValues[];
+  }): { query: string; values: QueryValues } {
+    const fullTableName = getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) });
+    const columnList = columns.map(column => `"${column}"`).join(', ');
+
+    const bindParams: string[] = [];
+    const values: QueryValues = [];
+    let bindIndex = 1;
+
+    for (const rowValues of rows) {
+      const placeholders = rowValues.map(() => `$${bindIndex++}`);
+      bindParams.push(`(${placeholders.join(', ')})`);
+      values.push(...rowValues);
+    }
+
+    let query = `INSERT INTO ${fullTableName} (${columnList}) VALUES ${bindParams.join(', ')}`;
+
+    if (tableName === TABLE_SPANS) {
+      const updateColumns = columns.filter(column => column !== 'traceId' && column !== 'spanId');
+      if (updateColumns.length > 0) {
+        const updateClause = updateColumns.map(column => `"${column}" = EXCLUDED."${column}"`).join(', ');
+        query += ` ON CONFLICT ("traceId", "spanId") DO UPDATE SET ${updateClause}`;
+      } else {
+        query += ` ON CONFLICT ("traceId", "spanId") DO NOTHING`;
+      }
+    }
+
+    return { query, values };
+  }
+
+  private async executeBatchInsert(
+    client: Pick<DbClient, 'none'> | Pick<TxClient, 'none'>,
+    { tableName, records }: { tableName: TABLE_NAMES; records: Record<string, any>[] },
+  ): Promise<void> {
+    const preparedRecords: Awaited<ReturnType<PgDB['normalizeForInsert']>>[] = [];
+    for (const record of records) {
+      preparedRecords.push(await this.normalizeForInsert(tableName, record));
+    }
+
+    let pendingColumns: string[] | undefined;
+    let pendingConflictKeys = new Set<string>();
+    let pendingRows: QueryValues[] = [];
+    let pendingLimit = 0;
+
+    const flush = async () => {
+      if (!pendingColumns || pendingRows.length === 0) {
+        return;
+      }
+
+      const statement = this.buildMultiRowInsertStatement({
+        tableName,
+        columns: pendingColumns,
+        rows: pendingRows,
+      });
+      await client.none(statement.query, statement.values);
+
+      pendingColumns = undefined;
+      pendingRows = [];
+      pendingConflictKeys = new Set();
+      pendingLimit = 0;
+    };
+
+    for (const { columns, values, conflictKey } of preparedRecords) {
+      if (columns.length === 0) {
+        continue;
+      }
+
+      const columnsSignature = columns.join('\u0000');
+      const currentPendingColumns = pendingColumns;
+      const isSpans = tableName === TABLE_SPANS;
+      const conflictDuplicate = isSpans && conflictKey !== undefined && pendingConflictKeys.has(conflictKey);
+      const exceedsLimit = pendingRows.length >= pendingLimit;
+      const incompatibleColumns =
+        currentPendingColumns === undefined || columnsSignature !== currentPendingColumns.join('\u0000');
+
+      if (incompatibleColumns || conflictDuplicate || exceedsLimit) {
+        await flush();
+
+        pendingColumns = columns;
+        pendingLimit = this.getChunkRowLimit(columns.length);
+        pendingRows = [values];
+        pendingConflictKeys = new Set();
+      } else {
+        pendingRows.push(values);
+      }
+
+      if (isSpans && conflictKey !== undefined) {
+        pendingConflictKeys.add(conflictKey);
+      }
+    }
+
+    await flush();
+  }
+
   async insert({ tableName, record }: { tableName: TABLE_NAMES; record: Record<string, any> }): Promise<void> {
     try {
       await this.executeInsert(this.client, { tableName, record });
@@ -697,9 +1072,39 @@ export class PgDB extends MastraBase {
         await this.setupSchema();
       }
 
-      const sql = generateTableSQL({ tableName, schema, schemaName: this.schemaName, compositePrimaryKey });
+      const snapshot = this.schemaSnapshot;
+      // Skipping the statement when everything it would create is already there
+      // is not only a saved round trip: `CREATE TABLE IF NOT EXISTS` requires
+      // CREATE on the schema, so on a converged schema this is also what lets a
+      // least-privilege role finish init instead of failing with
+      // "permission denied".
+      if (!snapshot || !this.snapshotShowsTableConverged(snapshot, tableName)) {
+        const sql = generateTableSQL({ tableName, schema, schemaName: this.schemaName, compositePrimaryKey });
 
-      await this.client.none(sql);
+        try {
+          await this.client.none(sql);
+        } catch (error) {
+          // `CREATE TABLE IF NOT EXISTS` is not atomic across concurrent
+          // backends. Two processes can both pass the existence probe and one
+          // surfaces a catalog duplicate error. Treat it as "already created".
+          if (!isDuplicateRelationError(error)) throw error;
+        }
+
+        if (snapshot) {
+          snapshot.tables.add(tableName);
+          // generateTableSQL emits the declared columns plus a `Z` twin for
+          // every timestamp column; record both so the alterTable pass below
+          // and later domains don't re-probe for them.
+          const created = this.snapshotColumns(snapshot, tableName);
+          for (const [name, def] of Object.entries(schema)) {
+            const parsedName = parseSqlIdentifier(name, 'column name');
+            created.add(parsedName);
+            if (def.type === 'timestamp') {
+              created.add(`${parsedName}Z`);
+            }
+          }
+        }
+      }
 
       await this.alterTable({
         tableName,
@@ -773,6 +1178,7 @@ export class PgDB extends MastraBase {
     } finally {
       // Clear cached columns so subsequent inserts see the fresh schema
       this.tableColumnsCache.delete(tableName);
+      this.columnTypeCache.delete(tableName);
     }
   }
 
@@ -809,6 +1215,7 @@ export class PgDB extends MastraBase {
           const alterSql =
             `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${parsedColumnName}" ${sqlType} ${nullable} ${defaultValue}`.trim();
           await this.client.none(alterSql);
+          this.noteColumnAdded(TABLE_SPANS, columnName);
           this.logger?.debug?.(`Added column '${columnName}' to ${fullTableName}`);
 
           // For timestamp columns, also add the timezone-aware version
@@ -817,6 +1224,7 @@ export class PgDB extends MastraBase {
             const timestampZSql =
               `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${parsedColumnName}Z" TIMESTAMPTZ DEFAULT NOW()`.trim();
             await this.client.none(timestampZSql);
+            this.noteColumnAdded(TABLE_SPANS, `${columnName}Z`);
             this.logger?.debug?.(`Added timezone column '${columnName}Z' to ${fullTableName}`);
           }
         }
@@ -833,6 +1241,7 @@ export class PgDB extends MastraBase {
             const timestampZSql =
               `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${parsedTzColumnName}" TIMESTAMPTZ DEFAULT NOW()`.trim();
             await this.client.none(timestampZSql);
+            this.noteColumnAdded(TABLE_SPANS, tzColumnName);
             this.logger?.debug?.(`Added timezone column '${tzColumnName}' to ${fullTableName}`);
           }
         }
@@ -973,13 +1382,23 @@ export class PgDB extends MastraBase {
    * Used to skip deduplication when the constraint already exists (migration already complete).
    */
   private async spansPrimaryKeyExists(): Promise<boolean> {
-    const parsedSchemaName = this.schemaName ? parseSqlIdentifier(this.schemaName, 'schema name') : '';
+    const parsedSchemaName = this.schemaName ? schemaNamePrefix(this.schemaName) : '';
     const constraintName = buildConstraintName({
       baseName: 'mastra_ai_spans_traceid_spanid_pk',
       schemaName: parsedSchemaName || undefined,
     });
     const schemaFilter = this.schemaName || 'public';
 
+    // A primary key is always backed by an index of the same name, so the init
+    // snapshot already answers this without a round trip.
+    const snapshot = this.schemaSnapshot;
+    if (snapshot) return snapshot.primaryKeyIndexes.has(constraintName.toLowerCase());
+
+    return this.spansPrimaryKeyExistsLive(constraintName, schemaFilter);
+  }
+
+  /** Live-catalog variant of {@link spansPrimaryKeyExists}, bypassing the snapshot. */
+  private async spansPrimaryKeyExistsLive(constraintName: string, schemaFilter: string): Promise<boolean> {
     const result = await this.client.oneOrNone<{ exists: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = lower($1) AND connamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2)) as exists`,
       [constraintName, schemaFilter],
@@ -994,7 +1413,7 @@ export class PgDB extends MastraBase {
    */
   private async addSpansPrimaryKey(): Promise<void> {
     const fullTableName = getTableName({ indexName: TABLE_SPANS, schemaName: getSchemaName(this.schemaName) });
-    const parsedSchemaName = this.schemaName ? parseSqlIdentifier(this.schemaName, 'schema name') : '';
+    const parsedSchemaName = this.schemaName ? schemaNamePrefix(this.schemaName) : '';
     const constraintName = buildConstraintName({
       baseName: 'mastra_ai_spans_traceid_spanid_pk',
       schemaName: parsedSchemaName || undefined,
@@ -1023,9 +1442,30 @@ export class PgDB extends MastraBase {
         ADD CONSTRAINT ${constraintName}
         PRIMARY KEY ("traceId", "spanId")
       `);
+      this.schemaSnapshot?.primaryKeyIndexes.add(constraintName.toLowerCase());
 
       this.logger?.info?.(`Added PRIMARY KEY constraint ${constraintName} to ${fullTableName}`);
     } catch (error) {
+      // Another process may have added the same constraint concurrently
+      // (TOCTOU between the EXISTS check and the ALTER TABLE). Treat the
+      // resulting duplicate-relation / duplicate-object error as success,
+      // but only after confirming the PRIMARY KEY is actually present.
+      // isDuplicateRelationError can also match on unrelated name collisions
+      // (e.g. a stale index with the same name), so the post-check prevents
+      // silently swallowing errors when the constraint is still missing.
+      //
+      // The confirm must hit the live catalog: in this path the init snapshot
+      // (if live) just said the constraint was ABSENT — that is why the ALTER
+      // ran — so re-asking it would deterministically contradict the
+      // concurrent creator and turn a benign race into a thrown error.
+      if (isDuplicateRelationError(error)) {
+        const confirmed = await this.spansPrimaryKeyExistsLive(constraintName, schemaFilter);
+        if (confirmed) {
+          this.schemaSnapshot?.primaryKeyIndexes.add(constraintName.toLowerCase());
+          this.logger?.debug?.(`PRIMARY KEY constraint ${constraintName} was created by another process`);
+          return;
+        }
+      }
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'ADD_SPANS_PRIMARY_KEY', 'FAILED'),
@@ -1143,6 +1583,11 @@ export class PgDB extends MastraBase {
     ifNotExists: string[];
   }): Promise<void> {
     const fullTableName = getTableName({ indexName: tableName, schemaName: getSchemaName(this.schemaName) });
+    const snapshot = this.schemaSnapshot;
+    // Every ALTER below is `ADD COLUMN IF NOT EXISTS`, so on a converged schema
+    // they are all no-ops the server still has to parse and acknowledge. When a
+    // snapshot is live, only issue the ones that will actually change something.
+    const knownColumns = snapshot ? this.snapshotColumns(snapshot, tableName) : null;
 
     try {
       for (const columnName of ifNotExists) {
@@ -1156,12 +1601,19 @@ export class PgDB extends MastraBase {
           const alterSql =
             `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${parsedColumnName}" ${sqlType} ${nullable} ${defaultValue}`.trim();
 
-          await this.client.none(alterSql);
+          if (!knownColumns?.has(parsedColumnName)) {
+            await this.client.none(alterSql);
+            knownColumns?.add(parsedColumnName);
+          }
 
           if (sqlType === 'TIMESTAMP') {
-            const timestampZSql =
-              `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${parsedColumnName}Z" TIMESTAMPTZ DEFAULT NOW()`.trim();
-            await this.client.none(timestampZSql);
+            const tzColumnName = `${parsedColumnName}Z`;
+            if (!knownColumns?.has(tzColumnName)) {
+              const timestampZSql =
+                `ALTER TABLE ${fullTableName} ADD COLUMN IF NOT EXISTS "${tzColumnName}" TIMESTAMPTZ DEFAULT NOW()`.trim();
+              await this.client.none(timestampZSql);
+              knownColumns?.add(tzColumnName);
+            }
           }
 
           this.logger?.debug?.(`Ensured column ${parsedColumnName} exists in table ${fullTableName}`);
@@ -1182,6 +1634,7 @@ export class PgDB extends MastraBase {
     } finally {
       // Invalidate cached columns after DDL completes so concurrent writers see the new schema
       this.tableColumnsCache.delete(tableName);
+      this.columnTypeCache.delete(tableName);
     }
   }
 
@@ -1227,9 +1680,7 @@ export class PgDB extends MastraBase {
   async batchInsert({ tableName, records }: { tableName: TABLE_NAMES; records: Record<string, any>[] }): Promise<void> {
     try {
       await this.client.tx(async tx => {
-        for (const record of records) {
-          await this.executeInsert(tx, { tableName, record });
-        }
+        await this.executeBatchInsert(tx, { tableName, records });
       });
     } catch (error) {
       throw new MastraError(
@@ -1267,6 +1718,7 @@ export class PgDB extends MastraBase {
     } finally {
       // Clear cached columns so subsequent createTable+insert sees the fresh schema
       this.tableColumnsCache.delete(tableName);
+      this.columnTypeCache.delete(tableName);
     }
   }
 
@@ -1291,15 +1743,20 @@ export class PgDB extends MastraBase {
         schemaName: getSchemaName(this.schemaName),
       });
 
-      const indexExists = await this.client.oneOrNone(
-        `SELECT 1 FROM pg_indexes
+      const snapshot = this.schemaSnapshot;
+      if (snapshot) {
+        if (snapshot.indexes.has(name)) return;
+      } else {
+        const indexExists = await this.client.oneOrNone(
+          `SELECT 1 FROM pg_indexes
          WHERE indexname = $1
          AND schemaname = $2`,
-        [name, schemaName],
-      );
+          [name, schemaName],
+        );
 
-      if (indexExists) {
-        return;
+        if (indexExists) {
+          return;
+        }
       }
 
       const uniqueStr = unique ? 'UNIQUE ' : '';
@@ -1336,6 +1793,7 @@ export class PgDB extends MastraBase {
       const sql = `CREATE ${uniqueStr}INDEX ${concurrentStr}${quotedIndexName} ON ${fullTableName} ${methodStr}(${columnsStr})${withStr}${tablespaceStr}${whereStr}`;
 
       await this.client.none(sql);
+      snapshot?.indexes.add(name);
     } catch (error) {
       if (error instanceof Error && error.message.includes('CONCURRENTLY')) {
         const retryOptions = { ...options, concurrent: false };
@@ -1357,23 +1815,46 @@ export class PgDB extends MastraBase {
     }
   }
 
+  /**
+   * Runs a caller-built `CREATE INDEX IF NOT EXISTS` statement, unless the init
+   * snapshot already proves `indexName` exists.
+   *
+   * `createIndex` covers the indexes described by {@link CreateIndexOptions};
+   * this is for the two init paths that hand-write their statement (a partial
+   * or otherwise non-standard index) and would otherwise send a no-op DDL on
+   * every warm init.
+   */
+  async createIndexFromStatement(indexName: string, sql: string): Promise<void> {
+    const snapshot = this.schemaSnapshot;
+    if (snapshot?.indexes.has(indexName)) return;
+
+    await this.client.none(sql);
+    snapshot?.indexes.add(indexName);
+  }
+
   async dropIndex(indexName: string): Promise<void> {
     try {
       const schemaName = this.schemaName || 'public';
-      const indexExists = await this.client.oneOrNone(
-        `SELECT 1 FROM pg_indexes
+      const snapshot = this.schemaSnapshot;
+      if (snapshot) {
+        if (!snapshot.indexes.has(indexName)) return;
+      } else {
+        const indexExists = await this.client.oneOrNone(
+          `SELECT 1 FROM pg_indexes
          WHERE indexname = $1
          AND schemaname = $2`,
-        [indexName, schemaName],
-      );
+          [indexName, schemaName],
+        );
 
-      if (!indexExists) {
-        return;
+        if (!indexExists) {
+          return;
+        }
       }
 
       const quotedIndexName = `"${parseSqlIdentifier(indexName, 'index name')}"`;
       const sql = `DROP INDEX IF EXISTS ${getSchemaName(this.schemaName)}.${quotedIndexName}`;
       await this.client.none(sql);
+      snapshot?.indexes.delete(indexName);
     } catch (error) {
       throw new MastraError(
         {

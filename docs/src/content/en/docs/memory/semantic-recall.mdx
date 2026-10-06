@@ -1,12 +1,13 @@
 ---
 title: "Semantic recall | Memory"
-description: "Learn how to use semantic recall in Mastra to retrieve relevant messages from past conversations using vector search and embeddings."
+description: "Retrieve relevant messages from past Mastra conversations with semantic recall, vector search, embeddings, metadata filters, and configurable storage."
 packages:
   - "@mastra/core"
   - "@mastra/fastembed"
   - "@mastra/libsql"
   - "@mastra/memory"
   - "@mastra/mongodb"
+  - "@mastra/oracledb"
   - "@mastra/pg"
 ---
 
@@ -27,9 +28,35 @@ Watch [Mastra semantic recall](https://www.youtube.com/watch?v=UVZtK8cK8xQ\&pp=y
 
 Semantic recall is RAG-based search that helps agents maintain context across longer interactions when messages are no longer within [recent message history](./message-history).
 
-It uses vector embeddings of messages for similarity search, integrates with various vector stores, and has configurable context windows around retrieved messages.
+It uses vector embeddings of messages for similarity search and integrates with vector stores, plus has configurable context windows around retrieved messages.
 
-![Diagram showing Mastra Memory semantic recall](/img/semantic-recall.png)
+```mermaid
+flowchart LR
+  accTitle: Semantic recall before and after an LLM request
+  accDescr: The pre-LLM pipeline embeds a user prompt and queries the vector database. The results become the semantic recall part of the context messages, which feed the context window. The post-LLM pipeline embeds all new messages and inserts them into the vector database.
+
+  subgraph pre["RAG pipeline pre-LLM"]
+    direction TB
+    prompt(( user prompt )) --> queryEmbedding([create embeddings<br/>from user prompt])
+    queryEmbedding --> query@{ shape: cyl, label: "query vector DB" }
+  end
+
+  subgraph context["context"]
+    direction BT
+    contextWindow([context window])
+    messages[context messages<br/><br/>system instruction<br/>working memory<br/><strong>semantic recall</strong><br/>conversation history<br/>new user message]
+    messages --> contextWindow
+  end
+
+  subgraph post["RAG pipeline post-LLM"]
+    direction TB
+    llm([LLM request]) --> messageEmbedding([create embeddings<br/>from all new messages])
+    messageEmbedding --> insert@{ shape: cyl, label: "insert in<br/>vector DB" }
+  end
+
+  pre -- results --> context
+  context --> post
+```
 
 When it's enabled, new messages are used to query a vector DB for semantically similar messages.
 
@@ -37,7 +64,7 @@ After getting a response from the LLM, all new messages (user, assistant, and to
 
 ## Quickstart
 
-Semantic recall is disabled by default. To enable it, set `semanticRecall: true` in `options` and provide a `vector` store and `embedder`:
+Semantic recall is disabled by default. To enable it, set `semanticRecall: true` in `options` and provide a `vector` store and an `embedder`. A store that generates embeddings itself, such as MongoDB with Automated Embedding, works without one. See [Server-side embeddings](#server-side-embeddings).
 
 <Tabs>
   <TabItem value="libsql" label="LibSQL" default>
@@ -167,6 +194,7 @@ Each vector store page below includes installation instructions, configuration p
 - [libSQL](/reference/vectors/libsql)
 - [MongoDB](/reference/vectors/mongodb)
 - [OpenSearch](/reference/vectors/opensearch)
+- [OracleDB](/reference/vectors/oracledb)
 - [Pinecone](/reference/vectors/pinecone)
 - [PostgreSQL](/reference/vectors/pg)
 - [Qdrant](/reference/vectors/qdrant)
@@ -201,7 +229,7 @@ const agent = new Agent({
 
 :::note
 
-`scope: 'resource'` is supported by the LibSQL, PostgreSQL, MongoDB, and Upstash storage adapters.
+`scope: 'resource'` is supported by the LibSQL, OracleDB, PostgreSQL, MongoDB, and Upstash storage adapters.
 
 :::
 
@@ -264,6 +292,40 @@ const options = {
 }
 ```
 
+## Server-side embeddings
+
+Some vector stores generate the embeddings themselves. With one of those, semantic recall runs without an `embedder`: the database embeds each message on write and the search string on arrival. The embedding provider stays out of your application entirely.
+
+MongoDB does this through [Automated Embedding](/reference/vectors/mongodb): name a Voyage AI model on the vector store and leave the `embedder` out.
+
+```typescript title="src/mastra/agents/index.ts"
+import { Memory } from '@mastra/memory'
+import { MongoDBStore, MongoDBVector } from '@mastra/mongodb'
+
+const memory = new Memory({
+  storage: new MongoDBStore({
+    id: 'agent-storage',
+    uri: process.env.MONGODB_URI,
+    dbName: process.env.MONGODB_DB_NAME,
+  }),
+  vector: new MongoDBVector({
+    id: 'agent-vector',
+    uri: process.env.MONGODB_URI,
+    dbName: process.env.MONGODB_DB_NAME,
+    autoEmbed: { model: 'voyage-4' },
+  }),
+  options: {
+    semanticRecall: { topK: 3, messageRange: 2 },
+  },
+})
+```
+
+Messages are stored as text and MongoDB embeds them, so the model choice and the vector size belong to the index rather than to your application. Recall works the same way through an agent and through [`recall()`](#using-the-recall-method).
+
+MongoDB embeds newly written messages in the background. A message saved moments ago may not be recallable immediately.
+
+Every other store expects your application to supply the vectors, and keeps requiring an `embedder`. Enabling semantic recall with neither an `embedder` nor a store that embeds server-side raises an error naming both options.
+
 ## Embedder configuration
 
 Semantic recall relies on an [embedding model](/reference/memory/memory-class) to convert messages into embeddings. Mastra supports embedding models through the model router using `provider/model` strings, or you can use any [embedding model](https://sdk.vercel.ai/docs/ai-sdk-core/embeddings) compatible with the AI SDK.
@@ -292,7 +354,7 @@ Supported embedding models:
 
 - **OpenAI**: `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`
 - **Google**: `gemini-embedding-001`
-- **OpenRouter**: Access embedding models from various providers
+- **OpenRouter**: Access embedding models from multiple providers
 
 ```ts {7}
 import { Agent } from '@mastra/core/agent'
@@ -351,6 +413,25 @@ const agent = new Agent({
   }),
 })
 ```
+
+FastEmbed also exposes the multilingual E5 model for non-English content. E5 is asymmetric, so it's exposed as two models: `multilingualE5LargePassage` for text you index and `multilingualE5LargeQuery` for search text.
+
+```ts {3,7}
+import { Memory } from '@mastra/memory'
+import { Agent } from '@mastra/core/agent'
+import { fastembed } from '@mastra/fastembed'
+
+const agent = new Agent({
+  id: 'agent',
+  memory: new Memory({
+    embedder: fastembed.multilingualE5LargePassage,
+  }),
+})
+```
+
+Memory uses a single embedder for both storing and recalling messages, so pick one of the two models and use it consistently. Use the paired `multilingualE5LargeQuery` model only where you control both sides of the pipeline, such as a RAG workflow that indexes with the passage model and searches with the query model.
+
+Multilingual E5 produces 1024-dimensional vectors. Your vector index must be created with matching dimensions, and E5 vectors can't be mixed with vectors from another embedder in the same index.
 
 ## PostgreSQL index optimization
 

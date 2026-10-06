@@ -1,0 +1,368 @@
+---
+title: "Mesa | File Storage"
+description: "Store versioned Mastra workspace files in Mesa repositories with standard file operations, commits, branches, diffs, history, and repository status."
+packages:
+  - "@mastra/mesa"
+---
+
+# Mesa
+
+Stores workspace files in [Mesa](https://docs.mesa.dev/content/getting-started/introduction) repos through the standard Mastra `WorkspaceFilesystem` interface.
+
+Use `MesaFilesystem` when agents need versioned file storage. For a local directory, use [`LocalFilesystem`](/reference/workspace/local-filesystem). For object storage, use [`S3Filesystem`](/integrations/file-storage/amazon-s3), [`GCSFilesystem`](/integrations/file-storage/google-cloud-storage), or [`AzureBlobFilesystem`](/integrations/file-storage/azure-blob).
+
+:::note
+
+`MesaFilesystem` runs in the Mastra process.
+
+[Mesa's POSIX mount](https://docs.mesa.dev/content/mesafs/posix-mount) (for using a Mesa filesystem within a sandbox) isn't yet part of the `@mastra/mesa` package. Support is coming soon.
+
+:::
+
+## Installation
+
+```bash npm2yarn
+npm install @mastra/mesa
+```
+
+## Usage example
+
+Mount one Mesa repo and pass the filesystem to a workspace:
+
+```typescript title="src/mastra/workspace.ts"
+import { Agent } from '@mastra/core/agent'
+import { Workspace } from '@mastra/core/workspace'
+import { MesaFilesystem, repo } from '@mastra/mesa'
+
+const workspace = new Workspace({
+  filesystem: new MesaFilesystem({
+    privateKey: process.env.MESA_PRIVATE_KEY,
+    authors: [{ name: 'File Agent', email: 'agent@example.com' }],
+    layout: {
+      '/docs': repo('docs', { mode: 'rw', at: { bookmark: 'main' } }),
+    },
+  }),
+})
+
+const agent = new Agent({
+  id: 'file-agent',
+  name: 'file-agent',
+  model: '__GATEWAY_ANTHROPIC_MODEL_OPUS__',
+  workspace,
+})
+```
+
+`privateKey` falls back to `MESA_PRIVATE_KEY` when omitted. The layout uses `repo()`, re-exported from the [Mesa SDK](https://docs.mesa.dev/content/getting-started/introduction), to declare which repos to mount and where.
+
+## Constructor parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'privateKey',
+    type: 'string',
+    description: 'Mesa private key. Falls back to `MESA_PRIVATE_KEY` when omitted.',
+    isOptional: true,
+  },
+  {
+    name: 'authors',
+    type: '[Author, ...Author[]]',
+    description: 'Commit authors attributed to writes made through this filesystem.',
+  },
+  {
+    name: 'layout',
+    type: 'Layout',
+    description: 'Mesa mount layout mapping absolute paths to repos, built with `repo()`.',
+  },
+  {
+    name: 'cache',
+    type: '{ diskCache?: { path: string; maxSizeBytes?: number } }',
+    description: 'Mesa filesystem cache configuration.',
+    isOptional: true,
+  },
+  {
+    name: 'ttl',
+    type: 'number',
+    description: 'Mesa mount token lifetime in seconds.',
+    isOptional: true,
+  },
+  {
+    name: 'readOnly',
+    type: 'boolean',
+    description: 'Mount every repo in the layout as read-only.',
+    isOptional: true,
+    defaultValue: 'false',
+  },
+]}
+/>
+
+## Properties
+
+<PropertiesTable
+  content={[
+  {
+    name: 'id',
+    type: 'string',
+    description: 'Filesystem instance identifier.',
+  },
+  {
+    name: 'name',
+    type: 'string',
+    description: "Provider name (`'MesaFilesystem'`).",
+  },
+  {
+    name: 'provider',
+    type: 'string',
+    description: "Provider identifier (`'mesa'`).",
+  },
+  {
+    name: 'readOnly',
+    type: 'boolean | undefined',
+    description: 'Whether write operations are blocked.',
+  },
+  {
+    name: 'client',
+    type: 'Mesa | undefined',
+    description: 'Mesa SDK client created by this provider. Undefined before initialization.',
+  },
+  {
+    name: 'filesystem',
+    type: 'MesaFileSystem',
+    description: 'Active Mesa filesystem. Access this after initialization when you need the raw Mesa SDK filesystem.',
+  },
+  {
+    name: 'change',
+    type: 'MesaFileSystem["change"]',
+    description: 'Mesa change management operations for the mounted filesystem.',
+  },
+  {
+    name: 'bookmark',
+    type: 'MesaFileSystem["bookmark"]',
+    description: 'Mesa bookmark management operations for the mounted filesystem.',
+  },
+]}
+/>
+
+## Methods
+
+`MesaFilesystem` implements the [WorkspaceFilesystem interface](/reference/workspace/filesystem).
+
+### File operations
+
+#### `readFile(path, options?)`
+
+Reads a file from Mesa.
+
+```typescript
+const content = await filesystem.readFile('/docs/README.md', {
+  encoding: 'utf-8',
+})
+```
+
+Returns: `Promise<string | Buffer>`
+
+#### `writeFile(path, content, options?)`
+
+Writes a file to Mesa.
+
+```typescript
+await filesystem.writeFile('/docs/report.md', '# Report')
+```
+
+Returns: `Promise<void>`
+
+#### `appendFile(path, content)`
+
+Appends content to a file.
+
+```typescript
+await filesystem.appendFile('/docs/log.txt', 'new line\n')
+```
+
+Returns: `Promise<void>`
+
+#### `deleteFile(path, options?)`
+
+Deletes a file.
+
+```typescript
+await filesystem.deleteFile('/docs/old-report.md')
+```
+
+Returns: `Promise<void>`
+
+#### `copyFile(src, dest, options?)`
+
+Copies a file.
+
+```typescript
+await filesystem.copyFile('/docs/report.md', '/docs/archive/report.md')
+```
+
+Returns: `Promise<void>`
+
+#### `moveFile(src, dest, options?)`
+
+Moves or renames a file.
+
+```typescript
+await filesystem.moveFile('/docs/draft.md', '/docs/final.md')
+```
+
+Returns: `Promise<void>`
+
+### Directory operations
+
+#### `mkdir(path, options?)`
+
+Creates a directory.
+
+```typescript
+await filesystem.mkdir('/docs/reports', { recursive: true })
+```
+
+Returns: `Promise<void>`
+
+#### `rmdir(path, options?)`
+
+Removes a directory.
+
+```typescript
+await filesystem.rmdir('/docs/reports', { recursive: true })
+```
+
+Returns: `Promise<void>`
+
+#### `readdir(path, options?)`
+
+Lists directory entries.
+
+```typescript
+const entries = await filesystem.readdir('/docs', {
+  recursive: true,
+  extension: '.md',
+})
+```
+
+Returns: `Promise<FileEntry[]>`
+
+### Path operations
+
+#### `exists(path)`
+
+Checks whether a path exists.
+
+```typescript
+const exists = await filesystem.exists('/docs/README.md')
+```
+
+Returns: `Promise<boolean>`
+
+#### `stat(path)`
+
+Returns file or directory metadata.
+
+```typescript
+const stat = await filesystem.stat('/docs/README.md')
+```
+
+Returns: `Promise<FileStat>`
+
+#### `realpath(path)`
+
+Returns the canonical path from Mesa.
+
+```typescript
+const realPath = await filesystem.realpath('/docs/README.md')
+```
+
+Returns: `Promise<string>`
+
+### Mesa operations
+
+#### `bash(options?)`
+
+Creates a Mesa-backed Bash runtime for this filesystem.
+
+```typescript
+const bash = await filesystem.bash({
+  cwd: '/docs',
+})
+```
+
+Returns: `Promise<Bash>`
+
+## Path semantics
+
+Methods expect absolute paths. For `MesaFilesystem`, paths are rooted at the Mesa mount and start with a path from the layout:
+
+```typescript
+await filesystem.readFile('/docs/README.md')
+```
+
+Don't omit the leading slash:
+
+```typescript
+await filesystem.readFile('docs/README.md') // Incorrect
+await filesystem.readFile('/docs/README.md') // Correct
+```
+
+When you mount multiple repos, each repo is available under its layout path:
+
+```typescript
+const filesystem = new MesaFilesystem({
+  authors: [{ name: 'File Agent' }],
+  layout: {
+    '/docs': repo('docs', { mode: 'rw', at: { bookmark: 'main' } }),
+    '/website': repo('website', { mode: 'rw', at: { bookmark: 'main' } }),
+  },
+})
+
+await filesystem.readFile('/docs/README.md')
+await filesystem.readFile('/website/package.json')
+```
+
+## Mesa versioning APIs
+
+Access the underlying Mesa filesystem for Mesa-specific change and bookmark operations:
+
+```typescript
+await filesystem.writeFile('/docs/draft.md', 'Draft')
+
+const current = await filesystem.change.current({
+  repo: 'docs',
+})
+
+await filesystem.bookmark.move({
+  repo: 'docs',
+  name: 'main',
+  changeId: current.changeId,
+})
+```
+
+More details on versioning semantics can be found in [Mesa's docs](https://docs.mesa.dev/content/concepts/versioning).
+
+## Read-only mode
+
+Set `readOnly: true` to mount every repo in the layout read-only and block write operations through Mastra:
+
+```typescript
+const filesystem = new MesaFilesystem({
+  authors: [{ name: 'File Agent' }],
+  layout: { '/docs': repo('docs', { mode: 'ro', at: { bookmark: 'main' } }) },
+  readOnly: true,
+})
+```
+
+Read operations still work. Write operations throw `WorkspaceReadOnlyError`.
+
+## Concurrency
+
+`overwrite: false` and `expectedMtime` use preflight checks before writing. These checks aren't atomic unless Mesa adds native conditional writes for app mounts.
+
+## Related
+
+- [WorkspaceFilesystem interface](/reference/workspace/filesystem)
+- [Filesystem docs](/docs/sandbox/filesystem)
+- [Sandbox](/docs/sandbox/overview)
+- [Mesa documentation](https://docs.mesa.dev/content/getting-started/introduction)

@@ -76,6 +76,14 @@ describe('components/* subpath exports', () => {
     expect(mod.ComposerActions).toBeDefined();
   });
 
+  it('Comment entry exports its compound components', async () => {
+    const mod = await import('./ds/components/Comment');
+    expect(mod.Comment).toBeDefined();
+    expect(mod.CommentList).toBeDefined();
+    expect(mod.CommentItem).toBeDefined();
+    expect(mod.CommentComposer).toBeDefined();
+  });
+
   it('AI plan entry exports Plan', async () => {
     const mod = await import('./ds/components/ai/plan');
     expect(mod.Plan).toBeDefined();
@@ -89,5 +97,15 @@ describe('components/* subpath exports', () => {
   it('AI task-list entry exports TaskList', async () => {
     const mod = await import('./ds/components/ai/task-list');
     expect(mod.TaskList).toBeDefined();
+  });
+
+  it('AI activity entry exports its compound components', async () => {
+    const mod = await import('./ds/components/ai/activity');
+    expect(mod.Activity).toBeDefined();
+    expect(mod.ActivityItem).toBeDefined();
+    expect(mod.ActivityTrigger).toBeDefined();
+    expect(mod.ActivityHeader).toBeDefined();
+    expect(mod.ActivityContent).toBeDefined();
+    expect(mod.ActivityDisclosure).toBeDefined();
   });
 });

@@ -1,22 +1,22 @@
 import { LogoWithoutText } from '@mastra/playground-ui/components/Logo';
-import { MainSidebar, useMainSidebar } from '@mastra/playground-ui/components/MainSidebar';
-import type { NavLink } from '@mastra/playground-ui/components/MainSidebar';
+import { Sidebar, useSidebar } from '@mastra/playground-ui/components/Sidebar';
+import type { SidebarLink } from '@mastra/playground-ui/components/Sidebar';
 import { useKeyboardShortcutLabel } from '@mastra/playground-ui/hooks/use-keyboard-shortcut-label';
-import { cn } from '@mastra/playground-ui/utils/cn';
+import { useAuthCapabilities, isAuthenticated } from '@mastra/react/hooks/auth';
+import { useMCPServers } from '@mastra/react/hooks/mcps';
+import { useWorkspaces } from '@mastra/react/hooks/workspace';
 import { Search, Wrench } from 'lucide-react';
 import { useLocation } from 'react-router';
 import { useAgentBuilderSidebarVisibility } from '@/domains/agent-builder/hooks/use-agent-builder-sidebar-visibility';
 import { AuthStatus } from '@/domains/auth/components/auth-status';
 import { ImpersonationBanner } from '@/domains/auth/components/impersonation-banner';
-import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
 import { getPermissionForRoute, hasRoutePermission } from '@/domains/auth/route-permissions';
-import { isAuthenticated } from '@/domains/auth/types';
 import { useIsCmsAvailable } from '@/domains/cms/hooks/use-is-cms-available';
 import { MastraVersionFooter } from '@/domains/configuration/components/mastra-version-footer';
 import { useNavigationCommand } from '@/lib/command';
-import { useLinkComponent } from '@/lib/framework';
 import { useMastraPlatform } from '@/lib/mastra-platform/hooks/use-mastra-platform';
+import { getIsLinkActive } from '@/lib/nav/get-is-link-active';
 import { bottomNav, mainNav } from '@/lib/nav/nav-items';
 import type { NavItem } from '@/lib/nav/nav-items';
 
@@ -27,21 +27,13 @@ declare global {
   }
 }
 
-function toSidebarLink(item: NavItem): NavLink {
+function toSidebarLink(item: NavItem): SidebarLink {
   const { Icon } = item;
   return { name: item.name, url: item.url, icon: <Icon /> };
 }
 
-function getIsLinkActive(item: NavItem, pathname: string): boolean {
-  // Exact match or sub-path match (with / boundary so sibling routes don't match by prefix)
-  const matches = (url: string) => pathname === url || pathname.startsWith(url + '/');
-  if (matches(item.url)) return true;
-  return item.activePaths?.some(matches) ?? false;
-}
-
 export function AppSidebar() {
-  const { Link } = useLinkComponent();
-  const { state, isMobile, setOpenMobile } = useMainSidebar();
+  const { state, isMobile, setOpenMobile } = useSidebar();
   const { setOpen: setNavigationCommandOpen } = useNavigationCommand({ enableShortcut: false });
   const commandShortcutLabel = useKeyboardShortcutLabel('K');
 
@@ -67,16 +59,8 @@ export function AppSidebar() {
     if (item.hidden) return false;
     if (cmsOnlyLinks.has(item.url) && !isCmsAvailable && !isCmsLoading) return false;
     if (isMastraPlatform && !item.isOnMastraPlatform) return false;
-    // While the user's permissions are still loading, hide permission-gated
-    // links. Being permissive here would briefly flash links the user may not
-    // be allowed to see. We can't yet know rbacEnabled/isAuthenticated during
-    // this window (auth capabilities are still resolving), so we gate purely on
-    // the loading state and only reveal a link once permissions have resolved.
-    // The authoritative permission patterns are already loaded and validated by
-    // RoutePermissionsGate before the sidebar renders.
     if (isPermissionsLoading) {
       const pending = getPermissionForRoute(item.url);
-      // Public/unknown routes have no permission requirement — keep showing them.
       if (pending && pending !== 'public') return false;
     }
     const requiredPermission = getPermissionForRoute(item.url);
@@ -86,153 +70,88 @@ export function AppSidebar() {
     return true;
   };
 
+  const { data: mcpServers } = useMCPServers();
+  const { data: workspaces } = useWorkspaces();
   const filteredBottom = bottomNav.filter(filterItem);
+  const sections = mainNav.map(section => {
+    const items = section.items.filter(filterItem);
+    const linkForItem = (item: NavItem) => ({
+      ...toSidebarLink(item),
+      isActive: getIsLinkActive(item, pathname, items),
+    });
+    return {
+      key: section.key,
+      title: section.title,
+      href: section.href,
+      isHeaderActive: !!(
+        section.href &&
+        pathname === section.href &&
+        !items.some(item => getIsLinkActive(item, pathname, items))
+      ),
+      links: items.filter(item => !item.foldable).map(linkForItem),
+      moreLinks: items
+        .filter(item => item.foldable)
+        .map(item => ({
+          ...linkForItem(item),
+          defaultVisible:
+            (item.url === '/mcps' && !!mcpServers?.length) ||
+            (item.url === '/workspaces' && !!workspaces?.workspaces.length),
+        })),
+    };
+  });
 
   return (
-    <MainSidebar>
-      <div className="pt-2 mb-2">
-        {state === 'collapsed' ? (
-          <div className="flex flex-col gap-2 items-center">
-            <div className="relative grid place-items-center size-9">
-              <LogoWithoutText
-                className={cn(
-                  'h-[1.5rem] w-[1.5rem] shrink-0 transition-opacity duration-150',
-                  !isMobile && 'group-hover/sidebar:opacity-0',
-                )}
-              />
-              {!isMobile && (
-                <div className="absolute inset-0 opacity-0 transition-opacity duration-150 group-hover/sidebar:opacity-100">
-                  <MainSidebar.Trigger />
-                </div>
-              )}
-            </div>
-            {isUserAuthenticated && <AuthStatus />}
-          </div>
-        ) : isUserAuthenticated ? (
-          <span className="flex items-center justify-between pl-3 pr-2">
-            <span className="flex items-center gap-2 flex-1 min-w-0">
-              <LogoWithoutText className="h-[1.5rem] w-[1.5rem] shrink-0" />
-              <span className="font-display text-sm font-semibold tracking-tight whitespace-nowrap truncate">
-                Mastra Studio
-              </span>
-              {!isMobile && <MainSidebar.Trigger />}
-            </span>
-            <AuthStatus />
-          </span>
-        ) : (
-          <span className="flex items-center gap-2 pl-3 pr-2">
-            <LogoWithoutText className="h-[1.5rem] w-[1.5rem] shrink-0" />
-            <span className="font-display text-sm font-semibold tracking-tight whitespace-nowrap truncate">
-              Mastra Studio
-            </span>
-            {!isMobile && <MainSidebar.Trigger />}
-          </span>
+    <Sidebar aria-label="Sidebar">
+      <Sidebar.CommandHeader>
+        <Sidebar.Brand logo={<LogoWithoutText className="size-6" />} title="Mastra Studio" />
+        {isUserAuthenticated && <AuthStatus />}
+        {!isMobile && (
+          <Sidebar.SearchTrigger
+            aria-label="Search and navigate"
+            shortcut={commandShortcutLabel}
+            onClick={openNavigationCommand}
+          >
+            <Search />
+          </Sidebar.SearchTrigger>
         )}
-      </div>
-
-      {!isMobile && (
-        <div className="mb-2">
-          <MainSidebar.NavList>
-            <MainSidebar.NavLink
-              asChild
-              state={state}
-              link={{
-                name: 'Search',
-                url: '#',
-                icon: <Search />,
-              }}
-            >
-              <button
-                type="button"
-                onClick={openNavigationCommand}
-                aria-label="Search and navigate"
-                className="border border-border1 bg-surface3 text-neutral5 hover:bg-surface4 hover:text-neutral6 active:bg-surface5 [&_svg]:text-neutral4 [&:hover_svg]:text-neutral5"
-              >
-                <Search />
-                <MainSidebar.NavLabel state={state}>Search</MainSidebar.NavLabel>
-                {state !== 'collapsed' && (
-                  <kbd
-                    aria-hidden="true"
-                    className="ml-auto rounded border border-border1 bg-surface4 px-1.5 py-0.5 font-mono text-[10px] leading-none text-neutral3"
-                  >
-                    {commandShortcutLabel}
-                  </kbd>
-                )}
-              </button>
-            </MainSidebar.NavLink>
-          </MainSidebar.NavList>
-        </div>
-      )}
+      </Sidebar.CommandHeader>
 
       {isAgentBuilderVisible && (
-        <div className="mb-1">
-          <MainSidebar.NavList>
-            <MainSidebar.NavLink
-              LinkComponent={Link}
-              state={state}
-              link={{
-                name: 'Agent Builder',
-                url: '/agent-builder',
-                icon: <Wrench />,
-              }}
-              isActive={isAgentBuilderActive}
-            />
-          </MainSidebar.NavList>
-        </div>
+        <Sidebar.NavList className="mb-1">
+          <Sidebar.NavLink
+            state={state}
+            link={{
+              name: 'Agent Builder',
+              url: '/agent-builder',
+              icon: <Wrench />,
+            }}
+            isActive={isAgentBuilderActive}
+          />
+        </Sidebar.NavList>
       )}
 
       <ImpersonationBanner />
 
-      <MainSidebar.Nav>
-        {mainNav.map(section => {
-          const filtered = section.items.filter(filterItem);
-          const anySubActive = filtered.some(item => getIsLinkActive(item, pathname));
-          const isHeaderActive = !!(section.href && pathname === section.href && !anySubActive);
+      <Sidebar.Nav>
+        <Sidebar.Sections sections={sections} visibilityStorageKey="mastra:studio:sidebar-visibility" />
+      </Sidebar.Nav>
 
-          return (
-            <MainSidebar.NavSection key={section.key}>
-              {section.title ? (
-                <MainSidebar.NavHeader LinkComponent={Link} state={state} href={section.href} isActive={isHeaderActive}>
-                  {section.title}
-                </MainSidebar.NavHeader>
-              ) : null}
-              <MainSidebar.NavList>
-                {filtered.map(item => (
-                  <MainSidebar.NavLink
-                    key={item.name}
-                    LinkComponent={Link}
-                    state={state}
-                    link={toSidebarLink(item)}
-                    isActive={getIsLinkActive(item, pathname)}
-                  />
-                ))}
-              </MainSidebar.NavList>
-            </MainSidebar.NavSection>
-          );
-        })}
-      </MainSidebar.Nav>
-
-      <MainSidebar.Bottom className="pb-3">
+      <Sidebar.Footer>
         {filteredBottom.length > 0 && (
-          <MainSidebar.NavList>
+          <Sidebar.NavList>
             {filteredBottom.map(item => (
-              <MainSidebar.NavLink
+              <Sidebar.NavLink
                 key={item.name}
-                LinkComponent={Link}
                 state={state}
                 link={toSidebarLink(item)}
                 isActive={getIsLinkActive(item, pathname)}
               />
             ))}
-          </MainSidebar.NavList>
+          </Sidebar.NavList>
         )}
-        {state !== 'collapsed' && (
-          <>
-            <hr className="mx-6 my-2 h-px border-0 bg-border1" />
-            <MastraVersionFooter collapsed={false} />
-          </>
-        )}
-      </MainSidebar.Bottom>
-    </MainSidebar>
+        <MastraVersionFooter collapsed={state === 'collapsed'} />
+        <Sidebar.FooterMeta action={<Sidebar.Trigger />} />
+      </Sidebar.Footer>
+    </Sidebar>
   );
 }

@@ -2,11 +2,19 @@ import type { ComponentPropsWithoutRef } from 'react';
 import { forwardRef } from 'react';
 
 import { ScrollArea } from '../ScrollArea';
+import { useComposerPointer } from './use-composer-pointer';
 import { cn } from '@/lib/utils';
 
+import './composer.css';
+import './composer-ring.css';
 import './composer-sending.css';
 
 export type ComposerProps = ComponentPropsWithoutRef<'form'>;
+
+export interface ComposerInputProps extends ComponentPropsWithoutRef<'textarea'> {
+  variant?: 'inline' | 'textarea';
+  maxHeight?: string;
+}
 
 export const Composer = forwardRef<HTMLFormElement, ComposerProps>(({ children, ...props }, ref) => (
   <form ref={ref} data-slot="composer" {...props}>
@@ -25,7 +33,7 @@ export const ComposerBox = forwardRef<HTMLDivElement, ComposerBoxProps>(
       ref={ref}
       data-slot="composer-box"
       className={cn(
-        'duration-normal @container relative mx-auto mt-auto w-full max-w-3xl overflow-hidden rounded-[22px] border border-border2/40 bg-surface3 transition-colors focus-within:border-border2',
+        'composer-box @container relative mx-auto mt-auto w-full max-w-3xl overflow-hidden rounded-[22px] border border-border transition-colors duration-normal focus-within:border-border-strong',
         className,
       )}
       {...props}
@@ -36,6 +44,45 @@ export const ComposerBox = forwardRef<HTMLDivElement, ComposerBoxProps>(
   ),
 );
 ComposerBox.displayName = 'ComposerBox';
+
+export type ComposerTone = 'default' | 'green' | 'purple' | 'orange';
+
+export interface ComposerRingProps extends ComponentPropsWithoutRef<'div'> {
+  busy?: boolean;
+  tone?: ComposerTone;
+}
+
+export const ComposerRing = ({
+  busy = false,
+  tone = 'green',
+  className,
+  style,
+  onPointerEnter,
+  onPointerMove,
+  ...props
+}: ComposerRingProps) => {
+  const { trackPointer, pointerStyle } = useComposerPointer(!busy);
+
+  return (
+    <div
+      data-slot="composer-ring"
+      data-composer-tone={tone}
+      data-busy={busy ? 'true' : 'false'}
+      className={cn('composer-ring relative mx-auto w-full max-w-3xl rounded-[23px] p-px', className)}
+      style={{ ...pointerStyle, ...style }}
+      onPointerEnter={event => {
+        onPointerEnter?.(event);
+        trackPointer(event);
+      }}
+      onPointerMove={event => {
+        onPointerMove?.(event);
+        trackPointer(event);
+      }}
+      {...props}
+    />
+  );
+};
+ComposerRing.displayName = 'ComposerRing';
 
 export const ComposerAttachments = forwardRef<HTMLDivElement, ComponentPropsWithoutRef<'div'>>(
   ({ className, ...props }, ref) => (
@@ -50,14 +97,15 @@ export const ComposerAttachments = forwardRef<HTMLDivElement, ComponentPropsWith
 );
 ComposerAttachments.displayName = 'ComposerAttachments';
 
-export const ComposerInput = forwardRef<HTMLTextAreaElement, ComponentPropsWithoutRef<'textarea'>>(
-  ({ className, ...props }, ref) => (
-    <ScrollArea maxHeight="212px">
+export const ComposerInput = forwardRef<HTMLTextAreaElement, ComposerInputProps>(
+  ({ className, variant = 'inline', maxHeight, ...props }, ref) => (
+    <ScrollArea maxHeight={maxHeight ?? (variant === 'textarea' ? '16rem' : '13rem')}>
       <textarea
         ref={ref}
         data-slot="composer-input"
         className={cn(
-          'min-h-17 field-sizing-content w-full resize-none bg-transparent px-3 pt-3 pb-2 text-ui-lg leading-ui-lg text-neutral6 outline-hidden placeholder:text-neutral3 focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50',
+          'field-sizing-content w-full resize-none overflow-hidden bg-transparent px-3 pt-2.5 pb-2 text-body text-muted-foreground outline-hidden placeholder:text-placeholder focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50',
+          variant === 'textarea' ? 'min-h-28' : 'min-h-10',
           className,
         )}
         {...props}
@@ -73,7 +121,7 @@ export const ComposerActions = forwardRef<HTMLDivElement, ComponentPropsWithoutR
       ref={ref}
       role="region"
       data-slot="composer-actions"
-      className={cn('flex flex-wrap-reverse items-center justify-between gap-2 px-1.5 pb-1.5', className)}
+      className={cn('flex w-full flex-wrap items-end justify-between gap-2 px-3 pb-3', className)}
       {...props}
     />
   ),
@@ -82,10 +130,10 @@ ComposerActions.displayName = 'ComposerActions';
 
 const ComposerGradientColumn = ({ className }: { className?: string }) => (
   <div className={cn('flex size-full flex-col -space-y-3', className)}>
-    <div className="w-full flex-1 bg-accent1 blur-xl" />
-    <div className="w-full flex-1 bg-accent1Dark blur-xl" />
-    <div className="w-full flex-1 bg-accent1 blur-xl" />
-    <div className="w-full flex-1 bg-accent1Darker blur-xl" />
+    <div className="w-full flex-1 bg-brand-green blur-xl" />
+    <div className="w-full flex-1 bg-product-observability blur-xl" />
+    <div className="w-full flex-1 bg-brand-green blur-xl" />
+    <div className="w-full flex-1 bg-product-observability blur-xl" />
   </div>
 );
 
@@ -105,3 +153,11 @@ const ComposerSendingPulse = ({ pulseKey }: { pulseKey: number }) => {
     </div>
   );
 };
+
+export interface ComposerToneLabelProps extends ComponentPropsWithoutRef<'span'> {
+  tone: ComposerTone;
+}
+
+export function ComposerToneLabel({ tone, className, ...props }: ComposerToneLabelProps) {
+  return <span data-composer-tone={tone} className={cn('composer-tone-label', className)} {...props} />;
+}

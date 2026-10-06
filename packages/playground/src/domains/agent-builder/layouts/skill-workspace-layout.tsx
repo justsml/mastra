@@ -1,4 +1,8 @@
 import { Button } from '@mastra/playground-ui/components/Button';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { raisedSurfaceStyle } from '@mastra/playground-ui/primitives/raised-surface';
+import { controlStateColorTransition } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
 import { cn } from '@mastra/playground-ui/utils/cn';
 import { ArrowLeftIcon } from 'lucide-react';
 import { useState } from 'react';
@@ -40,7 +44,7 @@ export const SkillWorkspaceLayout = ({
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* Header */}
-      <div className="flex min-w-0 items-center gap-2 bg-surface1 px-3 py-2 md:px-6 md:py-3">
+      <div className="flex min-w-0 items-center gap-2 bg-sidebar px-3 py-2 md:px-4 md:py-2">
         <Button
           size="icon-sm"
           variant="ghost"
@@ -52,7 +56,9 @@ export const SkillWorkspaceLayout = ({
           <ArrowLeftIcon />
         </Button>
         <div className="flex min-w-0 flex-1 items-center gap-3">
-          <div className="min-w-0 truncate text-ui-md text-neutral6">{title}</div>
+          <Txt as="p" variant="body" tone="ink" className="min-w-0 truncate">
+            {title}
+          </Txt>
           {rightAside && <div className="shrink-0">{rightAside}</div>}
         </div>
         {primaryAction && <div className="shrink-0">{primaryAction}</div>}
@@ -62,16 +68,19 @@ export const SkillWorkspaceLayout = ({
       {/* Mobile tabs — only when there's a configure side to switch to.
        *  Mirrors the agent-builder pill-style segmented switch for visual parity. */}
       {showForm && (
-        <div className="md:hidden px-4 pt-4 pb-2">
+        <div className="px-4 pt-4 pb-2 md:hidden">
           <div
             role="tablist"
             aria-label="Workspace view"
-            className="relative mx-auto flex h-9 w-full max-w-sm items-center rounded-full border border-border1 bg-surface3 p-0.5"
+            className={cn(
+              raisedSurfaceStyle,
+              'relative mx-auto flex h-control-lg w-full max-w-sm items-center rounded-full p-0.5',
+            )}
           >
             <span
               aria-hidden="true"
               className={cn(
-                'absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-surface4',
+                'absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-fill-hover',
                 'transition-transform duration-200 ease-out',
                 activeTab === 'configure' && 'translate-x-full',
               )}
@@ -83,12 +92,15 @@ export const SkillWorkspaceLayout = ({
               data-testid="skill-edit-tab-chat"
               onClick={() => setActiveTab('chat')}
               className={cn(
-                'relative z-10 flex-1 rounded-full text-ui-md font-medium outline-none',
-                'transition-colors duration-200',
-                activeTab === 'chat' ? 'text-neutral5' : 'text-neutral3 hover:text-neutral4',
+                'text-foreground',
+                'relative z-10 flex-1 rounded-full outline-none',
+                controlStateColorTransition,
+                activeTab === 'chat' ? '' : quietTextHover,
               )}
             >
-              Chat
+              <Txt as="span" variant="subheading" className="block">
+                Chat
+              </Txt>
             </button>
             <button
               type="button"
@@ -97,12 +109,15 @@ export const SkillWorkspaceLayout = ({
               data-testid="skill-edit-tab-configure"
               onClick={() => setActiveTab('configure')}
               className={cn(
-                'relative z-10 flex-1 rounded-full text-ui-md font-medium outline-none',
-                'transition-colors duration-200',
-                activeTab === 'configure' ? 'text-neutral5' : 'text-neutral3 hover:text-neutral4',
+                'text-foreground',
+                'relative z-10 flex-1 rounded-full outline-none',
+                controlStateColorTransition,
+                activeTab === 'configure' ? '' : quietTextHover,
               )}
             >
-              Configuration
+              <Txt as="span" variant="subheading" className="block">
+                Configuration
+              </Txt>
             </button>
           </div>
         </div>
@@ -120,20 +135,20 @@ export const SkillWorkspaceLayout = ({
       >
         <div
           className={cn(
-            'min-w-0 min-h-0 overflow-hidden bg-surface1',
+            'min-h-0 min-w-0 overflow-hidden bg-sidebar',
             showForm && activeTab !== 'chat' ? 'hidden' : 'block',
             'md:block',
             'md:transition-[grid-column] md:duration-300 md:ease-out',
           )}
         >
-          <div className="flex h-full min-h-0 flex-col px-4 pt-4 pb-6 md:px-10">
-            <div className="flex min-h-0 flex-1 flex-col md:max-w-[80ch] md:mx-auto w-full">{chat}</div>
+          <div className="flex h-full min-h-0 flex-col px-4 pt-4 pb-4 md:px-10">
+            <div className="flex min-h-0 w-full flex-1 flex-col md:mx-auto md:max-w-[80ch]">{chat}</div>
           </div>
         </div>
         {showForm && (
           <div
             className={cn(
-              'min-w-0 min-h-0 overflow-hidden bg-surface1',
+              'min-h-0 min-w-0 overflow-hidden bg-sidebar',
               activeTab === 'configure' ? 'block' : 'hidden',
               'md:block',
               // Mobile uses the same page-layout padding as the rest of the
@@ -142,19 +157,19 @@ export const SkillWorkspaceLayout = ({
               // slides in from the right. The slide is driven by a CSS
               // keyframe animation triggered the first time this element
               // mounts (which matches the moment showForm flips to true).
-              'px-4 pb-6 md:p-4 md:bg-transparent',
+              'px-4 pb-4 md:bg-transparent md:p-4',
             )}
             data-testid="skill-edit-configure-panel"
           >
             <div
               className={cn(
                 'skill-panel-slide-in flex h-full min-h-0 flex-col overflow-hidden',
-                'md:rounded-3xl md:border md:border-border1 md:bg-surface2',
+                'md:rounded-3xl md:border md:border-border md:bg-background',
               )}
             >
               <div className="min-h-0 flex-1 overflow-hidden">{form}</div>
               {deleteAction && (
-                <div className="border-t border-border1 px-4 pb-4 pt-4 md:px-6" data-testid="skill-edit-delete-action">
+                <div className="border-t border-border px-4 pt-4 pb-4 md:px-4" data-testid="skill-edit-delete-action">
                   {deleteAction}
                 </div>
               )}

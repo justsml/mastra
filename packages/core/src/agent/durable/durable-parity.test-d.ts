@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
 import { describe, it } from 'vitest';
 import type { AgentExecutionOptionsBase } from '../agent.types';
 import type { SerializableDurableOptions, RunRegistryEntry } from './types';
@@ -67,6 +66,11 @@ type ConsumedDuringPreparation =
   | 'onFinish'
   | 'onError'
   | 'onAbort'
+  | 'experimentalTransform'
+  // Applied to caller-local stream output, never serialized or used to filter generation.
+  | 'hideSignals'
+  // Caller-local stream lifecycle; read by DurableAgent.stream()/resume(), never serialized.
+  | 'closeOnSuspend'
   // AbortSignal is managed via the registry's abortController/abortSignal
   | 'abortSignal'
   // Toolsets and clientTools are resolved into the `tools` record during
@@ -83,6 +87,11 @@ type ConsumedDuringPreparation =
   | '_skipBgTaskWait'
   // untilIdle is handled by DurableAgent.streamUntilIdle() before preparation
   | 'untilIdle'
+  // Serverless waitUntil is call-site only for non-durable generate/stream.
+  // Durable execution manages its own finish lifecycle, so this is intentionally unused.
+  | 'serverless'
+  // Explicitly rejected during durable preparation before any side effects.
+  | 'eagerToolExecution'
   // Observability context keys from Partial<ObservabilityContext>
   | 'tracing'
   | 'loggerVNext'
@@ -123,8 +132,11 @@ type PhantomSerializedKeys = Exclude<
   | keyof AgentExecutionOptionsBase<any>
   // These are durable-internal representations that don't map 1:1 to a
   // base option key but are derived from one:
-  | 'hasErrorProcessors' // derived from errorProcessors.length
+  | 'hasErrorProcessors' // derived from configured errorProcessors.length (no framework defaults)
+  | 'emptyErrorProcessorOverride' // derived from a call-time errorProcessors: [] (replaces the defaults)
   | 'skipBgTaskWait' // derived from _skipBgTaskWait
+  | 'agentMaxRetries' // derived from the agent's maxRetries config
+  | 'agentMaxRetriesConfigured' // preserves omitted vs explicitly configured maxRetries
   | 'instructionsOverride' // derived from instructions
   | 'systemMessage' // derived from system
   | 'transform' // shadow of transform policy (targets only)

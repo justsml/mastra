@@ -1,6 +1,6 @@
 ---
 title: "Reference: createSkill() | Skills"
-description: "API reference for createSkill(), a factory function for creating inline agent skills without a filesystem."
+description: "Creates an inline skill that can be passed directly to an agent's skills config without a filesystem or workspace."
 packages:
   - "@mastra/core"
 ---
@@ -107,18 +107,17 @@ The skill is assigned a synthetic path of `inline/<name>` (e.g., `inline/code-re
 
 - `name` is required and must be a valid slug
 - `description` is required
-- `instructions` is required and non-empty
 
 If validation fails, an `Error` is thrown with details about the invalid fields.
 
 ```typescript
-// Throws: Invalid skill "": name is required
+// Throws: Invalid skill "": name: Skill name cannot be empty
 createSkill({ name: '', description: 'test', instructions: 'test' })
 ```
 
 ## Related
 
-- [Agent skills](/docs/agents/skills)
-- [Workspace skills](/docs/workspace/skills)
+- [Agent skills](/docs/skills)
+- [Workspace skills](/docs/sandbox/skills)
 - [`.getSkill()` reference](/reference/agents/getSkill)
 - [`.listSkills()` reference](/reference/agents/listSkills)

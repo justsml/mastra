@@ -92,7 +92,7 @@ type BuildArgs = {
   dashboardFilter: MetricsDimensionalFilter;
   /** Per-card scoping applied on top of dashboard filters. */
   scope: DrilldownScope;
-  /** Override the Traces page base path. Defaults to `/observability` (mastra Studio). */
+  /** Override the Traces page base path. Defaults to `/traces` (mastra Studio). */
   tracesBasePath?: string;
   /** Override the Logs page base path. Defaults to `/logs` (mastra Studio). */
   logsBasePath?: string;
@@ -142,7 +142,7 @@ export function buildTracesDrilldownUrl({
   customRange,
   dashboardFilter,
   scope,
-  tracesBasePath = '/observability',
+  tracesBasePath = '/traces',
 }: BuildArgs): string {
   const params = new URLSearchParams();
   params.set(TRACE_LIST_MODE_PARAM, 'branches');
@@ -166,7 +166,6 @@ export function buildTracesDrilldownUrl({
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.entityName, scope.entityName ?? dashboardFilter.entityName);
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.threadId, scope.threadId ?? dashboardFilter.threadId);
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.resourceId, scope.resourceId ?? dashboardFilter.resourceId);
-  setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.entityId, dashboardFilter.entityId);
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.runId, dashboardFilter.runId);
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.sessionId, dashboardFilter.sessionId);
   setIfDefined(params, TRACE_PROPERTY_FILTER_PARAM_BY_FIELD.requestId, dashboardFilter.requestId);

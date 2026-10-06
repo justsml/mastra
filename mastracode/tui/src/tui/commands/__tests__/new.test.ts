@@ -1,21 +1,45 @@
+import { basename } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
+import { AssistantRenderRegistry, getAssistantSegmentKey } from '../../assistant-render-registry.js';
+import { AssistantMessageComponent } from '../../components/assistant-message.js';
 import { handleNewCommand } from '../new.js';
 import type { SlashCommandContext } from '../types.js';
 
 function createMockState() {
+  const assistantRenderRegistry = new AssistantRenderRegistry();
+  const assistantSegment = assistantRenderRegistry.start(
+    'assistant-1',
+    getAssistantSegmentKey('assistant-1'),
+    () => new AssistantMessageComponent(),
+  ).segment;
+  vi.spyOn(assistantSegment.component, 'disposeRenderState');
+
   return {
+    assistantRenderRegistry,
+    assistantSegment,
     pendingNewThread: false,
+    currentThreadTitle: 'Current thread',
+    options: { appName: 'Mastra Code' },
     chatContainer: { clear: vi.fn() },
     pendingTools: { clear: vi.fn() },
     pendingTaskToolIds: { clear: vi.fn() },
+    pendingSubagents: new Map([['subagent', {}]]),
+    pendingSignalMessageComponentsById: new Map([['signal', {}]]),
+    followUpComponents: [{}],
     allToolComponents: [{}],
     allSlashCommandComponents: [{}],
     allSystemReminderComponents: [{}],
     messageComponentsById: new Map([['a', {}]]),
     allShellComponents: [{}],
+    globalBackgroundNotice: { setActivities: vi.fn() },
     taskProgress: { updateTasks: vi.fn() },
     taskToolInsertIndex: 5,
+    gradientAnimator: { stop: vi.fn() },
+    githubPrGradientAnimator: { stop: vi.fn() },
+    githubPrPollingActive: true,
+    agentRunStartedAt: 1_700_000_000_000,
+    agentRunLastStreamPartAt: 1_700_000_000_500,
     session: {
       state: { set: vi.fn(async () => {}) },
       thread: { detachFromCurrent: vi.fn() },
@@ -29,7 +53,7 @@ function createMockState() {
       },
       setState: vi.fn(async () => {}),
     },
-    ui: { requestRender: vi.fn() },
+    ui: { requestRender: vi.fn(), terminal: { setTitle: vi.fn() } },
   } as any;
 }
 
@@ -76,11 +100,18 @@ describe('handleNewCommand', () => {
 
     expect(state.chatContainer.clear).toHaveBeenCalled();
     expect(state.pendingTools.clear).toHaveBeenCalled();
+    expect(state.pendingTaskToolIds.clear).toHaveBeenCalled();
+    expect(state.pendingSubagents.size).toBe(0);
+    expect(state.pendingSignalMessageComponentsById.size).toBe(0);
+    expect(state.followUpComponents).toEqual([]);
     expect(state.allToolComponents).toEqual([]);
     expect(state.allSlashCommandComponents).toEqual([]);
     expect(state.allSystemReminderComponents).toEqual([]);
     expect(state.messageComponentsById.size).toBe(0);
+    expect(state.assistantRenderRegistry.size).toBe(0);
+    expect(state.assistantSegment.component.disposeRenderState).toHaveBeenCalledOnce();
     expect(state.allShellComponents).toEqual([]);
+    expect(state.globalBackgroundNotice.setActivities).toHaveBeenCalledWith([]);
     expect(state.session.state.set).toHaveBeenCalledWith({
       tasks: [],
       activePlan: null,
@@ -88,7 +119,24 @@ describe('handleNewCommand', () => {
     });
     expect(state.taskProgress.updateTasks).toHaveBeenCalledWith([]);
     expect(state.taskToolInsertIndex).toBe(-1);
+    expect(state.currentThreadTitle).toBeUndefined();
+    expect(state.ui.terminal.setTitle).toHaveBeenCalledWith(`Mastra Code - ${basename(process.cwd())}`);
     expect(ctx.updateStatusLine).toHaveBeenCalled();
     expect(state.ui.requestRender).toHaveBeenCalled();
+  });
+
+  it('stops status bar animations from the thread being left', async () => {
+    const state = createMockState();
+    const ctx = createCtx(state);
+
+    await handleNewCommand(ctx);
+
+    // A thread owned by another instance never delivers a local agent_end on
+    // detach, so /new has to stop the run animation itself.
+    expect(state.gradientAnimator.stop).toHaveBeenCalled();
+    expect(state.githubPrGradientAnimator.stop).toHaveBeenCalled();
+    expect(state.githubPrPollingActive).toBe(false);
+    expect(state.agentRunStartedAt).toBeUndefined();
+    expect(state.agentRunLastStreamPartAt).toBeUndefined();
   });
 });

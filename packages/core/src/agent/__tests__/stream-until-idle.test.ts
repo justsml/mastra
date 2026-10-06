@@ -1,24 +1,27 @@
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { buildContinuationOpts } from '../../loop/shared/stream-until-idle-helpers';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory';
 import { MockStore } from '../../storage';
+import { createTool } from '../../tools';
 import { Agent } from '../agent';
 
 /**
  * Helper: build a mock model whose streaming response is controlled by the
  * caller. Each call to stream() pulls the next scripted response.
  */
-function makeScriptedModel(scripts: Array<() => ReadableStream<any>>) {
+function makeScriptedModel(scripts: Array<(abortSignal?: AbortSignal) => ReadableStream<any>>) {
   let calls = 0;
   const model = new MockLanguageModelV2({
     doGenerate: async () => {
       throw new Error('doGenerate not used in these tests');
     },
-    doStream: async () => ({
+    doStream: async ({ abortSignal }) => ({
       rawCall: { rawPrompt: null, rawSettings: {} },
       warnings: [],
-      stream: scripts[calls++]!(),
+      stream: scripts[calls++]!(abortSignal),
     }),
   });
   return { model, getCallCount: () => calls };
@@ -40,6 +43,64 @@ function textResponse(text: string) {
     ]);
 }
 
+function abortableTextResponse(text: string, tail: string) {
+  let markStarted!: () => void;
+  const started = new Promise<void>(resolve => {
+    markStarted = resolve;
+  });
+  let aborted = false;
+
+  return {
+    started,
+    wasAborted: () => aborted,
+    response: (abortSignal?: AbortSignal) =>
+      new ReadableStream<any>({
+        start(controller) {
+          controller.enqueue({ type: 'stream-start', warnings: [] });
+          controller.enqueue({ type: 'response-metadata', id: 'id-0', modelId: 'mock', timestamp: new Date(0) });
+          controller.enqueue({ type: 'text-start', id: 't' });
+          controller.enqueue({ type: 'text-delta', id: 't', delta: text });
+          markStarted();
+
+          abortSignal?.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              controller.close();
+            },
+            { once: true },
+          );
+
+          setTimeout(() => {
+            if (abortSignal?.aborted) return;
+            controller.enqueue({ type: 'text-delta', id: 't', delta: tail });
+            controller.enqueue({ type: 'text-end', id: 't' });
+            controller.enqueue({
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            });
+            controller.close();
+          }, 500);
+        },
+      }),
+  };
+}
+
+function toolCallResponse(toolName: string) {
+  return () =>
+    convertArrayToReadableStream([
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: 'id-0', modelId: 'mock', timestamp: new Date(0) },
+      { type: 'tool-call', toolCallId: 'approval', toolName, input: '{}' },
+      {
+        type: 'finish',
+        finishReason: 'tool-calls',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      },
+    ]);
+}
+
 async function drain(stream: ReadableStream<any>): Promise<any[]> {
   const reader = stream.getReader();
   const chunks: any[] = [];
@@ -53,6 +114,23 @@ async function drain(stream: ReadableStream<any>): Promise<any[]> {
 
 describe('Agent.streamUntilIdle', () => {
   const storage = new MockStore();
+
+  it('passes completion directives as execution-only system context', () => {
+    const options = buildContinuationOpts({}, undefined, [
+      {
+        type: 'background-task-completed',
+        payload: { taskId: 'task-1', toolCallId: 'call-1', toolName: 'view' },
+      },
+    ]);
+
+    expect(options.context).toEqual([
+      {
+        role: 'system',
+        content:
+          'IMPORTANT: These tool calls ran as background tasks. Their authoritative results may now look like ordinary tool results after reconciliation; do not reinterpret them as foreground calls. IMPORTANT: The following tool-call IDs completed successfully: call-1 (view), background task task-1. Their results are now in the conversation. Do not call the same tool again — the result is already available.',
+      },
+    ]);
+  });
 
   let mastra: Mastra;
 
@@ -117,33 +195,28 @@ describe('Agent.streamUntilIdle', () => {
     expect(getCallCount()).toBe(1);
   });
 
-  it('re-invokes stream when a background task completes', async () => {
+  it('keeps a caller runId on the initial turn but not autonomous continuations', async () => {
     const memory = new MockMemory();
-    const { model, getCallCount } = makeScriptedModel([
-      textResponse('first response'),
-      textResponse('continuation response'),
-    ]);
-
+    const { model } = makeScriptedModel([textResponse('first response'), textResponse('continuation response')]);
     const agent = new Agent({
-      id: 'a2',
-      name: 'a2',
+      id: 'run-id-options',
+      name: 'run-id-options',
       instructions: 'test',
       model,
       memory,
     });
-    mastra.addAgent(agent, 'a2');
+    mastra.addAgent(agent, 'run-id-options');
+    const streamSpy = vi.spyOn(agent, 'stream');
 
-    // Emit task.running BEFORE calling streamUntilIdle so the outer state
-    // machine sees a pending task and stays open after the initial turn.
     const bgManager = mastra.backgroundTaskManager!;
-    const publishEvent = (type: string, taskId: string) =>
+    const publishEvent = (type: string) =>
       (bgManager as any).publishLifecycleEvent(type, {
-        id: taskId,
+        id: 'task-1',
         toolName: 'dummy',
-        toolCallId: taskId,
-        runId: 'run-1',
-        agentId: 'a2',
-        threadId: 'thread-2',
+        toolCallId: 'task-1',
+        runId: 'background-run',
+        agentId: 'run-id-options',
+        threadId: 'run-id-thread',
         resourceId: 'user-1',
         status: type.split('.')[1],
         result: {},
@@ -154,21 +227,512 @@ describe('Agent.streamUntilIdle', () => {
         args: {},
       });
 
-    const outer = await agent.streamUntilIdle('hi', {
-      memory: { thread: 'thread-2', resource: 'user-1' },
+    const result = await agent.streamUntilIdle('hi', {
+      runId: 'caller-run-id',
+      memory: { thread: 'run-id-thread', resource: 'user-1' },
+    });
+    await publishEvent('task.running');
+    await new Promise(r => setTimeout(r, 50));
+    await publishEvent('task.completed');
+    await drain(result.fullStream as ReadableStream<any>);
+
+    expect(streamSpy).toHaveBeenCalledTimes(2);
+    expect(streamSpy.mock.calls[0]?.[1]).toMatchObject({ runId: 'caller-run-id' });
+    expect(streamSpy.mock.calls[1]?.[1]).not.toHaveProperty('runId');
+  });
+
+  it.each([
+    { abortBy: 'run' as const, callerRunId: true },
+    { abortBy: 'thread' as const, callerRunId: true },
+    { abortBy: 'run' as const, callerRunId: false },
+    { abortBy: 'thread' as const, callerRunId: false },
+  ])('aborts the initial segment through the $abortBy handle (caller runId: $callerRunId)', async testCase => {
+    const { abortBy, callerRunId } = testCase;
+    const memory = new MockMemory();
+    const initial = abortableTextResponse('initial started', 'initial tail');
+    const { model } = makeScriptedModel([initial.response]);
+    const id = `initial-abort-${abortBy}-${callerRunId ? 'caller' : 'generated'}`;
+    const agent = new Agent({
+      id,
+      name: id,
+      instructions: 'test',
+      model,
+      memory,
+    });
+    mastra.addAgent(agent, id);
+
+    const suppliedRunId = callerRunId ? `caller-initial-abort-${abortBy}` : undefined;
+    const threadId = `initial-abort-thread-${abortBy}-${callerRunId ? 'caller' : 'generated'}`;
+    const resourceId = 'user-1';
+    const result = await agent.stream('hi', {
+      ...(suppliedRunId ? { runId: suppliedRunId } : {}),
+      memory: { thread: threadId, resource: resourceId },
+      untilIdle: true,
+    });
+    await initial.started;
+
+    const runId = result.runId;
+    const aborted =
+      abortBy === 'run'
+        ? agent.abortRunStream(runId)
+        : agent.abortThreadStream({ threadId, resourceId, expectedRunId: callerRunId ? runId : undefined });
+    expect(aborted).toBe(true);
+
+    const chunks = await drain(result.fullStream as ReadableStream<any>);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(initial.wasAborted()).toBe(true);
+    expect(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text)).not.toContain(
+      'initial tail',
+    );
+  });
+
+  it.each(['run', 'thread'] as const)(
+    'keeps the caller runId as a %s abort handle during continuations',
+    async abortBy => {
+      const memory = new MockMemory();
+      const continuation = abortableTextResponse('continuation started', 'continuation tail');
+      const { model } = makeScriptedModel([textResponse('initial response'), continuation.response]);
+      const agent = new Agent({
+        id: `abort-${abortBy}`,
+        name: `abort-${abortBy}`,
+        instructions: 'test',
+        model,
+        memory,
+      });
+      mastra.addAgent(agent, `abort-${abortBy}`);
+
+      const runId = `caller-abort-${abortBy}`;
+      const threadId = `abort-thread-${abortBy}`;
+      const resourceId = 'user-1';
+      const result = await agent.stream('hi', {
+        runId,
+        memory: { thread: threadId, resource: resourceId },
+        untilIdle: true,
+      });
+      const drainPromise = drain(result.fullStream as ReadableStream<any>);
+
+      await (mastra.backgroundTaskManager as any).publishLifecycleEvent('task.completed', {
+        id: `abort-task-${abortBy}`,
+        toolName: 'dummy',
+        toolCallId: `abort-task-${abortBy}`,
+        runId: 'background-run',
+        agentId: `abort-${abortBy}`,
+        threadId,
+        resourceId,
+        status: 'completed',
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+      await continuation.started;
+
+      const aborted =
+        abortBy === 'run'
+          ? agent.abortRunStream(runId)
+          : agent.abortThreadStream({ threadId, resourceId, expectedRunId: runId });
+      expect(aborted).toBe(true);
+
+      const chunks = await drainPromise;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(continuation.wasAborted()).toBe(true);
+      expect(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text)).not.toContain(
+        'continuation tail',
+      );
+    },
+  );
+
+  it('aborts a continuation while its stream is being created', async () => {
+    const memory = new MockMemory();
+    const { model } = makeScriptedModel([textResponse('initial response')]);
+    const agent = new Agent({
+      id: 'abort-pending-continuation',
+      name: 'abort-pending-continuation',
+      instructions: 'test',
+      model,
+      memory,
+    });
+    mastra.addAgent(agent, 'abort-pending-continuation');
+
+    const originalStream = agent.stream.bind(agent);
+    let streamCalls = 0;
+    let markCreationStarted!: () => void;
+    const creationStarted = new Promise<void>(resolve => {
+      markCreationStarted = resolve;
+    });
+    let creationWasAborted = false;
+    vi.spyOn(agent, 'stream').mockImplementation((messages: any, options: any) => {
+      streamCalls += 1;
+      if (streamCalls === 1) return originalStream(messages, options) as any;
+
+      return new Promise((_, reject) => {
+        markCreationStarted();
+        const abort = () => {
+          creationWasAborted = true;
+          reject(new Error('Continuation creation aborted'));
+        };
+        if (options.abortSignal.aborted) abort();
+        else options.abortSignal.addEventListener('abort', abort, { once: true });
+      }) as any;
     });
 
-    // Mark a task as running so the outer knows to wait for it.
-    await publishEvent('task.running', 'task-1');
-    // Now complete it. The state machine should re-invoke stream to process.
-    await new Promise(r => setTimeout(r, 50));
-    await publishEvent('task.completed', 'task-1');
+    const runId = 'pending-continuation-run';
+    const threadId = 'pending-continuation-thread';
+    const resourceId = 'user-1';
+    const result = await agent.streamUntilIdle('hi', {
+      runId,
+      memory: { thread: threadId, resource: resourceId },
+    });
+    const drainPromise = drain(result.fullStream as ReadableStream<any>);
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'pending-continuation-task',
+        toolName: 'dummy',
+        toolCallId: 'pending-continuation-task',
+        runId: 'background-run',
+        agentId: 'abort-pending-continuation',
+        threadId,
+        resourceId,
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
 
-    await drain(outer.fullStream as ReadableStream<any>);
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+    await creationStarted;
 
-    // Initial turn + one continuation = 2 LLM calls
-    expect(getCallCount()).toBe(2);
+    expect(agent.abortRunStream(runId)).toBe(true);
+    await drainPromise;
+    expect(creationWasAborted).toBe(true);
   });
+
+  it('aborts a pending continuation when the combined stream reader cancels', async () => {
+    const memory = new MockMemory();
+    const { model } = makeScriptedModel([textResponse('initial response')]);
+    const agent = new Agent({
+      id: 'cancel-pending-continuation',
+      name: 'cancel-pending-continuation',
+      instructions: 'test',
+      model,
+      memory,
+    });
+    mastra.addAgent(agent, 'cancel-pending-continuation');
+
+    const originalStream = agent.stream.bind(agent);
+    let streamCalls = 0;
+    let markCreationStarted!: () => void;
+    const creationStarted = new Promise<void>(resolve => {
+      markCreationStarted = resolve;
+    });
+    let creationWasAborted = false;
+    vi.spyOn(agent, 'stream').mockImplementation((messages: any, options: any) => {
+      streamCalls += 1;
+      if (streamCalls === 1) return originalStream(messages, options) as any;
+
+      return new Promise((_, reject) => {
+        markCreationStarted();
+        const abort = () => {
+          creationWasAborted = true;
+          reject(new Error('Continuation creation aborted'));
+        };
+        if (options.abortSignal.aborted) abort();
+        else options.abortSignal.addEventListener('abort', abort, { once: true });
+      }) as any;
+    });
+
+    const threadId = 'cancel-pending-continuation-thread';
+    const resourceId = 'user-1';
+    const result = await agent.streamUntilIdle('hi', {
+      runId: 'cancel-pending-continuation-run',
+      memory: { thread: threadId, resource: resourceId },
+    });
+    const reader = (result.fullStream as ReadableStream<any>).getReader();
+    const consumePromise = (async () => {
+      while (!(await reader.read()).done) {
+        // Keep reading until cancellation closes the combined stream.
+      }
+    })();
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'cancel-pending-continuation-task',
+        toolName: 'dummy',
+        toolCallId: 'cancel-pending-continuation-task',
+        runId: 'background-run',
+        agentId: 'cancel-pending-continuation',
+        threadId,
+        resourceId,
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+    await creationStarted;
+
+    await reader.cancel();
+    await consumePromise;
+    expect(creationWasAborted).toBe(true);
+  });
+
+  it('aborts a continuation created after the wrapper is aborted', async () => {
+    const memory = new MockMemory();
+    const lateContinuation = abortableTextResponse('late continuation', 'late tail');
+    const { model, getCallCount } = makeScriptedModel([textResponse('initial response'), lateContinuation.response]);
+    const agent = new Agent({
+      id: 'late-pending-continuation',
+      name: 'late-pending-continuation',
+      instructions: 'test',
+      model,
+      memory,
+    });
+    mastra.addAgent(agent, 'late-pending-continuation');
+
+    const originalStream = agent.stream.bind(agent);
+    let streamCalls = 0;
+    let markCreationStarted!: () => void;
+    const creationStarted = new Promise<void>(resolve => {
+      markCreationStarted = resolve;
+    });
+    let releaseCreation!: () => void;
+    const creationGate = new Promise<void>(resolve => {
+      releaseCreation = resolve;
+    });
+    let onAbortCalled = false;
+    let onFinishCalled = false;
+    let lateDrainPromise: Promise<any[]> | undefined;
+    vi.spyOn(agent, 'stream').mockImplementation(async (messages: any, options: any) => {
+      streamCalls += 1;
+      if (streamCalls === 1) return originalStream(messages, options) as any;
+
+      markCreationStarted();
+      await creationGate;
+      const { abortSignal: _abortSignal, ...lateOptions } = options;
+      const inner = await originalStream(messages, {
+        ...lateOptions,
+        onAbort: () => {
+          onAbortCalled = true;
+        },
+        onFinish: () => {
+          onFinishCalled = true;
+        },
+      });
+      lateDrainPromise = drain(inner.fullStream as ReadableStream<any>);
+      await lateContinuation.started;
+      return inner as any;
+    });
+
+    const runId = 'late-pending-continuation-run';
+    const threadId = 'late-pending-continuation-thread';
+    const resourceId = 'user-1';
+    const result = await agent.streamUntilIdle('hi', {
+      runId,
+      memory: { thread: threadId, resource: resourceId },
+    });
+    const drainPromise = drain(result.fullStream as ReadableStream<any>);
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'late-pending-continuation-task',
+        toolName: 'dummy',
+        toolCallId: 'late-pending-continuation-task',
+        runId: 'background-run',
+        agentId: 'late-pending-continuation',
+        threadId,
+        resourceId,
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+    await creationStarted;
+
+    expect(agent.abortRunStream(runId)).toBe(true);
+    await drainPromise;
+    releaseCreation();
+    await lateContinuation.started;
+    await vi.waitFor(() => expect(lateContinuation.wasAborted()).toBe(true));
+    await lateDrainPromise;
+
+    expect(getCallCount()).toBe(2);
+    expect(onAbortCalled).toBe(true);
+    expect(onFinishCalled).toBe(false);
+  });
+
+  it('drops the resumed runId from a plain Agent autonomous continuation', async () => {
+    const memory = new MockMemory();
+    const { model } = makeScriptedModel([
+      toolCallResponse('approval'),
+      textResponse('resumed response'),
+      textResponse('continuation response'),
+    ]);
+    const agent = new Agent({
+      id: 'resume-run-id-options',
+      name: 'resume-run-id-options',
+      instructions: 'test',
+      model,
+      memory,
+      tools: {
+        approval: createTool({
+          id: 'approval',
+          description: 'Request approval',
+          inputSchema: z.object({}),
+          suspendSchema: z.object({ question: z.string() }),
+          resumeSchema: z.object({ approved: z.boolean() }),
+          execute: async (_, context) => {
+            if (!context?.agent?.resumeData) return context?.agent?.suspend({ question: 'Continue?' });
+            return context.agent.resumeData;
+          },
+        }),
+      },
+    });
+    mastra.addAgent(agent, 'resume-run-id-options');
+
+    const memoryOptions = { thread: 'resume-run-id-thread', resource: 'user-1' };
+    const initial = await agent.stream('start', {
+      runId: 'resume-caller-run-id',
+      memory: memoryOptions,
+    });
+    const initialChunks = await drain(initial.fullStream as ReadableStream<any>);
+    expect(initial.runId).toBe('resume-caller-run-id');
+    expect(initialChunks.some(chunk => chunk.type === 'tool-call-suspended')).toBe(true);
+
+    const streamSpy = vi.spyOn(agent, 'stream');
+    const resumed = await agent.resumeStream(
+      { approved: true },
+      {
+        runId: initial.runId,
+        toolCallId: 'approval',
+        memory: memoryOptions,
+        untilIdle: true,
+      },
+    );
+
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'resume-task-1',
+        toolName: 'dummy',
+        toolCallId: 'resume-task-1',
+        runId: 'background-run',
+        agentId: 'resume-run-id-options',
+        threadId: 'resume-run-id-thread',
+        resourceId: 'user-1',
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+    const resumedChunks = await drain(resumed.fullStream as ReadableStream<any>);
+
+    expect(resumedChunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text)).toEqual([
+      'resumed response',
+      'continuation response',
+    ]);
+    expect(resumedChunks.some(chunk => chunk.type === 'tool-call')).toBe(false);
+    expect(resumedChunks.filter(chunk => chunk.type === 'finish')).toHaveLength(2);
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+    expect(streamSpy.mock.calls[0]?.[1]).not.toHaveProperty('runId');
+  });
+
+  it.each([false, true])(
+    'preserves signal exclusions across background continuations (excluded: %s)',
+    async excluded => {
+      const memory = new MockMemory();
+      const { model, getCallCount } = makeScriptedModel([
+        textResponse('first response'),
+        textResponse('continuation response'),
+      ]);
+
+      const agent = new Agent({
+        id: 'a2',
+        name: 'a2',
+        instructions: 'test',
+        model,
+        memory,
+        inputProcessors: [
+          {
+            id: 'continuation-reminder',
+            processInputStep: async ({ sendSignal }) => {
+              await sendSignal({ type: 'reactive', contents: 'every turn reminder' });
+            },
+          },
+        ],
+      });
+      mastra.addAgent(agent, 'a2');
+
+      // Emit task.running BEFORE calling streamUntilIdle so the outer state
+      // machine sees a pending task and stays open after the initial turn.
+      const bgManager = mastra.backgroundTaskManager!;
+      const publishEvent = (type: string, taskId: string) =>
+        (bgManager as any).publishLifecycleEvent(type, {
+          id: taskId,
+          toolName: 'dummy',
+          toolCallId: taskId,
+          runId: 'run-1',
+          agentId: 'a2',
+          threadId: 'thread-2',
+          resourceId: 'user-1',
+          status: type.split('.')[1],
+          result: {},
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 1000,
+          createdAt: new Date(),
+          args: {},
+        });
+
+      const outer = await agent.streamUntilIdle('hi', {
+        memory: { thread: 'thread-2', resource: 'user-1' },
+        hideSignals: excluded ? ['system-reminder'] : [],
+      });
+
+      // Mark a task as running so the outer knows to wait for it.
+      await publishEvent('task.running', 'task-1');
+      // Now complete it. The state machine should re-invoke stream to process.
+      await new Promise(r => setTimeout(r, 50));
+      await publishEvent('task.completed', 'task-1');
+
+      const chunks = await drain(outer.fullStream as ReadableStream<any>);
+      expect(chunks.filter(c => c.type === 'data-signal')).toHaveLength(excluded ? 0 : 2);
+      expect(chunks.filter(c => c.type === 'text-delta').map(c => c.payload.text)).toEqual([
+        'first response',
+        'continuation response',
+      ]);
+
+      // Initial turn + one continuation = 2 LLM calls
+      expect(getCallCount()).toBe(2);
+    },
+  );
 
   it('serializes continuations (only one inner stream at a time)', async () => {
     const memory = new MockMemory();
@@ -239,10 +803,10 @@ describe('Agent.streamUntilIdle', () => {
     await new Promise(r => setTimeout(r, 50));
     expect(getCallCount()).toBe(1);
 
-    // Fire two completions while the initial turn is still running.
+    // Track two concurrent background tasks while the initial turn is still running.
     const bgManager = mastra.backgroundTaskManager!;
-    const publishCompleted = (taskId: string) =>
-      (bgManager as any).publishLifecycleEvent('task.completed', {
+    const publishLifecycle = (event: 'task.running' | 'task.completed', taskId: string) =>
+      (bgManager as any).publishLifecycleEvent(event, {
         id: taskId,
         toolName: 'dummy',
         toolCallId: taskId,
@@ -250,27 +814,31 @@ describe('Agent.streamUntilIdle', () => {
         agentId: 'a3',
         threadId: 'thread-3',
         resourceId: 'user-1',
-        status: 'completed',
-        result: {},
+        status: event === 'task.running' ? 'running' : 'completed',
+        result: event === 'task.completed' ? {} : undefined,
         retryCount: 0,
         maxRetries: 0,
         timeoutMs: 1000,
         createdAt: new Date(),
         args: {},
       });
-    await publishCompleted('t-a');
-    await publishCompleted('t-b');
+    await publishLifecycle('task.running', 't-a');
+    await publishLifecycle('task.running', 't-b');
+    await publishLifecycle('task.completed', 't-a');
     await new Promise(r => setTimeout(r, 50));
 
-    // Both completions queued but no second inner turn yet — still 1 call.
+    // One completion is queued, but the other task is still running.
     expect(getCallCount()).toBe(1);
 
-    // Let the initial turn finish.
+    // Let the initial turn finish. The remaining running task still prevents
+    // a fragmented completion-triggered continuation.
     resolver1();
     await new Promise(r => setTimeout(r, 50));
+    expect(getCallCount()).toBe(1);
 
-    // After initial ends, processIfIdle should kick off ONE continuation
-    // that drains all queued completions together. Call count is 2.
+    // Once all tracked work settles, both completions are synthesized together.
+    await publishLifecycle('task.completed', 't-b');
+    await new Promise(r => setTimeout(r, 50));
     expect(getCallCount()).toBe(2);
 
     // Let continuation 2 finish. No more pending → outer closes.
@@ -462,6 +1030,71 @@ describe('Agent.streamUntilIdle', () => {
 
     // Allow slack but confirm we're closing on the timer, not hanging open.
     expect(elapsed).toBeLessThan(2_000);
+  });
+
+  it('re-arms maxIdleMs after a completion arrives mid-turn while another task remains running', async () => {
+    let finishInitialTurn!: () => void;
+    const initialTurnDone = new Promise<void>(resolve => {
+      finishInitialTurn = resolve;
+    });
+    const blockingStream = () =>
+      new ReadableStream<any>({
+        async start(controller) {
+          controller.enqueue({ type: 'stream-start', warnings: [] });
+          await initialTurnDone;
+          controller.enqueue({
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          });
+          controller.close();
+        },
+      });
+    const { model } = makeScriptedModel([blockingStream]);
+    const agent = new Agent({
+      id: 'a-pending-idle',
+      name: 'a-pending-idle',
+      instructions: 'test',
+      model,
+      memory: new MockMemory(),
+    });
+    mastra.addAgent(agent, 'a-pending-idle');
+
+    const publishLifecycle = (event: 'task.running' | 'task.completed', taskId: string) =>
+      (mastra.backgroundTaskManager as any).publishLifecycleEvent(event, {
+        id: taskId,
+        toolName: 'dummy',
+        toolCallId: taskId,
+        runId: 'run-1',
+        agentId: 'a-pending-idle',
+        threadId: 'thread-pending-idle',
+        resourceId: 'user-1',
+        status: event === 'task.running' ? 'running' : 'completed',
+        result: event === 'task.completed' ? {} : undefined,
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    const result = await agent.streamUntilIdle('hi', {
+      memory: { thread: 'thread-pending-idle', resource: 'user-1' },
+      maxIdleMs: 100,
+    });
+    const drainPromise = drain(result.fullStream as ReadableStream<any>);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await publishLifecycle('task.running', 'task-completed');
+    await publishLifecycle('task.running', 'task-stalled');
+    await publishLifecycle('task.completed', 'task-completed');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const start = Date.now();
+    finishInitialTurn();
+
+    await drainPromise;
+    const elapsedMs = Date.now() - start;
+    expect(elapsedMs).toBeGreaterThanOrEqual(100);
+    expect(elapsedMs).toBeLessThan(2_000);
   });
 
   it('does not close mid-turn when inner stream is slow (idle timer only runs between turns)', async () => {

@@ -11,18 +11,27 @@ import type { z } from 'zod';
 import type { ActorSignal } from '../../auth/ee/fga-check';
 import type { BackgroundTaskManager } from '../../background-tasks/manager';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
+import type { ScoringFilter } from '../../evals/predicate';
 import type { SystemMessage } from '../../llm';
-import type { ProviderOptions } from '../../llm/model/provider-options';
-import type { MastraLanguageModel } from '../../llm/model/shared.types';
+import type { MastraLanguageModel, SharedProviderOptions } from '../../llm/model/shared.types';
+import type { ToolCallConcurrency } from '../../loop/types';
+import type { Mastra } from '../../mastra';
 import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig } from '../../memory/types';
 import type { AIModelGenerationSpan, Span, SpanType, TracingContext, TracingOptions } from '../../observability';
-import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
+import type {
+  InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
+  OutputProcessorOrWorkflow,
+  ErrorProcessorOrWorkflow,
+} from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
 import type { RequestContext } from '../../request-context';
-import type { ChunkType } from '../../stream/types';
+import type { ChunkType, StepTripwireData } from '../../stream/types';
+import type { ToolPayloadTransformMetadata } from '../../tools/payload-transform';
 import type {
   CoreTool,
+  MCPToolExecutionContext,
   RequireToolApproval,
   ToolPayloadTransformPolicy,
   ToolPayloadTransformTarget,
@@ -75,7 +84,7 @@ export interface SerializableModelConfig {
     [key: string]: unknown;
   };
   /** Provider-specific options for the model call */
-  providerOptions?: ProviderOptions;
+  providerOptions?: SharedProviderOptions;
 }
 
 /**
@@ -105,6 +114,8 @@ export interface SerializableScorerEntry {
   scorerName: string;
   /** Optional sampling configuration */
   sampling?: SerializableScoringSamplingConfig;
+  /** Optional eligibility filter (JSON-safe predicate, survives round-trips as-is) */
+  filter?: ScoringFilter;
 }
 
 /**
@@ -138,6 +149,8 @@ export interface SerializableStructuredOutput {
   schema?: JSONSchema7;
   /** Whether to use JSON prompt injection instead of native response format */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
+  /** Caller-supplied instructions (see `StructuredOutputOptionsBase.instructions`) */
+  instructions?: string;
   /** Whether to use the parent agent's model for structuring */
   useAgent?: boolean;
   /** Model config for a dedicated structuring model (if different from the main model) */
@@ -163,24 +176,58 @@ export interface SerializableModelSettings {
   stopSequences?: string[];
   seed?: number;
   maxRetries?: number;
+  /**
+   * Execution time budgets (#21724). Persisted so a cold resume / recovery can
+   * re-arm the run-level budget the run was started with; `stepMs` and
+   * `firstChunkMs` are consumed by the shared per-call execute wrapper, which
+   * receives these serialized settings on the durable path.
+   */
+  timeout?: { stepMs?: number; totalMs?: number; firstChunkMs?: number };
+}
+
+/**
+ * JSON-safe snapshot of a call-time client tool. Client tools never execute on
+ * the server, so only the schema/metadata the model needs is persisted; the
+ * worker rebuilds the client tool from this when it runs in another process.
+ */
+export interface SerializableClientTool {
+  id?: string;
+  description?: string;
+  inputSchema: JSONSchema7;
+  requireApproval?: boolean;
 }
 
 /**
  * Options for durable agent execution (serializable subset)
  */
 export interface SerializableDurableOptions {
+  /** Call-time client tools, keyed by tool name, for cross-process rebuilds */
+  clientTools?: Record<string, SerializableClientTool>;
   /** Maximum number of agentic loop iterations */
   maxSteps?: number;
   /** Tool selection strategy */
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'tool'; toolName: string };
   /** Tool names enabled for this execution */
   activeTools?: string[];
-  /** Serializable LLM call settings (temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, stopSequences, seed). Headers are excluded — see RunRegistryEntry. */
+  /** Serializable LLM call settings (temperature, maxOutputTokens, topP, topK, presencePenalty, frequencyPenalty, stopSequences, seed, maxRetries, timeout). Headers are excluded — see RunRegistryEntry. */
   modelSettings?: SerializableModelSettings;
+  /**
+   * Agent-level maxRetries (folded, defaults to 0). Single-model agents have
+   * no modelList entry to carry retry config, so it rides on options; the
+   * llm-execution step's retry ladder reads it to apply the same
+   * agent-vs-call-time precedence as the in-process loop.
+   */
+  agentMaxRetries?: number;
+  /**
+   * Whether `maxRetries` was explicitly configured on the agent. An explicit
+   * value (including 0) overrides call-time `modelSettings.maxRetries`;
+   * otherwise the call-time value wins — matching `llm-execution-step.ts`.
+   */
+  agentMaxRetriesConfigured?: boolean;
   /** Whether to require tool approval globally */
   requireToolApproval?: boolean;
-  /** Concurrency limit for parallel tool calls */
-  toolCallConcurrency?: number;
+  /** Concurrency limit / strategy for parallel tool calls (JSON-safe union) */
+  toolCallConcurrency?: ToolCallConcurrency;
   /** Whether to auto-resume suspended tools */
   autoResumeSuspendedTools?: boolean;
   /** Maximum processor retries per generation */
@@ -191,14 +238,25 @@ export interface SerializableDurableOptions {
   returnScorerData?: boolean;
   /** Whether error processors are configured (flag only, instances are non-serializable) */
   hasErrorProcessors?: boolean;
+  /**
+   * The call passed `errorProcessors: []`, replacing the agent's resolved list (defaults included)
+   * with none. Processor instances aren't serializable, so this marker is what lets a worker that
+   * rebuilds the pipeline honor that override.
+   */
+  emptyErrorProcessorOverride?: boolean;
   /** Provider-specific options passed to the language model */
-  providerOptions?: ProviderOptions;
+  providerOptions?: SharedProviderOptions;
   /** Structured output configuration */
   structuredOutput?: SerializableStructuredOutput;
   /** When true, the background task check step skips its in-loop wait (external driver handles continuation) */
   skipBgTaskWait?: boolean;
   /** When true, background tasks are disabled for this run (the registry will not receive a BackgroundTaskManager). */
   disableBackgroundTasks?: boolean;
+  /** Execution-scoped background dispatch policy for delegated agents. */
+  backgroundTaskPolicy?: {
+    allowToolDispatch: boolean;
+    allowDelegationDispatch: boolean;
+  };
   /** Tracing options forwarded to the agent/model spans (metadata, tags, requestContextKeys, parentSpanId, hideInput/hideOutput, traceId). */
   tracingOptions?: TracingOptions;
   /**
@@ -248,6 +306,15 @@ export interface DurableAgenticWorkflowInput {
   agentId: string;
   /** Agent name for logging/tracing */
   agentName?: string;
+  /**
+   * Exact stored version id the run resolved to at start time. A run that
+   * suspends while executing a stored version must resume on *that* version —
+   * a status selector would re-resolve to whatever is published at resume
+   * time and silently change instructions/tools underneath a human approver.
+   * `DurableAgent.resume()` reads this on cold rehydration to pin the
+   * version. Absent for purely code-defined agents.
+   */
+  agentVersionId?: string;
   /** Serialized MessageList state */
   messageListState: SerializedMessageListState;
   /** Tool metadata (without execute functions) */
@@ -291,7 +358,7 @@ export interface DurableLLMStepOutput {
   toolCalls: DurableToolCallInput[];
   /** Step result metadata */
   stepResult: {
-    reason: LanguageModelV2FinishReason | 'tripwire' | 'retry';
+    reason: LanguageModelV2FinishReason | 'abort' | 'tripwire' | 'retry';
     warnings: LanguageModelV2CallWarning[];
     isContinued: boolean;
     logprobs?: LanguageModelV1LogProbs;
@@ -299,6 +366,8 @@ export interface DurableLLMStepOutput {
     headers?: Record<string, string>;
     messageId?: string;
     request?: LanguageModelRequestMetadata;
+    /** Set when a processOutputStep processor rejected this step */
+    tripwire?: StepTripwireData;
   };
   /** Response metadata from the model */
   metadata: {
@@ -345,6 +414,15 @@ export interface DurableToolCallInput {
   output?: unknown;
   /** Tool names enabled for the step that produced this call, or null if a processor cleared the restriction */
   activeTools?: string[] | null;
+  /**
+   * Serialized from the step's *effective* tool set at emission time (processors may add
+   * tools that never appear in the run-start `toolsMetadata`). Persisted with the call so
+   * `resolveDurableToolCallConcurrency` can enforce sequential execution for
+   * approval/suspend-capable tools even on a cold resume.
+   */
+  requireApproval?: boolean;
+  /** @see requireApproval */
+  hasSuspendSchema?: boolean;
   /** Exported model_step span data so the TOOL_CALL span nests under the LLM call */
   stepSpanData?: unknown;
 }
@@ -355,6 +433,59 @@ export interface DurableToolCallInput {
 export interface DurableToolCallOutput extends DurableToolCallInput {
   /** Result from tool execution */
   result?: unknown;
+  /** Whether toModelOutput was evaluated before the result crossed the durable boundary */
+  modelOutputComputed?: boolean;
+  /** A toModelOutput failure serialized for propagation across the durable boundary. */
+  mappingError?: {
+    name: string;
+    message: string;
+    stack?: string;
+  };
+  /**
+   * Set when execution was interrupted by request abort (not a tool error).
+   * The call carries no result/error so the mapping step leaves it incomplete.
+   */
+  aborted?: boolean;
+  /**
+   * Set when a processToolResult processor blocked the result via tripwire.
+   * A tripwire chunk was emitted instead of the tool-result; the call carries
+   * no result so the mapping step leaves it incomplete (mirrors the main
+   * loop's tripwire handling, where commit and emission are both skipped).
+   */
+  resultBlocked?: boolean;
+  /**
+   * Non-transient data-* chunks emitted by output processors via
+   * writer.custom() during this tool call. The tool-call step's messageList
+   * is a local copy whose mutations don't cross the step boundary, so parts
+   * are carried here and persisted into the authoritative messageList by the
+   * mapping step (#19375 parity port).
+   */
+  processorDataParts?: Array<{
+    type: string;
+    data?: unknown;
+    messageId?: string;
+  }>;
+  /**
+   * Chunk-level `mastra.toolPayloadTransform` metadata computed when the
+   * tool-result/tool-error chunk was emitted (L18b). The tool-call step's
+   * messageList is a local copy, so the metadata travels here across the
+   * serialization boundary and is layered into the persisted providerMetadata
+   * by the mapping step — matching the main loop's llm-mapping, which reads it
+   * off the live chunk. Without it, transcript-target transforms would not
+   * apply to the persisted args/result on recall.
+   */
+  transformMetadata?: { mastra?: { toolPayloadTransform?: ToolPayloadTransformMetadata } };
+  /**
+   * Set when a delegation `onDelegationComplete` hook called `ctx.bail()`
+   * during this tool call. The bail signal is written by-reference to the
+   * RequestContext the sub-agent tool was built with, which on the evented
+   * engine is a different instance from the one later steps rehydrate from
+   * their event payloads — so the tool-call step reads it in-process and
+   * carries it here across the serialization boundary. The mapping step ORs
+   * it into the iteration output so the dountil predicate stops the loop in
+   * the same iteration on every engine (G3).
+   */
+  delegationBailed?: boolean;
   /** Error if tool execution failed */
   error?: {
     name: string;
@@ -446,6 +577,13 @@ export interface AgentStreamEvent<T = unknown> {
   runId: string;
   /** Event payload */
   data: T;
+  /** Epoch ms at which a `chunk` event's chunk was produced. */
+  producedAt?: number;
+  /**
+   * The `chunk` event's chunk already ran through the run's output processors
+   * before it was published, so the stream consumer must not run them again.
+   */
+  outputProcessed?: boolean;
 }
 
 /**
@@ -498,6 +636,8 @@ export interface AgentSuspendedEventData {
 export interface AgentAbortEventData {
   /** Steps accumulated up to the point of abort */
   steps: unknown[];
+  /** Assistant text streamed before the abort */
+  text?: string;
 }
 
 /**
@@ -551,8 +691,24 @@ export interface RunRegistryEntry {
    * registered on the Mastra instance instead of trusting the entry.
    */
   isPlaceholder?: boolean;
-  /** Resolved tools with execute functions */
+  /**
+   * Resolved tools with execute functions.
+   *
+   * After a durable LLM step runs input processors this holds the per-step
+   * snapshot the model was shown (e.g. only `search_tools` when a
+   * ToolSearchProcessor withholds searchable tools), so the durable tool-call
+   * step resolves exactly what the model could call. Steps seed from
+   * `baseTools` instead, so a narrowed snapshot never shrinks the toolset
+   * later steps (and their processors) start from.
+   */
   tools: Record<string, CoreTool>;
+  /**
+   * The complete resolved toolset for the run, before any per-step processor
+   * narrowing. Set by the durable LLM step the first time it overwrites `tools`
+   * with a per-step snapshot; `resolveRuntimeDependencies` prefers it over
+   * `tools` when seeding a step (issue #22933).
+   */
+  baseTools?: Record<string, CoreTool>;
   /** SaveQueueManager for message persistence (undefined when memory is not configured) */
   saveQueueManager?: SaveQueueManager;
   /** Memory instance for thread creation and message persistence */
@@ -565,6 +721,8 @@ export interface RunRegistryEntry {
   workspace?: Workspace;
   /** Request context for forwarding auth data, feature flags, etc. to tools */
   requestContext?: RequestContext;
+  /** MCP protocol context for in-process tool execution (non-serializable). */
+  mcp?: MCPToolExecutionContext;
   /** Cleanup function to call when run completes */
   cleanup?: () => void;
   /** MessageList for tracking conversation messages (non-serializable) */
@@ -578,7 +736,7 @@ export interface RunRegistryEntry {
    * can invoke each processor's `processLLMRequest` method. When absent the
    * durable `llm-execution` step falls back to `inputProcessors`.
    */
-  llmRequestInputProcessors?: InputProcessorOrWorkflow[];
+  llmRequestInputProcessors?: LLMRequestProcessorOrWorkflow[];
   /** Resolved output processors (non-serializable) */
   outputProcessors?: OutputProcessorOrWorkflow[];
   /** Resolved error processors (non-serializable) */
@@ -724,6 +882,23 @@ export interface RunRegistryEntry {
    */
   abortController?: AbortController;
   /**
+   * Run-level execution budget from `modelSettings.timeout.totalMs` (#21724
+   * parity port). Parked here so warm resumes re-arm the original budget
+   * without re-reading the snapshot; cold resumes restore it from the
+   * persisted workflow input. The budget is armed per execution session
+   * (stream/resume/recover) — matching the main loop, where each session
+   * gets a fresh timer — by composing `abortSignal` through
+   * `createTimeoutAbortSignal` at install time.
+   */
+  timeoutTotalMs?: number;
+  /**
+   * Whether this process has already subscribed to cross-process abort
+   * requests for the run. Set by `ensureRemoteAbortListener`, which every
+   * durable step calls on entry — the flag is what keeps a run's many steps
+   * from installing duplicate subscriptions.
+   */
+  remoteAbortListenerInstalled?: boolean;
+  /**
    * Promise tracking the in-flight workflow execution (or resume) for this
    * run. Resolves once the workflow has fully settled (finished, errored,
    * suspended-and-persisted, or aborted). Used by `generate()` /
@@ -732,6 +907,11 @@ export interface RunRegistryEntry {
    * surface — purely an internal coordination primitive.
    */
   workflowExecution?: Promise<unknown>;
+  /**
+   * Mastra instance that owns this in-process run. Used during shutdown to
+   * wait only for executions that may still need this instance's storage.
+   */
+  mastra?: Mastra;
   /**
    * Tripwire data from `processInput` (initial input processing). When an
    * input processor calls `abort()` during `runInputProcessors` in
@@ -770,6 +950,15 @@ export interface RunRegistryEntry {
    * and structured output degrades to raw text.
    */
   structuredOutput?: StructuredOutputOptions;
+  /**
+   * Call-time `returnScorerData` flag. Also serialized into
+   * `SerializableDurableOptions`, but parked here too so warm resume() and
+   * observe() can rebuild `scoringData` on their client-side
+   * `MastraModelOutput` without re-reading the snapshot. Cross-process
+   * engines lose this slot; cold resume restores it from the persisted
+   * workflow input instead.
+   */
+  returnScorerData?: boolean;
 }
 
 /**

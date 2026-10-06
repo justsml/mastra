@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { getLLMRecordingsDir, defaultNameGenerator, getLLMTestMode } from '@internal/llm-recorder';
 import { createGatewayMock, setupDummyApiKeys } from '@internal/test-utils';
-import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '..';
 import { MockMemory } from '../memory/mock';
@@ -21,7 +21,35 @@ let mockStorage: InMemoryStore;
 
 let mockGateway: any;
 
+// The AI SDK generates Gemini tool-call ids client-side from `Math.random()`
+// (`createIdGenerator` in @ai-sdk/provider-utils). The auto-resume protocol
+// makes the model echo those ids back (`suspendedToolCallId`), so replayed
+// recordings can only correlate with the current run's persisted suspension if
+// the ids are deterministic per test — same reason `crypto.randomUUID` is
+// stubbed globally. Only draws made by the id generator consume the seeded
+// stream; every other `Math.random` caller gets real randomness so incidental
+// draws (e.g. live-mode networking) cannot shift the id sequence between
+// record and replay.
+let mathRandomSeed = 0;
+const seededRandom = () => {
+  // Mulberry32 — small deterministic PRNG, reset per test.
+  mathRandomSeed = (mathRandomSeed + 0x6d2b79f5) | 0;
+  let t = mathRandomSeed;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const realRandom = Math.random.bind(Math);
+// Matches the `generator` closure from `createIdGenerator` in
+// @ai-sdk/provider-utils and its vendored copies (packages/_vendored/ai_*).
+// Frames appear as `at generator (...)` or `at Object.generator [as generateId] (...)`.
+const idGeneratorFrame = /at (?:\S+\.)?generator(?: \[as \w+\])? \(.*(@ai-sdk[/+]provider-utils|_vendored[/\\]ai_)/;
+
 beforeEach(async c => {
+  mathRandomSeed = 0;
+  vi.spyOn(Math, 'random').mockImplementation(() =>
+    idGeneratorFrame.test(new Error().stack ?? '') ? seededRandom() : realRandom(),
+  );
   memory = new MockMemory();
   requestContext = new RequestContext();
   mockStorage = new InMemoryStore();
@@ -52,6 +80,11 @@ beforeEach(async c => {
         /\\"suspendedToolRunId\\":\\"[^\\"]+\\"/g,
         '\\"suspendedToolRunId\\":\\"NORMALIZED\\"',
       );
+      serialized = serialized.replace(/"suspendedToolCallId":"[^"]+"/g, '"suspendedToolCallId":"NORMALIZED"');
+      serialized = serialized.replace(
+        /\\"suspendedToolCallId\\":\\"[^\\"]+\\"/g,
+        '\\"suspendedToolCallId\\":\\"NORMALIZED\\"',
+      );
       // Normalize workflow timestamps embedded in multi-level stringified results.
       // They can appear at various escape depths (\"startedAt\", \\\"startedAt\\\", etc.)
       serialized = serialized.replace(/(\\*"startedAt\\*":\s*)\d{10,}/g, '$10');
@@ -66,6 +99,13 @@ beforeEach(async c => {
       // Normalize client-generated tool call ids echoed back in Gemini
       // functionCall/functionResponse parts — the AI SDK generates a fresh
       // random id per run, so they can never match the recorded request.
+      // Also drop the provider-injected `skip_thought_signature_validator`
+      // sentinel: @ai-sdk/google decides when to inject it for Gemini 3
+      // parallel function calls without a real thoughtSignature, and that
+      // decision changed across provider versions (4.0.18 injected it on
+      // every unsigned call; 4.0.25 skips calls that follow a signed call
+      // in the same model response). Real signatures are replay-stable and
+      // remain part of the hash.
       const normalizeFunctionCallIds = (value: unknown): void => {
         if (Array.isArray(value)) {
           for (const item of value) normalizeFunctionCallIds(item);
@@ -73,6 +113,16 @@ beforeEach(async c => {
         }
         if (value && typeof value === 'object') {
           const obj = value as Record<string, unknown>;
+          if (obj.thoughtSignature === 'skip_thought_signature_validator') {
+            delete obj.thoughtSignature;
+          }
+          // Provider upgrades can represent this permissive schema differently.
+          // Its shape does not affect the suspension behavior under test.
+          if (obj.description === 'The resumeData object created from the resumeSchema of suspended tool') {
+            for (const key of Object.keys(obj)) {
+              if (key !== 'description') delete obj[key];
+            }
+          }
           for (const [key, child] of Object.entries(obj)) {
             if (
               (key === 'functionCall' || key === 'functionResponse') &&
@@ -93,7 +143,10 @@ beforeEach(async c => {
   });
   await mockGateway.start();
 });
-afterEach(() => mockGateway.saveAndStop());
+afterEach(async () => {
+  await mockGateway.saveAndStop();
+  vi.mocked(Math.random).mockRestore();
+});
 
 describe('Gemini Model Compatibility Tests', () => {
   // gemini-2.0-flash was shut down 2026-06-01 and gemini-3-pro-preview was shut

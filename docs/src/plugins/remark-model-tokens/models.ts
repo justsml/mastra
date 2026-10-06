@@ -11,7 +11,7 @@
 
 export const MODEL_TOKENS: Record<string, string> = {
   // OpenAI
-  __GATEWAY_OPENAI_MODEL__: 'openai/gpt-5.5',
+  __GATEWAY_OPENAI_MODEL__: 'openai/gpt-5.6-sol',
   __GATEWAY_OPENAI_MODEL_MINI__: 'openai/gpt-5-mini',
   __GATEWAY_OPENAI_MODEL_NANO__: 'openai/gpt-5-nano',
   __GATEWAY_OPENAI_MODEL_BASE__: 'openai/gpt-5',
@@ -29,6 +29,9 @@ export const MODEL_TOKENS: Record<string, string> = {
   // Google
   __GATEWAY_GOOGLE_MODEL__: 'google/gemini-2.5-pro',
   __GATEWAY_GOOGLE_MODEL_FLASH__: 'google/gemini-2.5-flash',
+
+  // TypeSafe AI
+  __AI_SDK_TYPESAFE_EVALUATION_MODEL__: 'jev-latest',
 
   // Alibaba
   __GATEWAY_ALIBABA_MODEL__: 'alibaba/qwen-max',

@@ -1,0 +1,102 @@
+import { getSignalRecordNodeId, getSignalRecordNodeLabel, getSignalRecordNodeValue } from './sankey-signals-data';
+import { getSignalColor } from './signal-colors';
+import { SortableSignalHeaders } from './sortable-signal-headers';
+import type { ThemeFlowResponse, TraceSignalName } from './types';
+import { Card, CardContent } from '@/ds/components/Card';
+import { Sankey, SankeyChart } from '@/ds/components/SankeyChart';
+import type { SankeyChartColumn, SankeyChartNodeSelection, SankeyChartRecord } from '@/ds/components/SankeyChart';
+import { Txt } from '@/ds/components/Txt';
+
+export function FlowCard({
+  columns,
+  records,
+  stages,
+  height,
+  onNodeClick,
+  isNodeClickable,
+  drillInDisabledReason,
+  onOrderChange,
+  signalOrder,
+  reorderDisabled,
+}: {
+  columns: SankeyChartColumn[];
+  records: SankeyChartRecord[];
+  stages: ThemeFlowResponse['stages'];
+  height?: number;
+  onNodeClick?: (selection: SankeyChartNodeSelection) => void;
+  isNodeClickable?: (selection: SankeyChartNodeSelection) => boolean;
+  drillInDisabledReason?: string;
+  onOrderChange: (signalNames: TraceSignalName[]) => void;
+  signalOrder: TraceSignalName[];
+  reorderDisabled: boolean;
+}) {
+  const linkedColumnIds = new Set(columns.map(column => column.id));
+  const stageSignalNames = stages.map(stage => stage.signalName).filter(signalName => linkedColumnIds.has(signalName));
+  const optimisticSignalNames = signalOrder.filter(signalName => linkedColumnIds.has(signalName));
+  const optimisticSignalSet = new Set(optimisticSignalNames);
+  const headerSignalNames = reorderDisabled
+    ? [...optimisticSignalNames, ...stageSignalNames.filter(signalName => !optimisticSignalSet.has(signalName))]
+    : stageSignalNames;
+  const chartColumns = columns.map(column => ({ ...column, label: column.label.toUpperCase() }));
+  const handleHeaderOrderChange = (reordered: TraceSignalName[]) => {
+    const seen = new Set<TraceSignalName>(reordered);
+    onOrderChange([...reordered, ...signalOrder.filter(name => !seen.has(name))]);
+  };
+
+  return (
+    <Card
+      aria-label="Trace signal theme flow"
+      as="section"
+      className="relative min-w-0"
+      elevation="raised"
+      title={drillInDisabledReason}
+    >
+      <Txt
+        as="span"
+        variant="meta"
+        tone="muted"
+
+        aria-hidden="true"
+        className="absolute top-0 left-5 -translate-y-1/2 bg-background px-2"
+      >
+        SIGNALS
+      </Txt>
+      <CardContent className="px-0 pt-4 pb-2 sm:pt-5 sm:pb-3">
+        <SortableSignalHeaders
+          signalNames={headerSignalNames}
+          reorderDisabled={reorderDisabled}
+          onOrderChange={handleHeaderOrderChange}
+        />
+        <div aria-label="Themes" role="separator" className="flex items-center gap-2 py-1">
+          <span aria-hidden="true" className="h-px w-5 bg-border" />
+          <Txt tone="muted" as="span" variant="meta" className="block">
+            THEMES
+          </Txt>
+          <span aria-hidden="true" className="h-px flex-1 bg-border" />
+        </div>
+        <div aria-busy={reorderDisabled} data-testid="sankey-order-transition">
+          <Sankey
+            data={records}
+            columns={chartColumns}
+            columnOrder={chartColumns.map(column => column.id)}
+            getColumnColor={column => getSignalColor(column.id)}
+            getRecordNodeId={getSignalRecordNodeId}
+            getRecordNodeLabel={getSignalRecordNodeLabel}
+            getRecordNodeValue={getSignalRecordNodeValue}
+            getRecordWeight={record => Number(record.traceCount)}
+            getRecordLayoutWeight={record => Number(record.layoutTraceCount)}
+          >
+            <SankeyChart
+              height={height ?? 'clamp(340px, 42vw, 460px)'}
+              margin={{ top: 40, right: 32, bottom: 24, left: 32 }}
+              onNodeClick={onNodeClick}
+              isNodeClickable={isNodeClickable}
+              hideColumnLabels
+              geometryTransitionKey={chartColumns.map(column => column.id).join(':')}
+            />
+          </Sankey>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}

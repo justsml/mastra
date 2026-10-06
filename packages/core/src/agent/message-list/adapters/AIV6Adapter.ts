@@ -11,7 +11,13 @@ import type {
   MastraToolInvocationPart,
 } from '../state/types';
 import type { AIV5Type, AIV6Type, MessageSource } from '../types';
+import {
+  getResponseResultProviderMetadata,
+  omitResponseResultItemIds,
+  preserveResponseItemIdsOnMerge,
+} from '../utils/response-item-metadata';
 import { sanitizeToolName } from '../utils/tool-name';
+import { unwrapLegacyToolOutput } from '../utils/unwrap-legacy-tool-output';
 import { AIV5Adapter } from './AIV5Adapter';
 
 type AIV6AdapterContext = {
@@ -47,10 +53,6 @@ function normalizeToolArgs(input: unknown): Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
 }
 
-function normalizeToolResult(output: unknown): unknown {
-  return typeof output === 'object' && output && 'value' in output ? (output as { value: unknown }).value : output;
-}
-
 function isV6OnlyToolState(
   state: string,
 ): state is Extract<MastraToolInvocation['state'], 'approval-requested' | 'approval-responded' | 'output-denied'> {
@@ -79,13 +81,48 @@ function getToolNameFromUIPart(part: AIV6Type.ToolUIPart | AIV6Type.DynamicToolU
   return part.type === 'dynamic-tool' ? sanitizeToolName(part.toolName) : getToolNameFromType(part.type);
 }
 
+/**
+ * v6 splits tool provider metadata across `callProviderMetadata` and
+ * `resultProviderMetadata`, but a Mastra part has one slot. Reading only the call half
+ * dropped the `toModelOutput` projection prompt building looks for (issue #22012).
+ * The result half wins on conflict, being the later of the two — except for Responses
+ * item ids: a hosted tool (e.g. OpenAI `tool_search`) gives its call and output distinct
+ * ids and replay needs both, so the call's stays as `itemId` and the result's is kept
+ * beside it as `resultItemId`.
+ */
+function mergeToolUIPartProviderMetadata(
+  part: AIV6Type.ToolUIPart | AIV6Type.DynamicToolUIPart,
+): MastraProviderMetadata | undefined {
+  const callMetadata = 'callProviderMetadata' in part ? part.callProviderMetadata : undefined;
+  const resultMetadata = 'resultProviderMetadata' in part ? part.resultProviderMetadata : undefined;
+
+  if (!resultMetadata) return toMastraProviderMetadata(callMetadata);
+  if (!callMetadata) return toMastraProviderMetadata(resultMetadata);
+
+  // Merge per provider namespace so a result that only sets `mastra.modelOutput` keeps
+  // the call-time keys sitting beside it.
+  const merged: AIV6Type.ProviderMetadata = { ...callMetadata };
+  for (const [providerKey, resultValue] of Object.entries(resultMetadata)) {
+    const callValue = merged[providerKey];
+    merged[providerKey] = callValue ? { ...callValue, ...resultValue } : resultValue;
+  }
+
+  return toMastraProviderMetadata(
+    preserveResponseItemIdsOnMerge(
+      callMetadata as Record<string, unknown>,
+      resultMetadata as Record<string, unknown>,
+      merged as Record<string, unknown>,
+    ) as AIV6Type.ProviderMetadata,
+  );
+}
+
 function createToolInvocationPartFromUIPart(part: AIV6Type.ToolUIPart | AIV6Type.DynamicToolUIPart) {
   const base = {
     toolCallId: part.toolCallId,
     toolName: getToolNameFromUIPart(part),
     args: normalizeToolArgs(part.input),
     approval: 'approval' in part ? toMastraApproval(part.approval) : undefined,
-    providerMetadata: 'callProviderMetadata' in part ? toMastraProviderMetadata(part.callProviderMetadata) : undefined,
+    providerMetadata: mergeToolUIPartProviderMetadata(part),
     providerExecuted: part.providerExecuted,
     title: part.title,
     preliminary: 'preliminary' in part ? part.preliminary : undefined,
@@ -108,7 +145,7 @@ function createToolInvocationPartFromUIPart(part: AIV6Type.ToolUIPart | AIV6Type
       return createToolInvocationPart({
         ...base,
         state: 'result',
-        result: normalizeToolResult(part.output),
+        result: unwrapLegacyToolOutput(part.output),
       });
 
     case 'output-error':
@@ -138,6 +175,13 @@ function normalizeV6PartForV5Bridge(part: AIV6Type.UIMessage['parts'][number]): 
   }
 
   return part as unknown as AIV5Type.UIMessage['parts'][number];
+}
+
+function getSuspendedToolCallId(part: { type: string }): string | undefined {
+  if (part.type !== 'data-tool-call-suspended' || !('data' in part)) return undefined;
+  const data = part.data;
+  if (!data || typeof data !== 'object' || !('toolCallId' in data)) return undefined;
+  return typeof data.toolCallId === 'string' ? data.toolCallId : undefined;
 }
 
 function createToolInvocationPart({
@@ -220,9 +264,87 @@ function findApprovalRequest(
         return part;
       }
     }
+
+    const pendingToolApprovals = message.content.metadata?.pendingToolApprovals;
+    if (!pendingToolApprovals || typeof pendingToolApprovals !== 'object') {
+      continue;
+    }
+
+    for (const pendingToolApproval of Object.values(pendingToolApprovals)) {
+      if (!pendingToolApproval || typeof pendingToolApproval !== 'object') {
+        continue;
+      }
+
+      const toolCallId = 'toolCallId' in pendingToolApproval ? pendingToolApproval.toolCallId : undefined;
+      if (typeof toolCallId !== 'string') {
+        continue;
+      }
+
+      const runId = 'runId' in pendingToolApproval ? pendingToolApproval.runId : undefined;
+      const pendingApprovalId = typeof runId === 'string' ? `${runId}::${toolCallId}` : toolCallId;
+      if (pendingApprovalId !== approvalId) {
+        continue;
+      }
+
+      const existingPart = findToolInvocationPart(message.content.parts || [], toolCallId);
+      if (!existingPart) {
+        continue;
+      }
+
+      return createToolInvocationPart({
+        toolCallId: existingPart.toolInvocation.toolCallId,
+        toolName: existingPart.toolInvocation.toolName,
+        args: existingPart.toolInvocation.args,
+        state: 'approval-requested',
+        approval: { id: pendingApprovalId },
+        providerMetadata: existingPart.providerMetadata,
+        providerExecuted: existingPart.providerExecuted,
+        title: existingPart.title,
+        preliminary: existingPart.preliminary,
+      });
+    }
   }
 
   return undefined;
+}
+
+function rehydratePendingToolApprovals(parts: AIV6Type.UIMessage['parts'], metadata: Record<string, unknown>) {
+  const pendingToolApprovals = metadata.pendingToolApprovals;
+  if (!pendingToolApprovals || typeof pendingToolApprovals !== 'object') {
+    return;
+  }
+
+  for (const pendingToolApproval of Object.values(pendingToolApprovals)) {
+    if (!pendingToolApproval || typeof pendingToolApproval !== 'object') {
+      continue;
+    }
+
+    const toolCallId = 'toolCallId' in pendingToolApproval ? pendingToolApproval.toolCallId : undefined;
+    if (typeof toolCallId !== 'string') {
+      continue;
+    }
+
+    const runId = 'runId' in pendingToolApproval ? pendingToolApproval.runId : undefined;
+    const approvalId = typeof runId === 'string' ? `${runId}::${toolCallId}` : toolCallId;
+
+    const toolPartIndex = parts.findIndex(
+      part => AIV6.isToolUIPart(part) && part.toolCallId === toolCallId && part.state === 'input-available',
+    );
+    if (toolPartIndex === -1) {
+      continue;
+    }
+
+    const toolPart = parts[toolPartIndex];
+    if (!toolPart || !AIV6.isToolUIPart(toolPart) || toolPart.state !== 'input-available') {
+      continue;
+    }
+
+    parts[toolPartIndex] = {
+      ...toolPart,
+      state: 'approval-requested',
+      approval: { id: approvalId },
+    } as AIV6Type.UIMessage['parts'][number];
+  }
 }
 
 function createLegacyToolInvocations(
@@ -284,7 +406,8 @@ export class AIV6Adapter {
     const hasTextParts = dbParts.some(part => part.type === 'text');
 
     for (const part of dbParts) {
-      parts.push(AIV6Adapter.toUIPart(part));
+      const uiPart = AIV6Adapter.toUIPart(part);
+      if (uiPart) parts.push(uiPart);
     }
 
     if (!hasToolInvocationParts || !hasReasoningParts || !hasFileParts || !hasTextParts) {
@@ -315,6 +438,9 @@ export class AIV6Adapter {
         }
       }
     }
+
+    AIV6Adapter.rehydrateSuspendedToolParts(parts, v5Message.parts);
+    rehydratePendingToolApprovals(parts, metadata);
 
     return {
       id: dbMsg.id,
@@ -484,7 +610,7 @@ export class AIV6Adapter {
     };
   }
 
-  private static toUIPart(part: MastraMessagePart): AIV6Type.UIMessage['parts'][number] {
+  private static toUIPart(part: MastraMessagePart): AIV6Type.UIMessage['parts'][number] | undefined {
     if (part.type === 'tool-invocation') {
       const base = withOptionalFields(
         {
@@ -493,7 +619,14 @@ export class AIV6Adapter {
           providerExecuted: part.providerExecuted,
         },
         {
-          callProviderMetadata: part.providerMetadata,
+          // `resultItemId` is how a single-slot Mastra part carries the result's
+          // Responses item id. v6 has a real slot for it (`resultProviderMetadata`
+          // below), so the internal key must not ride along on the public call
+          // metadata — v6's own convertToModelMessages would forward it to the
+          // provider as `providerOptions.openai.resultItemId`.
+          callProviderMetadata: omitResponseResultItemIds(
+            part.providerMetadata as Record<string, unknown> | undefined,
+          ) as typeof part.providerMetadata,
           title: part.title,
         },
       );
@@ -549,6 +682,12 @@ export class AIV6Adapter {
             },
             {
               rawInput: part.toolInvocation.rawInput,
+              // A failed hosted call replays by item reference like a successful
+              // one, so its result id needs the same dedicated slot (see the
+              // `result` case below).
+              resultProviderMetadata: getResponseResultProviderMetadata(
+                part.providerMetadata as Record<string, unknown> | undefined,
+              ),
               approval:
                 part.toolInvocation.approval?.approved === true
                   ? {
@@ -586,6 +725,12 @@ export class AIV6Adapter {
             },
             {
               preliminary: part.preliminary,
+              // v6 has a dedicated slot for result-side metadata. Surface the result's
+              // Responses item id there when it differs from the call's, so a
+              // toUIMessage → fromUIMessage round trip keeps both ids.
+              resultProviderMetadata: getResponseResultProviderMetadata(
+                part.providerMetadata as Record<string, unknown> | undefined,
+              ),
               approval:
                 part.toolInvocation.approval?.approved === true
                   ? {
@@ -617,17 +762,43 @@ export class AIV6Adapter {
       ) as AIV6Type.UIMessage['parts'][number];
     }
 
-    return AIV6Adapter.toUIPartFromV5(
-      AIV5Adapter.toUIMessage({
-        id: 'tmp',
-        role: 'assistant',
-        createdAt: new Date(),
-        content: {
-          format: 2,
-          parts: [part],
-        },
-      }).parts[0]!,
-    );
+    const v5Part = AIV5Adapter.toUIMessage({
+      id: 'tmp',
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [part],
+      },
+    }).parts[0];
+
+    // The v5 bridge legitimately omits some parts (e.g. reasoning with no text and no
+    // details, which streaming emits before the first reasoning delta arrives).
+    // Signal "no part" instead of dereferencing undefined.
+    return v5Part ? AIV6Adapter.toUIPartFromV5(v5Part) : undefined;
+  }
+
+  // AIV5Adapter synthesizes data-tool-call-suspended parts from metadata.suspendedTools;
+  // carry them into the v6 message so suspension state survives history reloads.
+  private static rehydrateSuspendedToolParts(
+    parts: AIV6Type.UIMessage['parts'],
+    v5Parts: AIV5Type.UIMessage['parts'],
+  ): void {
+    const existingIds = new Set(parts.map(getSuspendedToolCallId).filter(id => id !== undefined));
+
+    for (const v5Part of v5Parts) {
+      const toolCallId = getSuspendedToolCallId(v5Part);
+      if (!toolCallId || existingIds.has(toolCallId)) continue;
+
+      const toolPartIndex = parts.findIndex(part => AIV6.isToolUIPart(part) && part.toolCallId === toolCallId);
+      const dataPart = AIV6Adapter.toUIPartFromV5(v5Part);
+      if (toolPartIndex === -1) {
+        parts.push(dataPart);
+      } else {
+        parts.splice(toolPartIndex + 1, 0, dataPart);
+      }
+      existingIds.add(toolCallId);
+    }
   }
 
   private static toUIPartFromV5(part: AIV5Type.UIMessage['parts'][number]): AIV6Type.UIMessage['parts'][number] {

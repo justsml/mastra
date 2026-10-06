@@ -42,12 +42,36 @@ const makeVariantStep = (kind: ResolvedWorkflowStep['kind']): ResolvedWorkflowSt
         result: successResult,
         workflowStatus: 'success',
       };
+    case 'agent-step':
+      return {
+        kind,
+        id: kind,
+        flow: { type: 'agent', id: kind, agentId: 'writer-agent' },
+        result: successResult,
+        workflowStatus: 'success',
+      };
+    case 'tool-step':
+      return {
+        kind,
+        id: kind,
+        flow: { type: 'tool', id: kind, toolId: 'double-tool' },
+        result: successResult,
+        workflowStatus: 'success',
+      };
+    case 'classifier-step':
+      return {
+        kind,
+        id: kind,
+        flow: { type: 'classifier', id: kind, classifierId: 'ticket-router' },
+        result: successResult,
+        workflowStatus: 'success',
+      };
     case 'foreach-step':
       return {
         kind,
         id: kind,
         step,
-        flow: { type: 'foreach', step, opts: { concurrency: 2 } },
+        flow: { type: 'foreach', step: { type: 'step', step }, opts: { concurrency: 2 } },
         result: successResult,
         workflowStatus: 'success',
       };
@@ -78,7 +102,12 @@ const makeVariantStep = (kind: ResolvedWorkflowStep['kind']): ResolvedWorkflowSt
         kind,
         id: kind,
         step,
-        flow: { type: 'loop', step, serializedCondition: { id: 'loop-1', fn: 'true' }, loopType: 'dountil' },
+        flow: {
+          type: 'loop',
+          step: { type: 'step', step },
+          serializedCondition: { id: 'loop-1', fn: 'true' },
+          loopType: 'dountil',
+        },
         result: successResult,
         workflowStatus: 'success',
       };
@@ -151,6 +180,9 @@ describe('WorkflowStepFactory', () => {
 
   it.each([
     ['map-step', 'MapStep'],
+    ['agent-step', 'AgentStep'],
+    ['tool-step', 'ToolStep'],
+    ['classifier-step', 'ClassifierStep'],
     ['foreach-step', 'ForEachStep'],
     ['parallel-step', 'ParallelStep'],
     ['conditional', 'Conditional'],
@@ -164,6 +196,9 @@ describe('WorkflowStepFactory', () => {
     const calls = {
       Step: vi.fn<(props: ResolvedWorkflowStep) => void>(),
       MapStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
+      AgentStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
+      ToolStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
+      ClassifierStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
       ForEachStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
       ParallelStep: vi.fn<(props: ResolvedWorkflowStep) => void>(),
       Conditional: vi.fn<(props: ResolvedWorkflowStep) => void>(),
@@ -184,6 +219,18 @@ describe('WorkflowStepFactory', () => {
         MapStep={props => {
           calls.MapStep(props);
           return <div data-testid="MapStep">{props.kind}</div>;
+        }}
+        AgentStep={props => {
+          calls.AgentStep(props);
+          return <div data-testid="AgentStep">{props.kind}</div>;
+        }}
+        ToolStep={props => {
+          calls.ToolStep(props);
+          return <div data-testid="ToolStep">{props.kind}</div>;
+        }}
+        ClassifierStep={props => {
+          calls.ClassifierStep(props);
+          return <div data-testid="ClassifierStep">{props.kind}</div>;
         }}
         ForEachStep={props => {
           calls.ForEachStep(props);

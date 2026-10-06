@@ -4,12 +4,15 @@
  */
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import type { Component } from '@earendil-works/pi-tui';
+import type { BackgroundCompletionEvent } from '@mastra/code-sdk/agents/background-completion-events';
+import { MODEL_FALLBACK_STATE_KEY } from '@mastra/code-sdk/auth/account-rotation-processor';
+import type { PendingModelFallback } from '@mastra/code-sdk/auth/account-rotation-processor';
 import { getOAuthProviders } from '@mastra/code-sdk/auth/storage';
 import {
   getAvailableModePacks,
   getAvailableOmPacks,
+  selectPreferredOMPack,
   ONBOARDING_VERSION,
   loadSettings,
   saveSettings,
@@ -18,6 +21,7 @@ import type { ProviderAccess, ProviderAccessLevel } from '@mastra/code-sdk/onboa
 import {
   resolveThreadActiveModelPackId,
   THREAD_ACTIVE_MODEL_PACK_ID_KEY,
+  THREAD_FALLBACK_STATUS_KEY,
   MASTRA_GATEWAY_PROVIDER,
 } from '@mastra/code-sdk/onboarding/settings';
 import type { LoadedPlugin } from '@mastra/code-sdk/plugins/types';
@@ -28,31 +32,42 @@ import {
   isNewerVersion,
   performUpdate,
 } from '@mastra/code-sdk/utils/update-check';
-import type { AgentSignalAttributes } from '@mastra/core/agent';
 import type { AgentControllerEvent, MastraDBMessage } from '@mastra/core/agent-controller';
 import type { Workspace } from '@mastra/core/workspace';
+import { disposeAssistantRenderState } from './assistant-render-registry.js';
+import {
+  clearCompletedBackgroundActivitiesForTarget,
+  compareBackgroundActivities,
+  completeBackgroundActivity,
+  getBackgroundActivitiesForTarget,
+} from './background-activity.js';
+import type { BackgroundActivity } from './background-activity.js';
 import { insertChatComponentWithBoundarySpacing } from './chat-boundary-reconciliation.js';
 import { dispatchSlashCommand } from './command-dispatch.js';
-import { startGoalWithDefaults } from './commands/goal.js';
-
+import { sendGoalReminder, setGoalWithDefaults } from './commands/goal.js';
+import { showThreadLockPrompt } from './commands/threads.js';
 import type { SlashCommandContext } from './commands/types.js';
 import { AskQuestionInlineComponent } from './components/ask-question-inline.js';
+import { BackgroundActivitySelectorComponent } from './components/background-activity-selector.js';
 import { LoginDialogComponent } from './components/login-dialog.js';
 import { promptAuthMode } from './components/login-mode-selector.js';
 import { ModelSelectorComponent } from './components/model-selector.js';
 import type { ModelItem } from './components/model-selector.js';
 import { GradientAnimator } from './components/obi-loader.js';
-import type { IToolExecutionComponent } from './components/tool-execution-interface.js';
 import { showError, showInfo, showFormattedError, notify } from './display.js';
-import { dispatchEvent } from './event-dispatch.js';
+import { dispatchEvent, getThreadLifecycleGeneration } from './event-dispatch.js';
+import { renderStatusAnimationFrame } from './footer-animation-renderer.js';
 import { isGoalJudgeInputLocked, showGoalJudgeInputLockInfo } from './goal-input-lock.js';
 import type { EventHandlerContext } from './handlers/types.js';
 import { askModalQuestion } from './modal-question.js';
+import { applyCurrentThreadPack, listResolvableModePacks } from './model-packs/apply.js';
+import { applyOMModelToSession, seedOMDefaultAfterLogin } from './om-defaults.js';
 import type { OnboardingResult } from './onboarding-inline.js';
 import { OnboardingInlineComponent } from './onboarding-inline.js';
 import { showModalOverlay } from './overlay.js';
 import { promptForApiKeyIfNeeded } from './prompt-api-key.js';
 
+import { applyQuietModeToRenderedComponents } from './quiet-mode.js';
 import {
   addPendingUserMessage,
   addUserMessage,
@@ -63,6 +78,7 @@ import {
   renderTaskDeltaInline,
 } from './render-messages.js';
 import { flushRender, requestRender } from './render-scheduler.js';
+import { showSessionError } from './session-errors.js';
 import {
   setupKeyboardShortcuts,
   buildLayout,
@@ -71,14 +87,14 @@ import {
   refreshSkillsAutocomplete,
   setupKeyHandlers,
   subscribeToAgentController,
-  updateTerminalTitle,
-  promptForThreadSelection,
   renderExistingTasks,
 } from './setup.js';
 import { handleShellPassthrough } from './shell.js';
 import type { MastraTUIOptions, TUIState } from './state.js';
 import { createTUIState, getGithubPrSubscriptionsFromMetadata } from './state.js';
 import { updateStatusLine } from './status-line.js';
+import { resumeThreadOnStartup } from './thread-startup.js';
+import { setCurrentThreadTitle } from './thread-title.js';
 
 // =============================================================================
 // Types
@@ -90,21 +106,8 @@ export type { MastraTUIOptions } from './state.js';
 // MastraTUI Class
 // =============================================================================
 
-/**
- * Delivery option attributes applied to user-message signals. When the signal is delivered to an
- * active run it is tagged as while-active; when it starts a new run it is a message.
- * The LLM sees these as XML attributes on the `<user-message>` element.
- */
 type GithubPollingChangedHandler = (event: { threadId: string; resourceId: string; running: boolean }) => void;
 type GithubSignalsWithPollingEvents = { onPollingChanged?: (handler: GithubPollingChangedHandler) => void };
-
-const USER_SIGNAL_DELIVERY_OPTIONS: {
-  ifActive: { attributes: AgentSignalAttributes };
-  ifIdle: { attributes: AgentSignalAttributes };
-} = {
-  ifActive: { attributes: { delivery: 'while-active' } },
-  ifIdle: { attributes: { delivery: 'message' } },
-};
 
 const USER_MESSAGE_APPROVAL_INTERRUPT = {
   reason: 'interrupted_by_user_message',
@@ -116,20 +119,67 @@ const UPDATE_RECHECK_INTERVAL_MS = 45 * 60 * 1_000; // 45 minutes
 const IMAGE_PLACEHOLDER_PATTERN = /\[image\]\s*/g;
 const CAFFEINATE_ARGS = ['-i', '-m'];
 
+function fallbackStatusFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): { usingPack: string; failedPack: string } | undefined {
+  const persisted = metadata?.[THREAD_FALLBACK_STATUS_KEY];
+  if (
+    persisted &&
+    typeof persisted === 'object' &&
+    typeof (persisted as Record<string, unknown>).usingPack === 'string' &&
+    typeof (persisted as Record<string, unknown>).failedPack === 'string'
+  ) {
+    return persisted as { usingPack: string; failedPack: string };
+  }
+  return undefined;
+}
+
 export async function syncInitialThreadState(state: TUIState): Promise<void> {
   const initThreadId = state.session.thread.getId();
-  if (!initThreadId) return;
+  if (!initThreadId) {
+    setCurrentThreadTitle(state, undefined);
+    state.fallbackStatus = undefined;
+    return;
+  }
 
   const initThreads = await state.session.thread.list();
+  if (state.session.thread.getId() !== initThreadId) return;
+
   const initThread = initThreads.find(t => t.id === initThreadId);
-  if (initThread?.title) {
-    state.currentThreadTitle = initThread.title;
-  }
   const metadata = initThread?.metadata as Record<string, unknown> | undefined;
+  const persistedFallbackStatus = fallbackStatusFromMetadata(metadata);
+  const pendingFallback = metadata?.[MODEL_FALLBACK_STATE_KEY] as Partial<PendingModelFallback> | null | undefined;
+  const validPendingFallback =
+    pendingFallback &&
+    typeof pendingFallback === 'object' &&
+    typeof pendingFallback.fromEntryId === 'string' &&
+    typeof pendingFallback.toEntryId === 'string' &&
+    typeof pendingFallback.toModelId === 'string' &&
+    (pendingFallback.reason === 'pool-exhausted' || pendingFallback.reason === 'persistent-outage') &&
+    typeof pendingFallback.at === 'string'
+      ? (pendingFallback as PendingModelFallback)
+      : null;
+  const currentState = state.session.state?.get?.() as Record<string, unknown> | undefined;
+  const currentPending = currentState?.[MODEL_FALLBACK_STATE_KEY];
+  if (validPendingFallback || currentPending) {
+    const updates = {
+      [MODEL_FALLBACK_STATE_KEY]: validPendingFallback,
+    };
+    const applied = state.session.state.setIf
+      ? await state.session.state.setIf(updates, () => state.session.thread.getId() === initThreadId)
+      : state.session.thread.getId() === initThreadId
+        ? await state.session.state.set(updates).then(() => true)
+        : false;
+    if (!applied || state.session.thread.getId() !== initThreadId) return;
+  }
+
+  setCurrentThreadTitle(state, initThread?.title);
+  state.fallbackStatus = persistedFallbackStatus;
   state.activeGithubPrSubscriptions = getGithubPrSubscriptionsFromMetadata(metadata);
   // Prefer the durable ThreadState objective; fall back to the legacy
   // thread-metadata goal for threads created before the migration.
   await state.goalManager.loadFromThread(state);
+  if (state.session.thread.getId() !== initThreadId) return;
   if (!state.goalManager.getGoal()) {
     state.goalManager.loadFromThreadMetadata(metadata);
   }
@@ -160,7 +210,19 @@ export class MastraTUI {
   private caffeinateProcess: ChildProcess | null = null;
   private cleanupKeyHandlers?: () => void;
   private cleanupPluginReloadListener?: () => void;
+  private cleanupPluginUpdateListener?: () => void;
+  private cleanupBackgroundCompletionListener?: () => void;
+  private backgroundNoticeQueue = Promise.resolve();
   private lastStreamError: string | null = null;
+  private stopped = false;
+  /**
+   * Text submitted while the main loop was busy (running a slash command or a
+   * shell passthrough) and so was not waiting on `getUserInput`. The editor's
+   * submit handler stays installed across loop iterations, so without this the
+   * submission would resolve an already-settled promise and be silently lost.
+   */
+  private queuedUserInput: string[] = [];
+  private pendingUserInputResolve: ((text: string) => void) | undefined;
 
   private static readonly DOUBLE_CTRL_C_MS = 500;
 
@@ -189,8 +251,7 @@ export class MastraTUI {
       if (event.threadId !== currentThreadId || (currentResourceId && event.resourceId !== currentResourceId)) return;
       if (!this.state.githubPrGradientAnimator) {
         this.state.githubPrGradientAnimator = new GradientAnimator(() => {
-          updateStatusLine(this.state);
-          requestRender(this.state);
+          renderStatusAnimationFrame(this.state, () => updateStatusLine(this.state));
         });
       }
       this.state.githubPrPollingActive = event.running;
@@ -253,9 +314,83 @@ export class MastraTUI {
 
     setupKeyboardShortcuts(this.state, {
       stop: () => this.stop(),
+      exit: exitCode => this.exit(exitCode),
       doubleCtrlCMs: MastraTUI.DOUBLE_CTRL_C_MS,
       queueFollowUpMessage: text => this.queueFollowUpMessage(text),
+      ...(this.state.options.backgroundToolsEnabled
+        ? {
+            openBackgroundActivityCenter: () => this.showBackgroundActivityCenter(),
+            clearFinishedBackgroundActivities: () => this.clearFinishedBackgroundActivity(),
+          }
+        : {}),
     });
+    this.installUserInputHandler();
+  }
+
+  private getCurrentThreadBackgroundActivities(): BackgroundActivity[] {
+    return getBackgroundActivitiesForTarget(
+      this.state.backgroundActivities,
+      this.state.session.identity.getResourceId(),
+      this.state.pendingNewThread ? null : this.state.session.thread.getId(),
+    );
+  }
+
+  private refreshBackgroundActivity(): void {
+    if (!this.state.options.backgroundToolsEnabled) return;
+    this.state.globalBackgroundNotice.setActivities(this.getCurrentThreadBackgroundActivities());
+    flushRender(this.state);
+  }
+
+  private clearFinishedBackgroundActivity(): void {
+    clearCompletedBackgroundActivitiesForTarget(
+      this.state.backgroundActivities,
+      this.state.session.identity.getResourceId(),
+      this.state.pendingNewThread ? null : this.state.session.thread.getId(),
+    );
+    this.refreshBackgroundActivity();
+  }
+
+  private showBackgroundActivityCenter(): void {
+    const activities = this.getCurrentThreadBackgroundActivities().sort(compareBackgroundActivities);
+    if (activities.length === 0) return;
+
+    const selector = new BackgroundActivitySelectorComponent({
+      tui: this.state.ui,
+      activities,
+      getActivity: taskId => this.state.backgroundActivities.get(taskId),
+      onCancel: () => this.state.ui.hideOverlay(),
+      onAbort: activity => void this.abortBackgroundActivity(activity),
+    });
+    showModalOverlay(this.state.ui, selector, { maxHeight: '80%' });
+    selector.focused = true;
+  }
+
+  private async abortBackgroundActivity(activity: BackgroundActivity): Promise<void> {
+    try {
+      const manager = this.state.controller.getMastra()?.backgroundTaskManager;
+      if (!manager) return;
+      await manager.cancel(activity.taskId);
+    } catch (error) {
+      showError(this.state, error instanceof Error ? error.message : 'Failed to cancel background task');
+    } finally {
+      this.state.ui.hideOverlay();
+    }
+  }
+
+  private handleBackgroundCompletion(event: BackgroundCompletionEvent): void {
+    this.backgroundNoticeQueue = this.backgroundNoticeQueue
+      .then(() => {
+        completeBackgroundActivity(this.state.backgroundActivities, event);
+        this.refreshBackgroundActivity();
+      })
+      .catch(error => {
+        showError(this.state, error instanceof Error ? error.message : 'Failed to refresh background activity');
+      });
+  }
+
+  private exit(exitCode: number): void {
+    if (this.state.options.exit) this.state.options.exit(exitCode);
+    else process.exit(exitCode);
   }
 
   // ===========================================================================
@@ -274,43 +409,14 @@ export class MastraTUI {
       hookMgr.runSessionStart().catch(() => {});
     }
 
-    // Process initial message if provided (e.g. piped stdin content).
-    // Runs the same validation as interactive input: model check, prompt hooks.
+    // Initial message (--tui-initial-prompt / --tui-prompt and/or piped stdin) is
+    // submitted exactly like typed input, so slash commands and skills work too.
     if (this.state.options.initialMessage) {
-      const msg = this.state.options.initialMessage;
-
-      if (!this.state.session.model.hasSelection()) {
-        showInfo(this.state, 'No model selected. Use /models to select a model, or /login to authenticate.');
+      const { resumeSkipNotice } = this.state.options;
+      if (resumeSkipNotice && (await this.resumedConversation())) {
+        showInfo(this.state, resumeSkipNotice);
       } else {
-        const messageId = `user-${Date.now()}`;
-        addUserMessage(this.state, {
-          id: messageId,
-          role: 'user',
-          content: { format: 2, parts: [{ type: 'text', text: msg }] },
-          createdAt: new Date(),
-        });
-        flushRender(this.state);
-
-        const allowed = await this.runUserPromptHook(msg);
-        if (!allowed) {
-          const comp = this.state.messageComponentsById.get(messageId);
-          if (comp) {
-            this.state.chatContainer.removeChild(comp as never);
-            this.state.messageComponentsById.delete(messageId);
-            flushRender(this.state);
-          }
-        } else {
-          try {
-            if (this.state.pendingNewThread) {
-              await this.state.session.thread.create();
-              this.state.pendingNewThread = false;
-            }
-            this.fireMessage(msg);
-          } catch (error) {
-            this.state.pendingNewThread = false;
-            showError(this.state, error instanceof Error ? error.message : 'Failed to start thread');
-          }
-        }
+        await this.submitUserInput(this.state.options.initialMessage);
       }
     }
 
@@ -320,42 +426,58 @@ export class MastraTUI {
       const userInput = await this.getUserInput();
       // allow space as transparent continue (for recovering from api errors manually)
       if (!userInput.trim() && userInput !== ' ') continue;
+      await this.submitUserInput(userInput);
+    }
+  }
 
-      try {
-        const pendingNewThread = this.state.pendingNewThread;
+  /** Whether startup loaded a thread that already has messages. */
+  private async resumedConversation(): Promise<boolean> {
+    if (this.state.pendingNewThread) return false;
+    const threadId = this.state.session.thread.getId();
+    if (!threadId) return false;
+    const messages = await this.state.session.thread.listMessages({ threadId, limit: 1 });
+    return messages.length > 0;
+  }
 
-        // Handle slash commands
-        if (userInput.startsWith('/')) {
-          const handled = await this.handleSlashCommand(userInput);
-          if (handled) continue;
-        }
+  /**
+   * Handle one submitted input: slash command, shell passthrough, or a message
+   * to the agent (after the model check and prompt hooks).
+   */
+  private async submitUserInput(userInput: string): Promise<void> {
+    try {
+      const pendingNewThread = this.state.pendingNewThread;
 
-        // Handle shell passthrough (! prefix)
-        if (userInput.startsWith('!')) {
-          await handleShellPassthrough(this.state, userInput.slice(1).trim());
-          continue;
-        }
-
-        // Check if a model is selected (sync — fast, no reason to defer)
-        if (!this.state.session.model.hasSelection()) {
-          showInfo(this.state, 'No model selected. Use /models to select a model, or /login to authenticate.');
-          continue;
-        }
-
-        const { content, images } = consumePendingImages(userInput, this.state.pendingImages);
-        this.state.pendingImages = [];
-
-        const optimisticMessageId = this.renderOptimisticUserMessage(content, images);
-        const allowed = await this.runUserPromptHook(userInput);
-        if (!allowed) {
-          this.removeOptimisticUserMessage(optimisticMessageId);
-          continue;
-        }
-
-        this.sendOptimisticSignal(content, images, optimisticMessageId, pendingNewThread);
-      } catch (error) {
-        showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      // Handle slash commands
+      if (userInput.startsWith('/')) {
+        const handled = await this.handleSlashCommand(userInput);
+        if (handled) return;
       }
+
+      // Handle shell passthrough (! prefix)
+      if (userInput.startsWith('!')) {
+        await handleShellPassthrough(this.state, userInput.slice(1).trim());
+        return;
+      }
+
+      // Check if a model is selected (sync — fast, no reason to defer)
+      if (!this.state.session.model.hasSelection()) {
+        showInfo(this.state, 'No model selected. Use /model to select a model, or /connect to authenticate.');
+        return;
+      }
+
+      const { content, images } = consumePendingImages(userInput, this.state.pendingImages);
+      this.state.pendingImages = [];
+
+      const optimisticMessageId = this.renderOptimisticUserMessage(content, images);
+      const allowed = await this.runUserPromptHook(userInput);
+      if (!allowed) {
+        this.removeOptimisticUserMessage(optimisticMessageId);
+        return;
+      }
+
+      this.sendOptimisticSignal(content, images, optimisticMessageId, pendingNewThread);
+    } catch (error) {
+      showSessionError(this.state, error);
     }
   }
 
@@ -367,7 +489,7 @@ export class MastraTUI {
     this.clearStatusTimingTicker();
     const files = images?.map(img => ({ data: img.data, mediaType: img.mimeType }));
     this.state.session.sendMessage({ content, files }).catch(error => {
-      showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      showSessionError(this.state, error);
     });
   }
 
@@ -450,12 +572,11 @@ export class MastraTUI {
 
       const signal = this.state.session.sendSignal({
         content: this.createUserSignalContent(content, images),
-        ...USER_SIGNAL_DELIVERY_OPTIONS,
       });
       this.remapOptimisticUserMessage(optimisticMessageId, signal.id);
       signal.accepted.catch((error: unknown) => {
         this.removeOptimisticUserMessage(signal.id);
-        showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+        showSessionError(this.state, error);
       });
     };
 
@@ -467,7 +588,7 @@ export class MastraTUI {
 
     pendingThread.then(send).catch((error: unknown) => {
       this.removeOptimisticUserMessage(optimisticMessageId);
-      showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      showSessionError(this.state, error);
     });
   }
 
@@ -482,7 +603,6 @@ export class MastraTUI {
 
       const signal = this.state.session.sendSignal({
         content: this.createUserSignalContent(content, images),
-        ...USER_SIGNAL_DELIVERY_OPTIONS,
       });
 
       if (hasActiveRun) {
@@ -497,7 +617,7 @@ export class MastraTUI {
         } else {
           this.removeOptimisticUserMessage(signal.id);
         }
-        showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+        showSessionError(this.state, error);
       });
     };
 
@@ -508,7 +628,7 @@ export class MastraTUI {
     }
 
     pendingThread.then(send).catch((error: unknown) => {
-      showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      showSessionError(this.state, error);
     });
   }
 
@@ -532,10 +652,17 @@ export class MastraTUI {
     flushRender(this.state);
   }
 
+  /** The thread to suggest resuming on exit, or null while waiting for a new thread. */
+  getResumeThreadId(): string | null {
+    return this.state.pendingNewThread ? null : this.state.session.thread.getId();
+  }
+
   /**
    * Stop the TUI and clean up.
    */
   stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
     this.stopCaffeinate();
 
     // Run SessionEnd hooks (best-effort, don't await)
@@ -551,6 +678,9 @@ export class MastraTUI {
 
     this.clearStatusTimingTicker();
 
+    this.state.footerAnimationRenderer?.dispose();
+    this.state.footerAnimationRenderer = undefined;
+
     if (this.cleanupKeyHandlers) {
       this.cleanupKeyHandlers();
       this.cleanupKeyHandlers = undefined;
@@ -561,10 +691,21 @@ export class MastraTUI {
       this.cleanupPluginReloadListener = undefined;
     }
 
+    if (this.cleanupPluginUpdateListener) {
+      this.cleanupPluginUpdateListener();
+      this.cleanupPluginUpdateListener = undefined;
+    }
+
+    if (this.cleanupBackgroundCompletionListener) {
+      this.cleanupBackgroundCompletionListener();
+      this.cleanupBackgroundCompletionListener = undefined;
+    }
+
     if (this.state.unsubscribe) {
       this.state.unsubscribe();
     }
     this.state.renderScheduler?.dispose();
+    disposeAssistantRenderState(this.state);
     this.state.ui.stop();
   }
 
@@ -599,6 +740,14 @@ export class MastraTUI {
       );
     }
 
+    if (this.state.pluginManager && !this.cleanupPluginUpdateListener) {
+      this.cleanupPluginUpdateListener = this.state.pluginManager.onGithubPluginsUpdated(pluginNames => {
+        if (pluginNames.length === 0) return;
+        const label = pluginNames.length === 1 ? 'Plugin' : 'Plugins';
+        showInfo(this.state, `${label} updated to the latest version: ${pluginNames.join(', ')}`);
+      });
+    }
+
     // Load custom slash commands
     await loadCustomSlashCommands(this.state);
 
@@ -615,17 +764,24 @@ export class MastraTUI {
     // Setup key handlers
     this.cleanupKeyHandlers = setupKeyHandlers(this.state, {
       stop: () => this.stop(),
+      exit: exitCode => this.exit(exitCode),
       doubleCtrlCMs: MastraTUI.DOUBLE_CTRL_C_MS,
     });
 
     // Start the UI before thread selection so resource-drift prompts can render.
     this.state.ui.start();
 
-    // Check for existing threads and prompt for resume
-    await promptForThreadSelection(this.state);
+    // Resume the latest unlocked thread for this directory.
+    const startupResumeIssue = await resumeThreadOnStartup(this.state, this.state.options.resumeThreadId);
+    await this.syncThreadActivePackMetadata();
 
     // Subscribe to controller events
     subscribeToAgentController(this.state, event => this.handleEvent(event));
+    if (this.state.options.backgroundToolsEnabled) {
+      this.cleanupBackgroundCompletionListener = this.state.options.backgroundCompletionEvents?.subscribe(event =>
+        this.handleBackgroundCompletion(event),
+      );
+    }
     // Restore escape-as-cancel setting from persisted state
     const escState = this.state.session.state.get() as any;
     if (escState?.escapeAsCancel === false) {
@@ -638,7 +794,7 @@ export class MastraTUI {
     await this.state.controller.loadOMProgress(this.state.session);
 
     // Sync current thread metadata — the thread_changed event from
-    // promptForThreadSelection fired before we subscribed above.
+    // Initial thread setup ran before we subscribed above.
     await syncInitialThreadState(this.state);
 
     this.state.isInitialized = true;
@@ -649,7 +805,11 @@ export class MastraTUI {
         .initInBackground()
         .then(result => {
           for (const s of result.failed) {
-            showInfo(this.state, `MCP: Failed to connect to "${s.name}": ${s.error}`);
+            if (s.needsAuth) {
+              showInfo(this.state, `MCP: \u26a0 "${s.name}" needs authentication \u2192 run /mcp to authenticate`);
+            } else {
+              showInfo(this.state, `MCP: Failed to connect to "${s.name}": ${s.error}`);
+            }
           }
           for (const s of result.skipped) {
             showInfo(this.state, `MCP: Skipped "${s.name}": ${s.reason}`);
@@ -660,8 +820,6 @@ export class MastraTUI {
         });
     }
 
-    // Set terminal title
-    updateTerminalTitle(this.state);
     // Render existing messages
     await this.renderExistingMessagesAndSeedIdleCounter();
     // Render existing tasks if any
@@ -672,6 +830,20 @@ export class MastraTUI {
     }
 
     await this.showQuietModePreferencePromptIfNeeded();
+
+    if (startupResumeIssue?.kind === 'missing') {
+      showError(
+        this.state,
+        `Thread not found: ${startupResumeIssue.threadId}. Started a new thread; use /threads to pick an existing one.`,
+      );
+    } else if (startupResumeIssue?.kind === 'locked') {
+      showThreadLockPrompt(
+        this.buildCommandContext(),
+        startupResumeIssue.title,
+        startupResumeIssue.ownerPid,
+        startupResumeIssue.threadId,
+      );
+    }
 
     // Check for updates after first render so network latency never blocks startup.
     void this.checkForUpdate().catch(() => {});
@@ -718,8 +890,9 @@ export class MastraTUI {
     }, 60_000);
   }
 
-  private async renderExistingMessagesAndSeedIdleCounter(): Promise<void> {
-    await renderExistingMessages(this.state);
+  private async renderExistingMessagesAndSeedIdleCounter(isCurrent?: () => boolean): Promise<void> {
+    await renderExistingMessages(this.state, isCurrent);
+    if (isCurrent && !isCurrent()) return;
 
     if (this.state.session.run.isRunning()) {
       this.clearStatusTimingTicker();
@@ -778,14 +951,27 @@ export class MastraTUI {
     }
 
     try {
+      const lifecycleGeneration = getThreadLifecycleGeneration(this.state);
+      const lifecycleThreadId =
+        event.type === 'thread_created'
+          ? event.thread.id
+          : event.type === 'thread_changed'
+            ? event.threadId
+            : undefined;
+      const lifecycleIsCurrent = () =>
+        lifecycleThreadId === undefined ||
+        (getThreadLifecycleGeneration(this.state) === lifecycleGeneration + 1 &&
+          this.state.session.thread.getId() === lifecycleThreadId);
+
       this.fireLifecycleHooksForEvent(event);
       await dispatchEvent(event, this.getEventContext(), this.state);
       this.captureAgentControllerAnalytics(event);
 
-      if (event.type === 'thread_created') {
-        await this.syncThreadActivePackMetadata(event.thread);
-      } else if (event.type === 'thread_changed') {
-        await this.syncThreadActivePackMetadata();
+      if (event.type === 'thread_created' && lifecycleIsCurrent()) {
+        await this.syncThreadActivePackMetadata(event.thread, lifecycleIsCurrent);
+      } else if (event.type === 'thread_changed' && lifecycleIsCurrent()) {
+        this.refreshBackgroundActivity();
+        await this.syncThreadActivePackMetadata(undefined, lifecycleIsCurrent);
       }
 
       if (event.type === 'agent_start' && this.state.agentRunStartedAt !== undefined) {
@@ -842,8 +1028,8 @@ export class MastraTUI {
     if (event.type === 'model_changed') {
       analytics.capture('mastracode_model_changed', {
         modelId: event.modelId,
-        scope: event.scope,
-        mode: event.modeId ?? this.state.session.mode.get(),
+        thinkingLevel: event.thinkingLevel,
+        mode: this.state.session.mode.get(),
         threadId: this.state.session.thread.getId(),
         resourceId: this.state.session.identity.getResourceId(),
       });
@@ -959,34 +1145,44 @@ export class MastraTUI {
     return access;
   }
 
-  private async syncThreadActivePackMetadata(thread?: {
-    id: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<void> {
+  private async syncThreadActivePackMetadata(
+    thread?: {
+      id: string;
+      metadata?: Record<string, unknown>;
+    },
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
     const settings = loadSettings();
     const currentThreadId = this.state.session.thread.getId();
-    if (!currentThreadId) return;
+    if (!isCurrent()) return;
+    if (!currentThreadId) {
+      if (!this.state.options.initialModelOverride) {
+        await applyCurrentThreadPack({ state: this.state }, { packId: settings.models.activeModelPackId });
+        if (!isCurrent()) return;
+      }
+      updateStatusLine(this.state);
+      return;
+    }
+    const ownsUpdate = () => isCurrent() && this.state.session.thread.getId() === currentThreadId;
 
     const resolvedThread =
       thread?.id === currentThreadId
         ? thread
         : (await this.state.session.thread.list()).find(t => t.id === currentThreadId);
-    const access = await this.buildProviderAccess();
-    const packs = getAvailableModePacks(access, settings.customModelPacks).filter(p => p.id !== 'custom');
-    const resolvedPackId = resolveThreadActiveModelPackId(
-      settings,
-      packs,
-      resolvedThread?.metadata as Record<string, unknown> | undefined,
-    );
-
-    if (resolvedPackId && settings.models.activeModelPackId !== resolvedPackId) {
-      // Re-read settings to avoid overwriting concurrent changes
-      const fresh = loadSettings();
-      if (fresh.models.activeModelPackId !== resolvedPackId) {
-        fresh.models.activeModelPackId = resolvedPackId;
-        saveSettings(fresh);
-      }
-    }
+    const packs = listResolvableModePacks(settings);
+    const metadata = resolvedThread?.metadata as Record<string, unknown> | undefined;
+    if (!ownsUpdate()) return;
+    const hasThreadPack = typeof metadata?.[THREAD_ACTIVE_MODEL_PACK_ID_KEY] === 'string';
+    const resolvedPackId =
+      this.state.options.initialModelOverride && !hasThreadPack
+        ? null
+        : resolveThreadActiveModelPackId(settings, packs, metadata);
+    const fallbackStatus = fallbackStatusFromMetadata(metadata);
+    if (!ownsUpdate()) return;
+    await applyCurrentThreadPack({ state: this.state }, { packId: resolvedPackId, applyModeDefault: false });
+    if (!ownsUpdate()) return;
+    this.state.fallbackStatus = fallbackStatus;
+    updateStatusLine(this.state);
   }
 
   private showHookWarnings(event: string, warnings: string[]): void {
@@ -998,27 +1194,22 @@ export class MastraTUI {
   private beginLifecycleRun(): void {
     const hookMgr = this.state.hookManager;
     if (!hookMgr) return;
-    const runId = randomUUID();
-    hookMgr.setRunId(runId);
+    // Reuse a run id set at receipt time (runPermissionHooksForEvent) so the
+    // PermissionRequest hook fired before the queued agent_start carries the
+    // same id as subsequent hooks in this run.
+    if (!hookMgr.getRunId()) {
+      hookMgr.setRunId(globalThis.crypto.randomUUID());
+    }
     hookMgr.runAgentStart().catch(() => {});
   }
 
   private fireLifecycleHooksForEvent(event: AgentControllerEvent): void {
     const hookMgr = this.state.hookManager;
     if (!hookMgr) return;
+    // PermissionRequest dispatch moved to the receipt-time tap in display.ts
+    // (runPermissionHooksForEvent, #20861): firing it here, inside the queued
+    // task, starved the hook behind any pending prompt.
     switch (event.type) {
-      case 'tool_approval_required':
-        hookMgr.runPermissionRequest('tool_approval', event.toolCallId, event.toolName, event.args).catch(() => {});
-        break;
-      case 'tool_suspended': {
-        const payload = (event.suspendPayload ?? {}) as Record<string, unknown>;
-        if (event.toolName === 'request_access' || payload.kind === 'sandbox_access_request') {
-          hookMgr.runPermissionRequest('sandbox_access', event.toolCallId, event.toolName, payload).catch(() => {});
-        } else if (event.toolName === 'submit_plan') {
-          hookMgr.runPermissionRequest('plan_approval', event.toolCallId, event.toolName, payload).catch(() => {});
-        }
-        break;
-      }
       case 'subagent_start':
         hookMgr
           .runSubagentStart(event.toolCallId, event.agentType, event.task, event.modelId, event.forked)
@@ -1110,48 +1301,71 @@ export class MastraTUI {
   // User Input
   // ===========================================================================
 
+  private installUserInputHandler(): void {
+    this.state.editor.onSubmit = (text: string) => {
+      if (isGoalJudgeInputLocked(this.state)) {
+        this.state.editor.setText(text);
+        showGoalJudgeInputLockInfo(this.state);
+        flushRender(this.state);
+        return;
+      }
+
+      // Add to history for arrow up/down navigation (skip empty)
+      if (text.trim()) {
+        this.state.editor.addToHistory(text);
+      }
+      this.state.editor.setText('');
+
+      if (this.state.session.run.isRunning()) {
+        if (text.startsWith('/')) {
+          // Run slash commands immediately — they are either settings
+          // commands (no agent interaction) or agent-facing commands the
+          // user explicitly chose to run mid-stream.  Use Ctrl+F to
+          // queue instead.
+          this.handleSlashCommand(text).catch(error => {
+            showError(this.state, error instanceof Error ? error.message : 'Slash command failed');
+          });
+          return;
+        }
+
+        if (text.startsWith('!')) {
+          // Shell passthrough runs locally and never touches the agent, so
+          // run it immediately instead of steering the active run with it.
+          void handleShellPassthrough(this.state, text.slice(1).trim());
+          return;
+        }
+
+        const { content, images } = consumePendingImages(text, this.state.pendingImages);
+        this.state.pendingImages = [];
+        if (images?.length) {
+          this.state.pendingImages = images;
+          this.queueFollowUpMessage(text);
+          return;
+        }
+
+        this.signalMessage(content);
+        return;
+      }
+
+      const pending = this.pendingUserInputResolve;
+      if (!pending) {
+        // The loop is busy elsewhere; hand the text over on its next turn.
+        this.queuedUserInput.push(text);
+        return;
+      }
+      this.pendingUserInputResolve = undefined;
+      pending(text);
+    };
+  }
+
   private getUserInput(): Promise<string> {
+    const queued = this.queuedUserInput.shift();
+    if (queued !== undefined) {
+      return Promise.resolve(queued);
+    }
     return new Promise(resolve => {
-      this.state.editor.onSubmit = (text: string) => {
-        if (isGoalJudgeInputLocked(this.state)) {
-          this.state.editor.setText(text);
-          showGoalJudgeInputLockInfo(this.state);
-          flushRender(this.state);
-          return;
-        }
-
-        // Add to history for arrow up/down navigation (skip empty)
-        if (text.trim()) {
-          this.state.editor.addToHistory(text);
-        }
-        this.state.editor.setText('');
-
-        if (this.state.session.run.isRunning()) {
-          if (text.startsWith('/')) {
-            // Run slash commands immediately — they are either settings
-            // commands (no agent interaction) or agent-facing commands the
-            // user explicitly chose to run mid-stream.  Use Ctrl+F to
-            // queue instead.
-            this.handleSlashCommand(text).catch(error => {
-              showError(this.state, error instanceof Error ? error.message : 'Slash command failed');
-            });
-            return;
-          }
-
-          const { content, images } = consumePendingImages(text, this.state.pendingImages);
-          this.state.pendingImages = [];
-          if (images?.length) {
-            this.state.pendingImages = images;
-            this.queueFollowUpMessage(text);
-            return;
-          }
-
-          this.signalMessage(content);
-          return;
-        }
-
-        resolve(text);
-      };
+      this.pendingUserInputResolve = resolve;
+      if (!this.state.editor.onSubmit) this.installUserInputHandler();
     });
   }
 
@@ -1184,11 +1398,15 @@ export class MastraTUI {
       pluginManager: this.state.pluginManager,
       analytics: this.state.analytics,
       authStorage: this.state.authStorage,
+      processMemoryDiagnostics: this.state.options.processMemoryDiagnostics,
+      knowledgeInspector: this.state.options.knowledgeInspector,
+      threadScheduler: this.state.options.threadScheduler,
       customSlashCommands: this.state.customSlashCommands,
       showInfo: msg => showInfo(this.state, msg),
       showError: msg => showError(this.state, msg),
       updateStatusLine: () => updateStatusLine(this.state),
       stop: () => this.stop(),
+      exit: exitCode => this.exit(exitCode),
       getResolvedWorkspace: () => this.getResolvedWorkspace(),
       addUserMessage: msg => addUserMessage(this.state, msg),
       renderExistingMessages: () => this.renderExistingMessagesAndSeedIdleCounter(),
@@ -1209,10 +1427,10 @@ export class MastraTUI {
       addUserMessage: msg => addUserMessage(this.state, msg),
       addChildBeforeFollowUps: child => this.addChildBeforeFollowUps(child),
       fireMessage: (content, images) => this.fireMessage(content, images),
-      startGoal: (objective, cancelMessage, options) =>
-        startGoalWithDefaults(this.buildCommandContext(), objective, cancelMessage, options),
+      setGoal: (objective, cancelMessage) => setGoalWithDefaults(this.buildCommandContext(), objective, cancelMessage),
+      sendGoalReminder: (goal, options) => sendGoalReminder(this.buildCommandContext(), goal, options),
       queueFollowUpMessage: content => this.queueFollowUpMessage(content),
-      renderExistingMessages: () => this.renderExistingMessagesAndSeedIdleCounter(),
+      renderExistingMessages: isCurrent => this.renderExistingMessagesAndSeedIdleCounter(isCurrent),
       renderClearedTasksInline: (clearedTasks, insertIndex) =>
         renderClearedTasksInline(this.state, clearedTasks, insertIndex),
       renderCompletedTasksInline: (completedTasks, insertIndex) =>
@@ -1280,11 +1498,12 @@ export class MastraTUI {
           const { PROVIDER_DEFAULT_MODELS } = await import('@mastra/code-sdk/auth/storage');
           const defaultModel = PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PROVIDER_DEFAULT_MODELS];
           if (defaultModel) {
-            await this.state.session.model.switch({ modelId: defaultModel });
+            await this.state.session.model.switch(defaultModel);
             showInfo(this.state, `Logged in to ${providerName} - switched to ${defaultModel}`);
           } else {
             showInfo(this.state, `Successfully logged in to ${providerName}`);
           }
+          await seedOMDefaultAfterLogin(this.state, providerId, message => showInfo(this.state, message));
 
           resolve();
         })
@@ -1316,6 +1535,7 @@ export class MastraTUI {
     const savedSettings = loadSettings();
     const modePacks = getAvailableModePacks(access, savedSettings.customModelPacks);
     const omPacks = getAvailableOmPacks(access);
+    const preferredOmPack = selectPreferredOMPack(access, savedSettings.models.activeModelPackId ?? undefined);
 
     let prevModePackId = savedSettings.onboarding.modePackId;
     if (prevModePackId === 'custom' && savedSettings.models.activeModelPackId?.startsWith('custom:')) {
@@ -1335,6 +1555,7 @@ export class MastraTUI {
         authProviders,
         modePacks,
         omPacks,
+        preferredOmPackId: preferredOmPack?.id,
         hasProviderAccess,
         previous,
         onComplete: async (result: OnboardingResult) => {
@@ -1360,7 +1581,9 @@ export class MastraTUI {
               const updatedAccess = await this.buildProviderAccess();
               const updatedHasAccess = Object.values(updatedAccess).some(Boolean);
               component.updateModePacks(getAvailableModePacks(updatedAccess, savedSettings.customModelPacks));
-              component.updateOmPacks(getAvailableOmPacks(updatedAccess));
+              const updatedOmPacks = getAvailableOmPacks(updatedAccess);
+              const preferred = selectPreferredOMPack(updatedAccess, providerId);
+              component.updateOmPacks(updatedOmPacks, preferred?.id);
               component.updateHasProviderAccess(updatedHasAccess);
             } catch (err) {
               console.error('Failed to refresh provider access after login:', err);
@@ -1404,44 +1627,20 @@ export class MastraTUI {
   }
 
   private async applyOnboardingResult(result: OnboardingResult): Promise<void> {
-    const controller = this.state.controller;
     const modePack = result.modePack;
-    const modes = controller.listModes();
+    const modes = this.state.controller.listModes();
 
-    for (const mode of modes) {
-      const modelId = (modePack.models as Record<string, string>)[mode.id];
-      if (modelId) {
-        (mode as any).defaultModelId = modelId;
-        await this.state.session.thread.setSetting({
-          key: `modeModelId_${mode.id}`,
-          value: modelId,
-        });
-      }
-    }
-
-    const currentModeId = this.state.session.mode.get();
-    const currentModeModel = (modePack.models as Record<string, string>)[currentModeId];
-    if (currentModeModel) {
-      await this.state.session.model.switch({ modelId: currentModeModel });
-    }
-
-    const subagentModeMap: Record<string, string> = { explore: 'fast', plan: 'plan', execute: 'build' };
-    for (const [agentType, modeId] of Object.entries(subagentModeMap)) {
-      const saModelId = (modePack.models as Record<string, string>)[modeId];
-      if (saModelId) {
-        await this.state.session.subagents.model.set({ modelId: saModelId, agentType });
-      }
-    }
-
-    const omPack = result.omPack;
-    void this.state.session.state.set({ observerModelId: omPack.modelId, reflectorModelId: omPack.modelId });
-    void this.state.session.state.set({ yolo: result.yolo });
+    // With no reachable provider the OM step only offers an empty custom pack;
+    // recording that non-choice would block every later provider-aware seed.
+    const omPack = result.omPack.modelId ? result.omPack : undefined;
+    if (omPack) await applyOMModelToSession(this.state, omPack.modelId);
+    await this.state.session.state.set({ yolo: result.yolo });
 
     const settings = loadSettings();
     settings.onboarding.completedAt = new Date().toISOString();
     settings.onboarding.skippedAt = null;
     settings.onboarding.version = ONBOARDING_VERSION;
-    settings.onboarding.omPackId = omPack.id;
+    settings.onboarding.omPackId = omPack?.id ?? null;
 
     const modeDefaults: Record<string, string> = {};
     for (const mode of modes) {
@@ -1449,31 +1648,34 @@ export class MastraTUI {
       if (modelId) modeDefaults[mode.id] = modelId;
     }
 
-    let activeModePackId = modePack.id;
-    if (modePack.id === 'custom' || modePack.id.startsWith('custom:')) {
-      const customName =
-        modePack.id === 'custom' ? modePack.name?.trim() || 'Custom' : modePack.id.slice('custom:'.length) || 'Custom';
-      activeModePackId = `custom:${customName}`;
-      const entry = { name: customName, models: modeDefaults, createdAt: new Date().toISOString() };
-      const idx = settings.customModelPacks.findIndex(p => p.name === customName);
-      if (idx >= 0) {
-        settings.customModelPacks[idx] = entry;
+    let activeModePackId = settings.models.activeModelPackId;
+    const hasCompleteModePack = modes.every(mode => Boolean(modeDefaults[mode.id]));
+    if (hasCompleteModePack) {
+      activeModePackId = modePack.id;
+      if (modePack.id === 'custom' || modePack.id.startsWith('custom:')) {
+        const customName =
+          modePack.id === 'custom'
+            ? modePack.name?.trim() || 'Custom'
+            : modePack.id.slice('custom:'.length) || 'Custom';
+        activeModePackId = `custom:${customName}`;
+        const entry = { name: customName, models: modeDefaults, createdAt: new Date().toISOString() };
+        const idx = settings.customModelPacks.findIndex(p => p.name === customName);
+        if (idx >= 0) {
+          settings.customModelPacks[idx] = entry;
+        } else {
+          settings.customModelPacks.push(entry);
+        }
+        settings.models.modeDefaults = modeDefaults;
       } else {
-        settings.customModelPacks.push(entry);
+        settings.models.modeDefaults = {};
       }
-      settings.models.modeDefaults = modeDefaults;
-    } else {
-      settings.models.modeDefaults = {};
+
+      settings.onboarding.modePackId = activeModePackId;
+      settings.models.activeModelPackId = activeModePackId;
     }
 
-    settings.onboarding.modePackId = activeModePackId;
-    settings.models.activeModelPackId = activeModePackId;
-    if (this.state.session.thread.getId()) {
-      await this.state.session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: activeModePackId });
-    }
-
-    settings.models.activeOmPackId = omPack.id;
-    settings.models.omModelOverride = omPack.id === 'custom' ? omPack.modelId : null;
+    settings.models.activeOmPackId = omPack?.id ?? null;
+    settings.models.omModelOverride = omPack?.id === 'custom' ? omPack.modelId : null;
     // Clear any per-role overrides from prior /om use so the newly-selected
     // pack (or custom modelId above) applies to both observer and reflector.
     settings.models.observerModelOverride = null;
@@ -1484,6 +1686,9 @@ export class MastraTUI {
     settings.models.subagentModels = {};
 
     saveSettings(settings);
+    await applyCurrentThreadPack({ state: this.state }, { packId: activeModePackId });
+    await this.state.session.thread.setSetting({ key: THREAD_FALLBACK_STATUS_KEY, value: undefined });
+    this.state.fallbackStatus = undefined;
 
     updateStatusLine(this.state);
     await this.refreshModelAuthStatus();
@@ -1509,16 +1714,9 @@ export class MastraTUI {
     this.state.quietModeMaxToolPreviewLines = previewLineLimit;
     this.state.taskProgress?.setQuietMode(enabled);
 
-    const tools = this.state.allToolComponents.filter(
-      (tool): tool is IToolExecutionComponent => typeof tool.setQuietModeDisplay === 'function',
-    );
     const color = this.state.session?.mode.resolve().metadata?.color;
     const modeColor = typeof color === 'string' ? color : undefined;
-    for (const tool of tools) {
-      tool.setCompactToolModeColor?.(modeColor);
-      tool.setQuietModeDisplay?.(enabled ? 'quiet' : 'normal');
-      tool.setQuietPreviewLineLimit?.(previewLineLimit);
-    }
+    applyQuietModeToRenderedComponents(this.state, enabled, previewLineLimit, modeColor);
     flushRender(this.state);
   }
 
@@ -1552,7 +1750,7 @@ export class MastraTUI {
     const previewLineAnswer = await askModalQuestion(this.state.ui, {
       question: 'How many quiet-mode tool preview lines should be shown?\n\nYou can change this later in /settings.',
       options: [
-        { label: 'None', description: 'Hide compact tool detail previews' },
+        { label: 'None', description: 'Hide tool previews and shell output' },
         { label: '1 line', description: 'Show the latest preview line' },
         { label: '2 lines', description: 'Default' },
         { label: '4 lines', description: 'Show more streaming detail' },
@@ -1667,7 +1865,7 @@ export class MastraTUI {
         // Printed after TUI teardown — a message rendered inside it is lost in the exit race.
         this.stop();
         console.info(outcome.message);
-        process.exit(0);
+        this.exit(0);
       } else {
         showError(this.state, outcome.message);
       }

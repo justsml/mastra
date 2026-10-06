@@ -9,7 +9,12 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { Agent } from '../../agent';
+import { LeasePubSub } from '../../agent/__tests__/thread-stream-test-utils';
+import { createDurableAgent, globalRunRegistry } from '../../agent/durable';
+import { agentThreadStreamRuntime } from '../../agent/thread-stream-runtime';
+import { InMemoryServerCache } from '../../cache';
 import { Mastra } from '../../mastra';
+import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { MastraLanguageModelV2Mock } from '../../test-utils/llm-mock';
 import { askUserTool } from '../../tools/builtin/ask-user';
@@ -17,6 +22,7 @@ import { askUserTool } from '../../tools/builtin/ask-user';
 import { AgentController } from '../agent-controller';
 import { SessionApproval } from '../session';
 import { createMockWorkspace } from '../test-utils';
+import type { AgentControllerEvent } from '../types';
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -60,7 +66,8 @@ function createTextStream() {
   });
 }
 
-async function buildController(id: string, input: string) {
+async function buildController(id: string, input: string, withMemory = false) {
+  const storage = new InMemoryStore();
   const agent = new Agent({
     id: `agent-${id}`,
     name: `Agent ${id}`,
@@ -75,9 +82,9 @@ async function buildController(id: string, input: string) {
       })(),
     }),
     tools: { ask_user: askUserTool },
+    memory: withMemory ? new MockMemory({ storage }) : undefined,
   });
 
-  const storage = new InMemoryStore();
   const mastra = new Mastra({ agents: { [`agent-${id}`]: agent }, logger: false, storage });
   const registeredAgent = mastra.getAgent(`agent-${id}`);
 
@@ -148,6 +155,132 @@ describe('AgentController: ask_user native suspension', () => {
     expect(session.displayState.get().pendingSuspensions.size).toBe(0);
   });
 
+  it('preserves the answer when a second controller resumes a durable ask_user suspension', async () => {
+    const storage = new InMemoryStore();
+    const cache = new InMemoryServerCache();
+    const memory = new MockMemory({ storage });
+    const modelPrompts: unknown[] = [];
+    let modelCalls = 0;
+    let pubsub = new LeasePubSub();
+    pubsub.retain = true;
+
+    const createController = async () => {
+      const baseAgent = new Agent({
+        id: 'cold-resume-agent',
+        name: 'Cold resume agent',
+        instructions: 'Ask the user for a hotel, then acknowledge their answer.',
+        model: new MastraLanguageModelV2Mock({
+          doStream: async ({ prompt }) => {
+            modelCalls++;
+            modelPrompts.push(prompt);
+            return {
+              stream:
+                modelCalls === 1
+                  ? createAskUserToolCallStream(JSON.stringify({ question: 'Which hotel?' }))
+                  : createTextStream(),
+            };
+          },
+        }),
+        tools: { ask_user: askUserTool },
+        memory,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, cache, pubsub });
+      const mastra = new Mastra({ agents: { agent: durableAgent }, storage, cache, pubsub, logger: false });
+      const controller = new AgentController({
+        id: 'cold-resume-controller',
+        agent: mastra.getAgent('agent'),
+        pubsub,
+        workspace: createMockWorkspace(),
+        storage,
+        initialState: { yolo: false } as any,
+        modes: [{ id: 'default', name: 'Default', default: true }],
+      });
+      await controller.init();
+      return controller;
+    };
+
+    const firstController = await createController();
+    const firstSession = await firstController.createSession({
+      id: 'cold-resume-session',
+      ownerId: 'cold-resume-owner',
+    });
+    await firstSession.thread.create();
+    const threadId = firstSession.thread.requireId();
+    await firstSession.permissions.setForTool({ toolName: 'ask_user', policy: 'allow' });
+
+    const firstEvents: AgentControllerEvent[] = [];
+    firstSession.subscribe(event => firstEvents.push(event));
+    await firstSession.sendMessage({ content: 'Ask me which hotel.' });
+    await vi.waitFor(() => expect(firstEvents.some(event => event.type === 'tool_suspended')).toBe(true));
+    expect(pubsub.retainedTopics()).not.toEqual([]);
+
+    await firstSession.thread.detachFromCurrent();
+    pubsub = pubsub.restart();
+    agentThreadStreamRuntime.resetForTests();
+    globalRunRegistry.clear();
+
+    const secondController = await createController();
+    const secondSession = await secondController.createSession({
+      id: 'cold-resume-session',
+      ownerId: 'cold-resume-owner',
+    });
+    const secondEvents: AgentControllerEvent[] = [];
+    secondSession.subscribe(event => {
+      secondEvents.push(event);
+      if (event.type === 'tool_approval_required') {
+        queueMicrotask(() => {
+          void secondSession.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId });
+        });
+      }
+    });
+    await secondSession.thread.switch({ threadId });
+
+    await vi.waitFor(() => {
+      expect(secondSession.displayState.get().pendingSuspensions.get('call-1')?.toolName).toBe('ask_user');
+    });
+    expect(secondEvents.some(event => event.type === 'tool_approval_required')).toBe(false);
+    expect(modelCalls).toBe(1);
+    expect(secondSession.claimToolSuspension('call-1')).toEqual({ accepted: true, toolCallId: 'call-1' });
+    await secondSession.respondToToolSuspension({ toolCallId: 'call-1', resumeData: 'Hilton' });
+
+    await vi.waitFor(() => expect(modelCalls).toBe(2));
+    const resumedPrompt = JSON.stringify(modelPrompts[1]);
+    expect(resumedPrompt).toContain('User answered: Hilton');
+    expect(resumedPrompt).not.toContain('Tool input validation failed');
+    expect(resumedPrompt).not.toContain('"approved":true');
+    expect(secondEvents.some(event => event.type === 'error')).toBe(false);
+  });
+
+  it('emits the resumed reply with its persisted message ID (#23150)', async () => {
+    const { session } = await buildController('resume-identity', JSON.stringify({ question: 'Your name?' }), true);
+    const events: AgentControllerEvent[] = [];
+    session.subscribe(event => events.push(structuredClone(event)));
+
+    await session.sendMessage({ content: 'Ask my name' });
+    expect(events.some(event => event.type === 'tool_suspended')).toBe(true);
+    events.length = 0;
+    await session.respondToToolSuspension({ toolCallId: 'call-1', resumeData: 'Ada' });
+    await vi.waitFor(() => {
+      expect(events.find(event => event.type === 'agent_end')?.reason).toBe('complete');
+    });
+
+    const persisted = await session.thread.listMessages({ threadId: session.thread.requireId() });
+    const savedReplies = persisted.filter(
+      message =>
+        message.role === 'assistant' &&
+        message.content.parts.some(part => part.type === 'text' && part.text === 'Thanks!'),
+    );
+    const replies = events
+      .filter(event => event.type === 'message_end')
+      .filter(event => savedReplies.some(message => message.id === event.id));
+    expect(savedReplies).toHaveLength(1);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!.id).toBe(savedReplies[0]!.id);
+    expect(events.some(event => event.type === 'tool_end' && event.toolCallId === 'call-1')).toBe(true);
+    expect(session.displayState.get().pendingSuspensions.size).toBe(0);
+    expect(events.some(event => event.type === 'error')).toBe(false);
+  });
+
   it('emits multi_select in the suspend payload when requested', async () => {
     const { session } = await buildController(
       'multi',
@@ -180,8 +313,10 @@ describe('AgentController: ask_user native suspension', () => {
     };
 
     const pending = session.suspensions;
-    pending.register({ toolCallId: 'call-a', runId: 'run-a', toolName: 'ask_user' });
-    pending.register({ toolCallId: 'call-b', runId: 'run-b', toolName: 'ask_user' });
+    const threadId = session.thread.requireId();
+    const resourceId = session.identity.getResourceId();
+    pending.register({ toolCallId: 'call-a', runId: 'run-a', toolName: 'ask_user', threadId, resourceId });
+    pending.register({ toolCallId: 'call-b', runId: 'run-b', toolName: 'ask_user', threadId, resourceId });
 
     // Explicit toolCallId resumes only that suspension; the other stays pending.
     await session.respondToToolSuspension({ toolCallId: 'call-b', resumeData: 'two' });
@@ -205,14 +340,16 @@ describe('AgentController: ask_user native suspension', () => {
     };
 
     const pending = session.suspensions;
-    pending.register({ toolCallId: 'call-only', runId: 'run-only', toolName: 'ask_user' });
+    const threadId = session.thread.requireId();
+    const resourceId = session.identity.getResourceId();
+    pending.register({ toolCallId: 'call-only', runId: 'run-only', toolName: 'ask_user', threadId, resourceId });
 
     await session.respondToToolSuspension({ resumeData: 'ok' });
     expect(resumed).toEqual(['call-only']);
 
     // With more than one pending and no toolCallId, the call is a no-op.
-    pending.register({ toolCallId: 'call-x', runId: 'run-x', toolName: 'ask_user' });
-    pending.register({ toolCallId: 'call-y', runId: 'run-y', toolName: 'ask_user' });
+    pending.register({ toolCallId: 'call-x', runId: 'run-x', toolName: 'ask_user', threadId, resourceId });
+    pending.register({ toolCallId: 'call-y', runId: 'run-y', toolName: 'ask_user', threadId, resourceId });
     await session.respondToToolSuspension({ resumeData: 'ambiguous' });
     expect(resumed).toEqual(['call-only']);
     expect(pending.has({ toolCallId: 'call-x' })).toBe(true);
@@ -231,8 +368,10 @@ describe('AgentController: ask_user native suspension', () => {
     };
 
     const pending = session.suspensions;
-    pending.register({ toolCallId: 'call-a', runId: 'run-a', toolName: 'ask_user' });
-    pending.register({ toolCallId: 'call-b', runId: 'run-b', toolName: 'ask_user' });
+    const threadId = session.thread.requireId();
+    const resourceId = session.identity.getResourceId();
+    pending.register({ toolCallId: 'call-a', runId: 'run-a', toolName: 'ask_user', threadId, resourceId });
+    pending.register({ toolCallId: 'call-b', runId: 'run-b', toolName: 'ask_user', threadId, resourceId });
     expect(session.suspensions.hasPending()).toBe(true);
 
     session.abort();
@@ -253,7 +392,7 @@ describe('AgentController: ask_user native suspension', () => {
     const { session } = await buildController('approval-abort', JSON.stringify({ question: 'Pick?' }));
 
     const approval = session.approval;
-    const parked = approval.arm({ toolName: 'edit_file' });
+    const parked = approval.arm({ toolName: 'edit_file', toolCallId: 'call-1' });
     expect(approval.isArmed()).toBe(true);
 
     session.abort();
@@ -270,18 +409,18 @@ describe('AgentController: ask_user native suspension', () => {
     const approval = new SessionApproval();
     const parked = approval.arm({ toolName: 'edit_file', toolCallId: 'call-current' });
     expect(approval.isArmed()).toBe(true);
-    expect(approval.getToolCallId()).toBe('call-current');
+    expect(approval.getToolCallIds()).toEqual(['call-current']);
 
     // Wrong id: ignored, gate remains armed.
     approval.respond({ decision: 'approve', toolCallId: 'call-stale' });
     expect(approval.isArmed()).toBe(true);
 
-    // Correct id resolves it. Omitting toolCallId is also accepted (backwards compatible).
+    // The matching id resolves it.
     approval.respond({ decision: 'approve', toolCallId: 'call-current' });
     const decision = await parked;
     expect(decision.decision).toBe('approve');
     expect(approval.isArmed()).toBe(false);
-    expect(approval.getToolCallId()).toBeNull();
+    expect(approval.getToolCallIds()).toEqual([]);
   });
 
   it('surfaces three ask_user questions one at a time across resumes (#13642 serialized flow)', async () => {
@@ -382,5 +521,79 @@ describe('AgentController: ask_user native suspension', () => {
     }
 
     expect(session.displayState.get().pendingSuspensions.size).toBe(0);
+  });
+});
+
+describe('AgentController: Stop on a parked question frees the thread', () => {
+  async function buildRecording(id: string) {
+    const prompts: unknown[] = [];
+    const agent = new Agent({
+      id: `agent-${id}`,
+      name: `Agent ${id}`,
+      instructions: 'You ask the user questions.',
+      model: new MastraLanguageModelV2Mock({
+        doStream: async (options: any) => {
+          prompts.push(options?.prompt);
+          return {
+            stream:
+              prompts.length === 1
+                ? createAskUserToolCallStream(JSON.stringify({ question: 'Red or blue?' }))
+                : createTextStream(),
+          };
+        },
+      }),
+      tools: { ask_user: askUserTool },
+    });
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({ agents: { [`agent-${id}`]: agent }, logger: false, storage });
+    const registeredAgent = mastra.getAgent(`agent-${id}`);
+    const controller = new AgentController({
+      workspace: createMockWorkspace(),
+      id: `controller-${id}`,
+      storage,
+      modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
+      initialState: { yolo: true } as any,
+    });
+    await controller.init();
+    const session = await controller.createSession({ id: `session-${id}`, ownerId: 'test-owner' });
+    await session.thread.create();
+    const ends: Array<string | undefined> = [];
+    session.subscribe(event => {
+      if (event.type === 'agent_end') ends.push(event.reason);
+    });
+    return { controller, session, prompts, ends };
+  }
+
+  it('answers a message sent after Stop on a parked question', async () => {
+    const { controller, session, prompts, ends } = await buildRecording('stop-then-send');
+    await session.sendMessage({ content: 'Ask me a color.' });
+    expect(ends).toEqual(['suspended']);
+
+    session.abort();
+    const next = session.sendMessage({ content: 'Forget the color and say hello.' });
+    void next.catch(() => {});
+
+    // The parked run no longer holds the thread: the new message starts its own run.
+    await vi.waitFor(() => expect(ends.at(-1)).toBe('complete'), { timeout: 10_000 });
+    await next;
+    expect(prompts).toHaveLength(2);
+    expect(JSON.stringify(prompts[1])).toContain('Forget the color and say hello.');
+    expect(session.displayState.get().isRunning).toBe(false);
+    expect(controller.listActiveThreadRuns()).toHaveLength(0);
+  }, 20_000);
+});
+
+describe('resume boundary waiter', () => {
+  it('settles when the stream is torn down before any terminal event', async () => {
+    const { session } = await buildController('teardown', JSON.stringify({ question: 'Color?' }));
+    const waiter = (session as any).createSubscribedResumeBoundaryWaiter({ toolCallId: 'call-1' });
+    let settled = false;
+    void waiter.promise.then(() => {
+      settled = true;
+    });
+
+    session.stream.cleanup();
+
+    await vi.waitFor(() => expect(settled).toBe(true));
   });
 });

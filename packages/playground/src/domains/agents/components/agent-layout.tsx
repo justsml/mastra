@@ -1,4 +1,5 @@
 import { useIsMobile } from '@mastra/playground-ui/hooks/use-is-mobile';
+import { CollapsiblePanel } from '@mastra/playground-ui/resize/collapsible-panel';
 import { PanelDrawer } from '@mastra/playground-ui/resize/panel-drawer';
 import { PanelGroup } from '@mastra/playground-ui/resize/panel-group';
 import { PanelSeparator } from '@mastra/playground-ui/resize/separator';
@@ -6,6 +7,7 @@ import { useEffect, useRef } from 'react';
 import { Panel, useDefaultLayout } from 'react-resizable-panels';
 import type { PanelImperativeHandle } from 'react-resizable-panels';
 import { useMemoryTimeline } from '../context/memory-timeline-context';
+import { useThreadsPanel } from '../context/use-threads-panel';
 
 export interface AgentLayoutProps {
   agentId: string;
@@ -32,6 +34,7 @@ export const AgentLayout = ({
 }: AgentLayoutProps) => {
   const isMobile = useIsMobile();
   const { isPanelOpen: isMemoryTimelineOpen } = useMemoryTimeline();
+  const threadsPanel = useThreadsPanel();
   const leftPanelRef = useRef<PanelImperativeHandle | null>(null);
   const wasMemoryTimelineOpen = useRef(false);
   const sizeBeforeMemoryDetail = useRef<string | null>(null);
@@ -89,20 +92,25 @@ export const AgentLayout = ({
         onLayoutChange={onLayoutChange}
       >
         {leftSlot && (
-          <Panel
+          <CollapsiblePanel
             id="left-slot"
+            direction="left"
+            ref={handle => threadsPanel?.registerPanel(handle, Boolean(defaultLayout))}
             panelRef={leftPanelRef}
+            collapsible
+            collapsedSize={0}
+            expandShortcut="{"
             minSize={256}
             maxSize={'50%'}
             defaultSize={300}
             className="min-w-0"
           >
             {leftSlot}
-          </Panel>
+          </CollapsiblePanel>
         )}
 
         {leftSlot && <PanelSeparator />}
-        <Panel id="main-slot" className="grid min-w-0 overflow-y-auto relative">
+        <Panel id="main-slot" className="relative grid min-w-0 overflow-y-auto">
           {children}
         </Panel>
         {rightSlot && (

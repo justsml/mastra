@@ -48,6 +48,17 @@ describe('buildMessagesFromChunks', () => {
     expect(result).toHaveLength(0);
   });
 
+  it('should keep an empty text span whose deltas carry providerMetadata (#20469)', () => {
+    const meta = { google: { thoughtSignature: 'sig-abc' } };
+    const result = parts([
+      { type: 'text-start', payload: { id: 't1' } },
+      { type: 'text-delta', payload: { id: 't1', text: '', providerMetadata: meta } },
+      { type: 'text-end', payload: { id: 't1' } },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ type: 'text', text: '', providerMetadata: meta });
+  });
+
   it('should handle text-delta without a matching text-start', () => {
     const result = parts([
       { type: 'text-delta', payload: { id: 't1', text: 'orphan' } },
@@ -122,6 +133,22 @@ describe('buildMessagesFromChunks', () => {
       type: 'reasoning',
       reasoning: 'Thinking...',
       details: [{ type: 'text', text: 'Thinking...' }],
+    });
+  });
+
+  it('should preserve Anthropic signed reasoning text in the primary reasoning field', () => {
+    const result = parts([
+      { type: 'reasoning-start', payload: { id: 'r1' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'Signed ' } },
+      { type: 'reasoning-delta', payload: { id: 'r1', text: 'thinking.' } },
+      { type: 'reasoning-end', payload: { id: 'r1', providerMetadata: { anthropic: { signature: 'sig' } } } },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'reasoning',
+      reasoning: 'Signed thinking.',
+      details: [{ type: 'text', text: 'Signed thinking.' }],
+      providerMetadata: { anthropic: { signature: 'sig' } },
     });
   });
 
@@ -251,6 +278,360 @@ describe('buildMessagesFromChunks', () => {
         args: { q: 'test' },
         result: { answer: '42' },
       },
+    });
+  });
+
+  it('should copy the tool title from the tools map onto a call part', () => {
+    const result = parts(
+      [{ type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'search', args: { q: 'test' } } }],
+      { search: { title: 'Search the web' } },
+    );
+    expect(result[0]).toMatchObject({ type: 'tool-invocation', title: 'Search the web' });
+  });
+
+  it('should keep the tool title on a merged call + result part', () => {
+    const result = parts(
+      [
+        { type: 'tool-call', payload: { toolCallId: 'tc1', toolName: 'search', args: { q: 'test' } } },
+        {
+          type: 'tool-result',
+          payload: { toolCallId: 'tc1', toolName: 'search', args: { q: 'test' }, result: { hits: 1 } },
+        },
+      ],
+      { search: { title: 'Search the web' } },
+    );
+    expect(result[0]).toMatchObject({ title: 'Search the web', toolInvocation: { state: 'result' } });
+  });
+
+  it('should preserve both call and result itemIds when a Responses provider assigns each side its own id', () => {
+    // OpenAI hosted tool_search (Responses API) emits a tool-call chunk carrying
+    // the call item id (tsc_…) and a tool-result chunk carrying the output item
+    // id (tso_…). Replay needs BOTH ids — losing the call id makes the next
+    // request reference the same item twice ("Duplicate item found").
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'tool_search',
+          args: { queries: ['cache'] },
+          providerExecuted: true,
+          providerMetadata: { openai: { itemId: 'tsc_1' } },
+        },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'tool_search',
+          args: { queries: ['cache'] },
+          result: { tools: ['get_block'] },
+          providerExecuted: true,
+          providerMetadata: { openai: { itemId: 'tso_1' } },
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect((result[0] as any).providerMetadata).toEqual({
+      openai: { itemId: 'tsc_1', resultItemId: 'tso_1' },
+    });
+  });
+
+  it('should keep the result metadata as-is when call and result share the same itemId', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'ws1',
+          toolName: 'web_search_call',
+          args: { query: 'news' },
+          providerExecuted: true,
+          providerMetadata: { openai: { itemId: 'ws_1' } },
+        },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'ws1',
+          toolName: 'web_search_call',
+          args: { query: 'news' },
+          result: { status: 'completed' },
+          providerExecuted: true,
+          providerMetadata: { openai: { itemId: 'ws_1' } },
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect((result[0] as any).providerMetadata).toEqual({ openai: { itemId: 'ws_1' } });
+  });
+
+  it('should not add itemId metadata when neither chunk carries any (web_search shape)', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: { toolCallId: 'ws1', toolName: 'web_search', args: { query: 'news' }, providerExecuted: true },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'ws1',
+          toolName: 'web_search',
+          args: { query: 'news' },
+          result: { status: 'completed' },
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect((result[0] as any).providerMetadata).toBeUndefined();
+  });
+
+  it('should keep providerExecuted from the tool-call chunk when the result chunk omits it (Google server tool shape)', () => {
+    const providerMetadata = {
+      google: { serverToolCallId: 'call_962734', serverToolType: 'GOOGLE_SEARCH_WEB' },
+    };
+    const result = parts(
+      [
+        {
+          type: 'tool-call',
+          payload: {
+            toolCallId: 'call_962734',
+            toolName: 'server:GOOGLE_SEARCH_WEB',
+            args: { queries: ['test'] },
+            providerExecuted: true,
+            providerMetadata,
+          },
+        },
+        {
+          type: 'tool-result',
+          payload: {
+            toolCallId: 'call_962734',
+            toolName: 'server:GOOGLE_SEARCH_WEB',
+            result: { searchResults: [] },
+            providerMetadata,
+          },
+        },
+      ],
+      { google_search: { type: 'provider-defined', id: 'google.google_search', name: 'google_search' } },
+    );
+    expect(result).toHaveLength(1);
+    expect((result[0] as any).toolInvocation.state).toBe('result');
+    expect((result[0] as any).providerExecuted).toBe(true);
+  });
+
+  it('should merge tool-call + tool-error into a single output-error part', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: new Error('Provider tool failed'),
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Provider tool failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should preserve string tool-error messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: 'boom',
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'boom',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should preserve plain-object tool-error messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: { message: 'Provider object failure' },
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Provider object failure',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for falsy tool errors', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: null,
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for whitespace-only tool error strings', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: '   ',
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
+    });
+  });
+
+  it('should fall back for Error instances without usable messages', () => {
+    const result = parts([
+      {
+        type: 'tool-call',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          providerExecuted: true,
+        },
+      },
+      {
+        type: 'tool-error',
+        payload: {
+          toolCallId: 'tc1',
+          toolName: 'myTool',
+          args: { q: 'test' },
+          error: new Error(''),
+          providerExecuted: true,
+        },
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'output-error',
+        toolCallId: 'tc1',
+        toolName: 'myTool',
+        args: { q: 'test' },
+        errorText: 'Tool execution failed',
+      },
+      providerExecuted: true,
     });
   });
 

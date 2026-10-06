@@ -1,4 +1,6 @@
 import { Avatar } from '@mastra/playground-ui/components/Avatar';
+import { focusRing } from '@mastra/playground-ui/primitives/transitions';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { toast } from '@mastra/playground-ui/utils/toast';
 import { Plus } from 'lucide-react';
 import { useRef } from 'react';
@@ -38,14 +40,14 @@ export const AgentProfileAvatar = ({ disabled = false }: AgentProfileAvatarProps
   };
 
   return (
-    <div className="rounded-full bg-surface3 p-1 scale-[1.65]" style={{ viewTransitionName: 'agent-avatar' }}>
+    <div className="scale-[1.65] rounded-full bg-card p-1" style={{ viewTransitionName: 'agent-avatar' }}>
       {interactive ? (
         <>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled}
-            className="relative rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral3 disabled:cursor-not-allowed disabled:opacity-60"
+            className={cn('relative rounded-full disabled:cursor-not-allowed disabled:opacity-60', focusRing)}
             aria-label="Upload avatar"
             data-testid="agent-configure-avatar-trigger"
           >
@@ -57,8 +59,8 @@ export const AgentProfileAvatar = ({ disabled = false }: AgentProfileAvatarProps
               color={avatarColor}
               textColor={avatarTextColor}
             />
-            <span className="absolute inset-0 flex items-center justify-center rounded-full bg-surface4 opacity-0 transition-opacity">
-              <Plus className="h-5 w-5 text-neutral5" />
+            <span className="absolute inset-0 flex items-center justify-center rounded-full bg-muted opacity-0 transition-opacity">
+              <Plus className="h-5 w-5 text-foreground" />
             </span>
           </button>
           <input

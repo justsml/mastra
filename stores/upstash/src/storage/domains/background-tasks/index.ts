@@ -1,4 +1,10 @@
-import type { BackgroundTask, BackgroundTaskStatus, TaskFilter, TaskListResult } from '@mastra/core/background-tasks';
+import type {
+  BackgroundTask,
+  BackgroundTaskStatus,
+  TaskFilter,
+  TaskListResult,
+  UpdateBackgroundTaskOptions,
+} from '@mastra/core/background-tasks';
 import { BackgroundTasksStorage, TABLE_BACKGROUND_TASKS } from '@mastra/core/storage';
 import type { Redis } from '@upstash/redis';
 import { UpstashDB, resolveUpstashConfig } from '../../db';
@@ -26,6 +32,8 @@ function toStorageRecord(task: BackgroundTask): Record<string, any> {
     startedAt: task.startedAt?.toISOString() ?? null,
     suspendedAt: task.suspendedAt?.toISOString() ?? null,
     completedAt: task.completedAt?.toISOString() ?? null,
+    ownerId: task.ownerId ?? null,
+    leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null,
   };
 }
 
@@ -50,6 +58,8 @@ function fromStorageRecord(record: Record<string, any>): BackgroundTask {
     startedAt: record.startedAt ? new Date(record.startedAt) : undefined,
     suspendedAt: record.suspendedAt ? new Date(record.suspendedAt) : undefined,
     completedAt: record.completedAt ? new Date(record.completedAt) : undefined,
+    ownerId: record.ownerId ?? undefined,
+    leaseExpiresAt: record.leaseExpiresAt ? new Date(record.leaseExpiresAt) : undefined,
   };
 }
 
@@ -74,24 +84,57 @@ export class BackgroundTasksUpstash extends BackgroundTasksStorage {
     await this.client.set(key, processedRecord);
   }
 
-  async updateTask(taskId: string, update: Partial<BackgroundTask>): Promise<void> {
-    const existing = await this.getTask(taskId);
-    if (!existing) return;
+  async updateTask(
+    taskId: string,
+    update: Partial<BackgroundTask>,
+    options?: UpdateBackgroundTaskOptions,
+  ): Promise<boolean> {
+    const patch: Record<string, unknown> = {};
+    if ('status' in update) patch.status = update.status;
+    if ('result' in update) patch.result = update.result ?? null;
+    if ('error' in update) patch.error = update.error ?? null;
+    if ('suspendPayload' in update) patch.suspend_payload = update.suspendPayload ?? null;
+    if ('retryCount' in update) patch.retry_count = update.retryCount;
+    if ('startedAt' in update) patch.startedAt = update.startedAt?.toISOString() ?? null;
+    if ('suspendedAt' in update) patch.suspendedAt = update.suspendedAt?.toISOString() ?? null;
+    if ('completedAt' in update) patch.completedAt = update.completedAt?.toISOString() ?? null;
+    if ('ownerId' in update) patch.ownerId = update.ownerId ?? null;
+    if ('leaseExpiresAt' in update) patch.leaseExpiresAt = update.leaseExpiresAt?.toISOString() ?? null;
+    if (Object.keys(patch).length === 0) return false;
 
-    const merged = { ...existing };
-
-    if ('status' in update) merged.status = update.status!;
-    if ('result' in update) merged.result = update.result;
-    if ('error' in update) merged.error = update.error;
-    if ('suspendPayload' in update) merged.suspendPayload = update.suspendPayload;
-    if ('retryCount' in update) merged.retryCount = update.retryCount!;
-    if ('startedAt' in update) merged.startedAt = update.startedAt;
-    if ('suspendedAt' in update) merged.suspendedAt = update.suspendedAt;
-    if ('completedAt' in update) merged.completedAt = update.completedAt;
-
-    const record = toStorageRecord(merged);
-    const { key, processedRecord } = processRecord(TABLE_BACKGROUND_TASKS, record);
-    await this.client.set(key, processedRecord);
+    const key = getKey(TABLE_BACKGROUND_TASKS, { id: taskId });
+    const result = await this.client.eval(
+      `
+        local existing = redis.call('GET', KEYS[1])
+        if not existing then return 0 end
+        local record = cjson.decode(existing)
+        if ARGV[1] ~= '' and record.status ~= ARGV[1] then return 0 end
+        local function normalize(value)
+          if value == nil or value == cjson.null then return nil end
+          return value
+        end
+        if ARGV[3] == '1' then
+          if normalize(record.ownerId) ~= normalize(cjson.decode(ARGV[4])) then return 0 end
+        end
+        if ARGV[5] == '1' then
+          if normalize(record.leaseExpiresAt) ~= normalize(cjson.decode(ARGV[6])) then return 0 end
+        end
+        local patch = cjson.decode(ARGV[2])
+        for field, value in pairs(patch) do record[field] = value end
+        redis.call('SET', KEYS[1], cjson.encode(record))
+        return 1
+      `,
+      [key],
+      [
+        options?.expectedStatus ?? '',
+        JSON.stringify(patch),
+        options?.expectedOwnerId !== undefined ? '1' : '0',
+        JSON.stringify(options?.expectedOwnerId ?? null),
+        options?.expectedLeaseExpiresAt !== undefined ? '1' : '0',
+        JSON.stringify(options?.expectedLeaseExpiresAt?.toISOString() ?? null),
+      ],
+    );
+    return Number(result) === 1;
   }
 
   async getTask(taskId: string): Promise<BackgroundTask | null> {

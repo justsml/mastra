@@ -1,4 +1,3 @@
-import { generateSignalId } from '@mastra/core/observability';
 import type {
   AnyRecordedSpan,
   CorrelationContext,
@@ -12,6 +11,7 @@ import type {
   SpanTypeMap,
 } from '@mastra/core/observability';
 import type { GetTraceResponse, SpanRecord } from '@mastra/core/storage';
+import { generateSignalId } from './ids';
 
 type RecordedAnnotationEvent = ScoreEvent | FeedbackEvent;
 type EmitRecordedEvent = (event: RecordedAnnotationEvent) => void | Promise<void>;
@@ -377,7 +377,9 @@ class RecordedTraceImpl implements RecordedTrace {
 
 function findRootSpan(spans: SpanRecord[]): SpanRecord | undefined {
   const spanIds = new Set(spans.map(span => span.spanId));
-  return spans.find(span => !span.parentSpanId || !spanIds.has(span.parentSpanId)) ?? spans[0];
+  // Prefer the true root; storage may return spans in any order, so an orphan
+  // (parent not persisted) must not win just by appearing first.
+  return spans.find(span => !span.parentSpanId) ?? spans.find(span => !spanIds.has(span.parentSpanId!)) ?? spans[0];
 }
 
 export function hydrateRecordedTrace(args: {

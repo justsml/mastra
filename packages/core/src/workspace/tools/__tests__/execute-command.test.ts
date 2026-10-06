@@ -67,6 +67,36 @@ describe('executeCommandTool data chunks', () => {
     });
   });
 
+  describe('exit metadata', () => {
+    it('preserves provider termination flags', async () => {
+      const { context, writerCustom } = createMockContext({
+        toolCallId: 'call-terminated',
+        executeCommand: async () => ({
+          success: false,
+          exitCode: 137,
+          stdout: '',
+          stderr: '',
+          executionTimeMs: 50,
+          killed: true,
+          timedOut: true,
+        }),
+      });
+
+      await execute({ command: 'sleep', args: ['999'], timeout: null, cwd: null }, context);
+
+      const exitChunks = getChunks(writerCustom, 'data-sandbox-exit');
+      expect(exitChunks).toHaveLength(1);
+      expect(exitChunks[0].data).toEqual({
+        exitCode: 137,
+        success: false,
+        executionTimeMs: 50,
+        killed: true,
+        timedOut: true,
+        toolCallId: 'call-terminated',
+      });
+    });
+  });
+
   describe('toolCallId in chunks', () => {
     it('includes toolCallId in stdout chunks', async () => {
       const { context, writerCustom } = createMockContext({
@@ -253,23 +283,24 @@ describe('executeCommandTool data chunks', () => {
 
       const result = await execute({ command: 'test', args: [], timeout: null, cwd: null }, context);
 
-      expect(result).toBe('partial output\nsome error\nExit code: 2');
+      expect(result).toBe('stdout:\npartial output\n\nstderr:\nsome error\n\nExit code: 2');
     });
 
-    it('returns accumulated stdout + error message when sandbox throws', async () => {
+    it('labels accumulated stdout and stderr when sandbox throws', async () => {
       const { context } = createMockContext({
         executeCommand: async (_cmd, _args, opts) => {
           opts?.onStdout?.('Log #1\n');
-          opts?.onStdout?.('Log #2\n');
+          opts?.onStdout?.('Log #2');
+          opts?.onStderr?.('warning: cleanup incomplete');
           throw new Error('Process timed out after 4000ms');
         },
       });
 
       const result = await execute({ command: 'node', args: ['slow.js'], timeout: null, cwd: null }, context);
 
-      expect(result).toContain('Log #1\n');
-      expect(result).toContain('Log #2\n');
-      expect(result).toContain('Error: Process timed out after 4000ms');
+      expect(result).toBe(
+        'stdout:\nLog #1\nLog #2\n\nstderr:\nwarning: cleanup incomplete\n\nError: Process timed out after 4000ms',
+      );
     });
 
     it('returns only error when no stdout was captured before throw', async () => {
@@ -287,14 +318,14 @@ describe('executeCommandTool data chunks', () => {
     it('returns accumulated stderr + error when only stderr before throw', async () => {
       const { context } = createMockContext({
         executeCommand: async (_cmd, _args, opts) => {
-          opts?.onStderr?.('warning: something bad\n');
+          opts?.onStderr?.('warning: something bad');
           throw new Error('killed');
         },
       });
 
       const result = await execute({ command: 'test', args: [], timeout: null, cwd: null }, context);
 
-      expect(result).toBe('warning: something bad\n\nError: killed');
+      expect(result).toBe('stderr:\nwarning: something bad\n\nError: killed');
     });
 
     it('returns "(no output)" for successful command with empty stdout', async () => {
@@ -319,6 +350,30 @@ describe('executeCommandTool data chunks', () => {
       const result = await execute({ command: 'echo', args: ['hello world'], timeout: null, cwd: null }, context);
 
       expect(result).toBe('hello world\n');
+    });
+
+    it('returns stderr for successful command with no stdout', async () => {
+      const { context } = createMockContext({
+        executeCommand: async () => {
+          return { success: true, exitCode: 0, stdout: '', stderr: 'warning', executionTimeMs: 5 };
+        },
+      });
+
+      const result = await execute({ command: 'warn', args: [], timeout: null, cwd: null }, context);
+
+      expect(result).toBe('stderr:\nwarning');
+    });
+
+    it('labels stdout and stderr for successful command with both streams', async () => {
+      const { context } = createMockContext({
+        executeCommand: async () => {
+          return { success: true, exitCode: 0, stdout: 'completed', stderr: 'warning', executionTimeMs: 5 };
+        },
+      });
+
+      const result = await execute({ command: 'build', args: [], timeout: null, cwd: null }, context);
+
+      expect(result).toBe('stdout:\ncompleted\n\nstderr:\nwarning');
     });
   });
 
@@ -349,6 +404,25 @@ describe('executeCommandTool data chunks', () => {
       const stdoutChunks = getChunks(writerCustom, 'data-sandbox-stdout');
       const streamedOutput = stdoutChunks.map(c => c.data.output).join('');
       expect(streamedOutput).toBe(result);
+    });
+
+    it('bounds retained output so huge streams cannot overflow the accumulator', async () => {
+      const chunk = 'x'.repeat(1024 * 1024);
+      const { context } = createMockContext({
+        executeCommand: async (_cmd, _args, opts) => {
+          for (let i = 0; i < 8; i++) {
+            await opts?.onStdout?.(`${chunk}\n`);
+            await opts?.onStderr?.(`${chunk}\n`);
+          }
+          throw new Error('boom');
+        },
+      });
+
+      const result = await execute({ command: 'flood', args: [], timeout: null, cwd: null, tail: 0 }, context);
+
+      expect(result.endsWith('Error: boom')).toBe(true);
+      // 1 MiB cap per stream, so the 16 MiB streamed stays far out of the result.
+      expect(result.length).toBeLessThan(4 * 1024 * 1024);
     });
 
     it('streamed chunks + error match return value when command throws after streaming', async () => {
@@ -424,6 +498,154 @@ describe('executeCommandTool data chunks', () => {
       await execute({ command: 'echo hi', timeout: null, cwd: null, tail: null }, context);
 
       expect(receivedOpts.abortSignal).toBeUndefined();
+    });
+  });
+
+  describe('aborted commands', () => {
+    const abortNote =
+      'Command aborted: the run was cancelled (by the user or system) while this command was running, so it was killed before it finished.';
+
+    function createAbortedContext(executeCommand: Parameters<typeof createMockContext>[0]['executeCommand']) {
+      const controller = new AbortController();
+      const { context } = createMockContext({
+        executeCommand: async (cmd, args, opts) => {
+          controller.abort();
+          return executeCommand(cmd, args, opts);
+        },
+      });
+      context.abortSignal = controller.signal;
+      return context;
+    }
+
+    it('explains that a command killed by the abort signal was aborted', async () => {
+      const context = createAbortedContext(async () => ({
+        success: false,
+        exitCode: 128,
+        stdout: 'started\n',
+        stderr: '',
+        executionTimeMs: 300,
+        killed: true,
+      }));
+
+      const result = await execute({ command: 'echo started; sleep 10', timeout: null, cwd: null }, context);
+
+      expect(result).toBe(`started\n\n${abortNote}\nExit code: 128`);
+    });
+
+    it('explains the abort when the provider does not report killed', async () => {
+      const context = createAbortedContext(async () => ({
+        success: false,
+        exitCode: -1,
+        stdout: '',
+        stderr: '',
+        executionTimeMs: 300,
+      }));
+
+      const result = await execute({ command: 'sleep 10', timeout: null, cwd: null }, context);
+
+      expect(result).toBe(`${abortNote}\nExit code: -1`);
+    });
+
+    it('does not label a command the provider reports was not killed', async () => {
+      const context = createAbortedContext(async () => ({
+        success: false,
+        exitCode: 128,
+        stdout: '',
+        stderr: 'fatal: not a git repository',
+        executionTimeMs: 5,
+        killed: false,
+      }));
+
+      const result = await execute({ command: 'git status', timeout: null, cwd: null }, context);
+
+      expect(result).toBe('stderr:\nfatal: not a git repository\n\nExit code: 128');
+    });
+
+    it('does not label a timed-out command as aborted', async () => {
+      const context = createAbortedContext(async () => ({
+        success: false,
+        exitCode: 124,
+        stdout: '',
+        stderr: 'Process timed out after 1000ms',
+        executionTimeMs: 1000,
+        killed: true,
+        timedOut: true,
+      }));
+
+      const result = await execute({ command: 'sleep 10', timeout: 1, cwd: null }, context);
+
+      expect(result).toBe('stderr:\nProcess timed out after 1000ms\n\nExit code: 124');
+    });
+
+    it('does not label a killed command when the run was not aborted', async () => {
+      const { context } = createMockContext({
+        executeCommand: async () => ({
+          success: false,
+          exitCode: 128,
+          stdout: '',
+          stderr: '',
+          executionTimeMs: 5,
+          killed: true,
+        }),
+      });
+      context.abortSignal = new AbortController().signal;
+
+      const result = await execute({ command: 'sleep 10', timeout: null, cwd: null }, context);
+
+      expect(result).toBe('Exit code: 128');
+    });
+
+    it('explains the abort when the sandbox throws after the abort', async () => {
+      const context = createAbortedContext(async (_cmd, _args, opts) => {
+        opts?.onStdout?.('started\n');
+        throw new Error('process terminated');
+      });
+
+      const result = await execute({ command: 'echo started; sleep 10', timeout: null, cwd: null }, context);
+
+      expect(result).toBe(`started\n\n${abortNote}\nError: process terminated`);
+    });
+
+    function abortOnExitChunk(writerCustom: ReturnType<typeof vi.fn>, controller: AbortController) {
+      writerCustom.mockImplementation(async (chunk: { type: string }) => {
+        if (chunk.type === 'data-sandbox-exit') controller.abort();
+      });
+    }
+
+    it('does not label a failed command when the abort arrives after it finished', async () => {
+      const controller = new AbortController();
+      const { context, writerCustom } = createMockContext({
+        executeCommand: async () => ({
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr: 'error: tests failed',
+          executionTimeMs: 5,
+        }),
+      });
+      context.abortSignal = controller.signal;
+      abortOnExitChunk(writerCustom, controller);
+
+      const result = await execute({ command: 'pnpm test', timeout: null, cwd: null }, context);
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(result).toBe('stderr:\nerror: tests failed\n\nExit code: 1');
+    });
+
+    it('does not label a sandbox error when the abort arrives after it was thrown', async () => {
+      const controller = new AbortController();
+      const { context, writerCustom } = createMockContext({
+        executeCommand: async () => {
+          throw new Error('connection reset');
+        },
+      });
+      context.abortSignal = controller.signal;
+      abortOnExitChunk(writerCustom, controller);
+
+      const result = await execute({ command: 'pnpm test', timeout: null, cwd: null }, context);
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(result).toBe('Error: connection reset');
     });
   });
 
@@ -508,6 +730,31 @@ describe('executeCommandTool data chunks', () => {
       await execute({ command: 'cat file.txt | grep error', timeout: null, cwd: null, tail: null }, context);
 
       expect(receivedCommand).toBe('cat file.txt | grep error');
+    });
+
+    it('passes stdinMode ignore to spawn for background commands', async () => {
+      let receivedOptions: any;
+
+      const { context } = createMockContext({
+        executeCommand: async () => {
+          return { success: true, exitCode: 0, stdout: '', stderr: '', executionTimeMs: 1 };
+        },
+      });
+
+      (context.workspace as any).sandbox.processes = {
+        spawn: async (_cmd: string, options: any) => {
+          receivedOptions = options;
+          return { pid: 123 };
+        },
+      };
+
+      const { executeCommandWithBackgroundTool } = await import('../execute-command');
+      await executeCommandWithBackgroundTool.execute!(
+        { command: 'npm start', timeout: null, cwd: null, tail: null, background: true },
+        context,
+      );
+
+      expect(receivedOptions).toHaveProperty('stdinMode', 'ignore');
     });
   });
 });
@@ -642,6 +889,94 @@ describe('executeCommandTool browser CLI logic', () => {
   });
 
   describe('CDP injection', () => {
+    it('routes Browser Use stdin to the managed browser with stable thread isolation', async () => {
+      const commands: string[] = [];
+      const browser = createMockBrowser({
+        getCdpUrl: vi.fn(thread => `ws://localhost/browser/${thread}`),
+      });
+      const command = `browser-use <<'PY'\nprint("hello; world")\nPY\n`;
+      for (const threadId of ['one', 'one', 'two']) {
+        const { context } = createMockContextWithBrowser({
+          browser,
+          threadId,
+          executeCommand: async cmd => {
+            commands.push(cmd);
+            return { success: true, exitCode: 0, stdout: '', stderr: '', executionTimeMs: 1 };
+          },
+        });
+        await execute({ command, timeout: null, cwd: null, tail: null }, context);
+      }
+      expect(commands).toHaveLength(3); // No Browser Use warmup commands.
+      expect(commands[0]).toBe(commands[1]);
+      expect(commands[0]).not.toBe(commands[2]);
+      expect(commands[0]).toContain('BU_CDP_WS=');
+      expect(commands[0]).toContain('ws://localhost/browser/one');
+      expect(commands[2]).toContain('ws://localhost/browser/two');
+      expect(commands[0]).toContain('BU_NAME=');
+      expect(commands[0]).not.toMatch(/--cdp-url|--session/);
+      expect(commands[0]).toContain('print("hello; world")\n');
+      expect(browser.launch).toHaveBeenCalledWith('one');
+      expect(browser.launch).toHaveBeenCalledWith('two');
+      expect(browser.connectToExternalCdp).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'agent-browser open https://example.com && browser-use < script.py',
+      'browser-use < script.py &&\nagent-browser open https://example.com',
+      'browser-use < script.py ||\nagent-browser open https://example.com',
+      'browser-use < script.py;\nagent-browser open https://example.com',
+      'agent-browser open https://example.com;\nbrowser-use < script.py',
+    ])('warms up and scopes agent-browser in a mixed Browser Use stdin chain: %s', async command => {
+      const commands: string[] = [];
+      const browser = createMockBrowser();
+      const { context } = createMockContextWithBrowser({
+        browser,
+        executeCommand: async cmd => {
+          commands.push(cmd);
+          return { success: true, exitCode: 0, stdout: '', stderr: '', executionTimeMs: 1 };
+        },
+      });
+      await execute(
+        {
+          command,
+          timeout: null,
+          cwd: null,
+          tail: null,
+        },
+        context,
+      );
+      expect(commands).toHaveLength(2);
+      expect(commands[0]).toBe('agent-browser --session test-thread connect ws://localhost:9222/devtools/browser/abc');
+      expect(commands[1]).toContain(
+        'agent-browser --cdp ws://localhost:9222/devtools/browser/abc --session test-thread open',
+      );
+      expect(commands[1]).toContain('BU_CDP_WS=');
+      expect(commands[1]).toContain('BU_NAME=');
+      expect(commands[1]).toContain('browser-use < script.py');
+      expect(commands[1]).not.toContain('--cdp-url');
+      expect(browser.connectToExternalCdp).not.toHaveBeenCalled();
+    });
+
+    it('forwards Browser Use stdin transport to background execution', async () => {
+      const browser = createMockBrowser();
+      const foreground = vi.fn();
+      const { context, sandbox } = createMockContextWithBrowser({ browser, executeCommand: foreground });
+      const spawn = vi.fn(async () => ({ pid: '123' }));
+      Object.assign(sandbox, { processes: { spawn } });
+      const { executeCommandWithBackgroundTool } = await import('../execute-command');
+      const command = `bu <<'PY'\nprint("hello; world")\nPY\n`;
+      await executeCommandWithBackgroundTool.execute!(
+        { command, timeout: null, cwd: null, tail: null, background: true },
+        context,
+      );
+      expect(spawn).toHaveBeenCalledWith(
+        browserCliHandler.injectCdpUrl(command, 'ws://localhost:9222/devtools/browser/abc', 'test-thread'),
+        expect.any(Object),
+      );
+      expect(foreground).not.toHaveBeenCalled();
+      expect(browser.launch).toHaveBeenCalledWith('test-thread');
+    });
+
     it('injects CDP URL into browser CLI command', async () => {
       let executedCommand = '';
       const mockBrowser = createMockBrowser({

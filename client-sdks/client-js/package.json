@@ -1,14 +1,13 @@
 {
   "name": "@mastra/client-js",
-  "version": "1.33.0-alpha.5",
+  "version": "1.52.0-alpha.6",
   "description": "The official TypeScript library for the Mastra Client API",
   "author": "",
   "type": "module",
   "types": "dist/index.d.ts",
   "main": "dist/index.js",
   "files": [
-    "dist",
-    "CHANGELOG.md"
+    "dist"
   ],
   "exports": {
     ".": {
@@ -34,9 +33,10 @@
   "homepage": "https://mastra.ai",
   "license": "Apache-2.0",
   "scripts": {
-    "lint": "eslint .",
+    "lint": "oxlint . && eslint .",
+    "lint:fix": "oxlint --fix . && eslint --fix .",
     "generate:route-types": "pnpm --filter @mastra/server generate:route-types",
-    "build:lib": "tsup --config tsup.config.ts",
+    "build:lib": "tsdown --config tsdown.config.ts",
     "prepack": "tsx ../../scripts/generate-package-docs.ts",
     "dev": "pnpm generate:route-types && pnpm build:lib --watch",
     "test": "vitest",
@@ -48,7 +48,7 @@
     "@mastra/core": "workspace:*",
     "@mastra/schema-compat": "workspace:*",
     "canonicalize": "^1.0.8",
-    "jose": "^6.2.1",
+    "jose": "^6.2.11",
     "json-schema": "^0.4.0"
   },
   "peerDependencies": {
@@ -63,8 +63,8 @@
     "@types/node": "22.20.1",
     "@vitest/coverage-v8": "catalog:",
     "@vitest/ui": "catalog:",
-    "eslint": "^10.4.1",
-    "tsup": "^8.5.1",
+    "eslint": "^10.7.0",
+    "tsdown": "0.22.9",
     "tsx": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",

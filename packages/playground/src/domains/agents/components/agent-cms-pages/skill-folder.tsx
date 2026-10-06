@@ -1,5 +1,6 @@
 import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
 import { Combobox } from '@mastra/playground-ui/components/Combobox';
+import { Field, FieldLabel } from '@mastra/playground-ui/components/Field';
 import { Txt } from '@mastra/playground-ui/components/Txt';
 import { useState, useCallback, useMemo } from 'react';
 
@@ -77,13 +78,11 @@ export function SkillFolder({
   const isImage = isImageContent(selectedFileContent);
 
   return (
-    <div className="grid grid-cols-[300px_1fr] h-full">
-      <div className="overflow-y-auto h-full border-r border-border1 p-4">
+    <div className="grid h-full grid-cols-[300px_1fr]">
+      <div className="h-full overflow-y-auto border-r border-border p-4">
         {workspaceOptions.length > 0 && (
-          <div className="flex flex-col gap-1.5 pb-4">
-            <Txt as="label" variant="ui-sm" className="text-neutral3">
-              Workspace
-            </Txt>
+          <Field className="pb-4">
+            <FieldLabel>Workspace</FieldLabel>
             <Combobox
               options={workspaceOptions}
               value={workspaceId}
@@ -91,7 +90,7 @@ export function SkillFolder({
               placeholder="Select a workspace..."
               disabled={readOnly}
             />
-          </div>
+          </Field>
         )}
 
         <SkillFileTree
@@ -107,11 +106,11 @@ export function SkillFolder({
         {isFileSelected ? (
           <>
             {isImage ? (
-              <div className="flex items-center justify-center flex-1 p-4 bg-surface2">
+              <div className="flex flex-1 items-center justify-center bg-background p-4">
                 <img
                   src={selectedFileContent}
                   alt={selectedFileName}
-                  className="max-w-full max-h-dropdown-max-height rounded-md object-contain"
+                  className="max-h-dropdown max-w-full rounded-md object-contain"
                 />
               </div>
             ) : (
@@ -127,8 +126,10 @@ export function SkillFolder({
             )}
           </>
         ) : (
-          <div className="flex items-center justify-center h-full text-xs text-neutral3">
-            Select a file to edit its content
+          <div className="flex h-full items-center justify-center">
+            <Txt tone="muted" as="span" variant="caption" className="block">
+              Select a file to edit its content
+            </Txt>
           </div>
         )}
       </div>

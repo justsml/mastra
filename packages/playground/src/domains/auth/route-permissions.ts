@@ -51,8 +51,7 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
 
   // Observability - uses 'observability' resource for traces/metrics, 'logs' for logs
   { route: '/metrics', permission: 'observability:read', name: 'Metrics' },
-  { route: '/signals', permission: 'observability:read', name: 'Signals' },
-  { route: '/observability', permission: 'observability:read', name: 'Traces' },
+  { route: '/intelligence', permission: 'observability:read', name: 'Intelligence' },
   { route: '/traces', permission: 'observability:read', name: 'Traces' },
   { route: '/logs', permission: 'logs:read', name: 'Logs' },
 
@@ -60,6 +59,7 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   { route: '/scorers', permission: 'scores:read', name: 'Scorers' },
   { route: '/datasets', permission: ['datasets:read'], name: 'Datasets' },
   { route: '/experiments', permission: ['datasets:read'], name: 'Experiments' },
+  { route: '/experiments/review-queue', permission: ['datasets:read'], name: 'Review Queue' },
 
   // Primitives - note: 'mcp' not 'mcps', 'stored' for prompts (stored/prompt-blocks routes)
   { route: '/tools', permission: 'tools:read', name: 'Tools' },
@@ -69,7 +69,6 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   { route: '/workspaces', permission: 'workspaces:read', name: 'Workspaces' },
 
   // Admin-only pages
-  { route: '/request-context', permission: '*', name: 'Request Context' },
 
   // UI-only pages (no corresponding API resource) - marked as public
   // These pages don't fetch protected data, so they're accessible to all authenticated users

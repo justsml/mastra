@@ -1,4 +1,5 @@
-import { createHttpLoggingTestSuite } from '@internal/server-adapter-test-utils';
+import { EventEmitter } from 'node:events';
+import { createHttpLoggingTestSuite } from '@mastra/server-adapters-test-suite';
 import Koa from 'koa';
 import type { Context, Next } from 'koa';
 import { describe } from 'vitest';
@@ -46,7 +47,7 @@ describe('Koa Server Adapter', () => {
         };
 
         const headers: Record<string, string> = {};
-        const res: any = {
+        const res: any = Object.assign(new EventEmitter(), {
           statusCode: 200,
           setHeader: (name: string, value: string) => {
             headers[name.toLowerCase()] = value;
@@ -59,11 +60,11 @@ describe('Koa Server Adapter', () => {
           },
           end: () => {
             res.writableEnded = true;
+            res.emit('finish');
             resolve({ status: res.statusCode });
           },
-          on: () => {},
           writableEnded: false,
-        };
+        });
 
         // Execute
         try {

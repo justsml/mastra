@@ -35,6 +35,20 @@ function createMockV4Model() {
 }
 
 describe('AISDKV7LanguageModel', () => {
+  describe('supportsStructuredOutputs', () => {
+    it('exposes the wrapped model capability', () => {
+      const wrapped = new AISDKV7LanguageModel(Object.assign(createMockV4Model(), { supportsStructuredOutputs: true }));
+      expect(wrapped.supportsStructuredOutputs).toBe(true);
+    });
+
+    it('leaves the capability undefined when the wrapped model does not declare it', () => {
+      const model = createMockV4Model() as unknown as Record<string, unknown>;
+      delete model.supportsStructuredOutputs;
+      const wrapped = new AISDKV7LanguageModel(model as any);
+      expect(wrapped.supportsStructuredOutputs).toBeUndefined();
+    });
+  });
+
   describe('serializeForSpan', () => {
     it('returns only identity fields', () => {
       const wrapped = new AISDKV7LanguageModel(createMockV4Model());
@@ -221,6 +235,52 @@ describe('AISDKV7LanguageModel', () => {
     });
   });
 
+  describe('tool-result media remapping', () => {
+    const toolPrompt = (value: unknown[]) =>
+      [
+        {
+          role: 'tool',
+          content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'read', output: { type: 'content', value } }],
+        },
+      ] as unknown as LanguageModelV4CallOptions['prompt'];
+    const outputOf = (call: any) => call.prompt[0].content[0].output.value;
+
+    it('converts V2 media parts to V4 file parts in doGenerate and doStream', async () => {
+      const model = createMockV4Model();
+      const wrapped = new AISDKV7LanguageModel(model);
+      const prompt = toolPrompt([
+        { type: 'text', text: 'caption' },
+        { type: 'media', data: 'aGVsbG8=', mediaType: 'image/png' },
+      ]);
+      const expected = [
+        { type: 'text', text: 'caption' },
+        { type: 'file', data: { type: 'data', data: 'aGVsbG8=' }, mediaType: 'image/png' },
+      ];
+
+      await wrapped.doGenerate({ prompt } as LanguageModelV4CallOptions);
+      await wrapped.doStream({ prompt } as LanguageModelV4CallOptions);
+
+      expect(outputOf((model.doGenerate as any).mock.calls[0][0])).toMatchObject(expected);
+      expect(outputOf((model.doStream as any).mock.calls[0][0])).toMatchObject(expected);
+    });
+
+    it('converts image-url parts and leaves V4 file parts unchanged', async () => {
+      const model = createMockV4Model();
+      const wrapped = new AISDKV7LanguageModel(model);
+      const v4File = { type: 'file', data: { type: 'data', data: 'aGk=' }, mediaType: 'image/png' };
+
+      await wrapped.doStream({
+        prompt: toolPrompt([{ type: 'image-url', url: 'https://example.com/a.jpg' }, v4File]),
+      } as LanguageModelV4CallOptions);
+
+      const value = outputOf((model.doStream as any).mock.calls[0][0]);
+      expect(value[0]).toMatchObject({ type: 'file', data: { type: 'url' } });
+      expect(value[0].data.url).toBeInstanceOf(URL);
+      expect(value[0].data.url.href).toBe('https://example.com/a.jpg');
+      expect(value[1]).toEqual(v4File);
+    });
+  });
+
   describe('response file untagging', () => {
     it('untags generated file data from doStream so the shared pipeline receives the flat shape', async () => {
       const model = createMockV4Model();
@@ -324,6 +384,61 @@ describe('AISDKV7LanguageModel', () => {
         mediaType: 'image/png',
         data: 'aGVsbG8=',
       });
+    });
+
+    it('delivers reasoning-file and custom parts to Mastra chunks on both doStream and doGenerate', async () => {
+      const model = createMockV4Model();
+      const customPart = { type: 'custom', kind: 'anthropic.container_upload' };
+      (model.doStream as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+        stream: new ReadableStream<LanguageModelV4StreamPart>({
+          start(controller) {
+            controller.enqueue({
+              type: 'reasoning-file',
+              mediaType: 'image/png',
+              data: { type: 'data', data: 'aGVsbG8=' },
+            } as unknown as LanguageModelV4StreamPart);
+            controller.enqueue(customPart as unknown as LanguageModelV4StreamPart);
+            controller.close();
+          },
+        }),
+      });
+      (model.doGenerate as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+        content: [
+          { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: 'aGVsbG8=' } },
+          customPart,
+        ],
+        finishReason: 'stop',
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        warnings: [],
+      });
+      const wrapped = new AISDKV7LanguageModel(model);
+
+      const expectedReasoningFile = {
+        type: 'reasoning-file',
+        runId: 'run-1',
+        from: 'AGENT',
+        payload: { data: 'aGVsbG8=', base64: 'aGVsbG8=', mimeType: 'image/png' },
+      };
+      const expectedCustom = {
+        type: 'custom',
+        runId: 'run-1',
+        from: 'AGENT',
+        payload: { kind: 'anthropic.container_upload' },
+      };
+
+      const streamResult = await wrapped.doStream({ prompt: [] } as unknown as LanguageModelV4CallOptions);
+      const streamChunks = (await collectStream(streamResult.stream)).map(part =>
+        convertFullStreamChunkToMastra(part, { runId: 'run-1' }),
+      );
+      expect(streamChunks).toContainEqual(expectedReasoningFile);
+      expect(streamChunks).toContainEqual(expectedCustom);
+
+      const generateResult = await wrapped.doGenerate({ prompt: [] } as unknown as LanguageModelV4CallOptions);
+      const generateChunks = (await collectStream(generateResult.stream)).map(part =>
+        convertFullStreamChunkToMastra(part, { runId: 'run-1' }),
+      );
+      expect(generateChunks).toContainEqual(expectedReasoningFile);
+      expect(generateChunks).toContainEqual(expectedCustom);
     });
 
     it('produces flat data the shared chunk transform maps to a valid FileChunk payload', async () => {

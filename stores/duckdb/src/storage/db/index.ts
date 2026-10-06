@@ -48,11 +48,37 @@ function toJsValue(val: unknown): unknown {
   return val;
 }
 
+/** A query interrupted at its caller-supplied deadline. */
+export class DuckDBQueryTimeoutError extends Error {
+  constructor() {
+    super('DuckDB query exceeded its deadline');
+    this.name = 'DuckDBQueryTimeoutError';
+  }
+}
+
 /** Configuration for the DuckDB database connection. */
 export interface DuckDBStorageConfig {
   /** Path to the DuckDB file. Defaults to 'mastra.duckdb'. Use ':memory:' for ephemeral. */
   path?: string;
+  /**
+   * Maximum memory DuckDB may use (e.g. '2GB', '512MB').
+   * @default '2GB'
+   * DuckDB's own default is 80% of system RAM, which is far too aggressive for
+   * a store embedded in an application server — a single query against a large
+   * database can balloon the process by several GB and push the host into
+   * swap. Larger-than-memory operations spill to disk for file-backed
+   * databases. Raise this for dedicated analytical workloads.
+   */
+  memoryLimit?: string;
+  /**
+   * Number of threads DuckDB may use. Defaults to DuckDB's default (one per
+   * CPU core). Lower this to keep queries from monopolizing all cores of a
+   * shared application server.
+   */
+  threads?: number;
 }
+
+const DEFAULT_MEMORY_LIMIT = '2GB';
 
 /**
  * Shared DuckDB connection management for Mastra storage.
@@ -64,10 +90,15 @@ export class DuckDBConnection extends MastraBase {
   private initialized = false;
   private initPromise: Promise<void> | null = null;
   private path: string;
+  private instanceOptions: Record<string, string>;
 
   constructor(config: DuckDBStorageConfig = {}) {
     super({ component: 'STORAGE', name: 'DUCKDB' });
     this.path = config.path ?? 'mastra.duckdb';
+    this.instanceOptions = {
+      max_memory: config.memoryLimit ?? DEFAULT_MEMORY_LIMIT,
+      ...(config.threads !== undefined ? { threads: String(config.threads) } : {}),
+    };
   }
 
   private async initialize(): Promise<void> {
@@ -82,7 +113,7 @@ export class DuckDBConnection extends MastraBase {
 
     this.initPromise = (async () => {
       try {
-        this.instance = await DuckDBInstance.create(this.path);
+        this.instance = await DuckDBInstance.create(this.path, this.instanceOptions);
         this.initialized = true;
       } catch (error) {
         this.instance = null;
@@ -135,8 +166,16 @@ export class DuckDBConnection extends MastraBase {
   /**
    * Execute a SQL query and return results as objects.
    */
-  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], timeoutMs?: number): Promise<T[]> {
     const connection = await this.getConnection();
+    let timedOut = false;
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            connection.interrupt();
+          }, timeoutMs);
     try {
       if (params.length === 0) {
         const result = await connection.run(sql);
@@ -167,7 +206,11 @@ export class DuckDBConnection extends MastraBase {
         });
         return obj as T;
       });
+    } catch (error) {
+      if (timedOut) throw new DuckDBQueryTimeoutError();
+      throw error;
     } finally {
+      if (timer !== undefined) clearTimeout(timer);
       this.closeConnection(connection);
     }
   }
@@ -189,6 +232,67 @@ export class DuckDBConnection extends MastraBase {
         bindParam(stmt, i + 1, params[i]);
       }
       await stmt.run();
+    } finally {
+      this.closeConnection(connection);
+    }
+  }
+
+  /** Delete one bounded retention batch and return the number of rows removed. */
+  async pruneBatch({
+    tableName,
+    column,
+    cutoff,
+    limit,
+  }: {
+    tableName: string;
+    column: string;
+    cutoff: Date;
+    limit: number;
+  }): Promise<number> {
+    const identifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    if (!identifier.test(tableName) || !identifier.test(column)) {
+      throw new Error(`Invalid retention identifier: ${tableName}.${column}`);
+    }
+
+    const rows = await this.query(
+      `DELETE FROM ${tableName}
+       WHERE rowid IN (
+         SELECT rowid FROM ${tableName}
+         WHERE ${column} < ?
+         ORDER BY ${column}
+         LIMIT ?
+       )
+       RETURNING 1 AS deleted`,
+      [cutoff, limit],
+    );
+    return rows.length;
+  }
+
+  /** Execute parameterized statements atomically using a single DuckDB connection. */
+  async executeTransaction(statements: readonly { sql: string; params?: readonly unknown[] }[]): Promise<void> {
+    if (statements.length === 0) return;
+
+    const connection = await this.getConnection();
+    try {
+      await connection.run('BEGIN TRANSACTION');
+      for (const statement of statements) {
+        const params = statement.params ?? [];
+        if (params.length === 0) {
+          await connection.run(statement.sql);
+          continue;
+        }
+        let paramIndex = 0;
+        const preparedSql = statement.sql.replace(/\?/g, () => `$${++paramIndex}`);
+        const prepared = await connection.prepare(preparedSql);
+        for (let i = 0; i < params.length; i++) {
+          bindParam(prepared, i + 1, params[i]);
+        }
+        await prepared.run();
+      }
+      await connection.run('COMMIT');
+    } catch (error) {
+      await connection.run('ROLLBACK').catch(() => undefined);
+      throw error;
     } finally {
       this.closeConnection(connection);
     }

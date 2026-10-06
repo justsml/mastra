@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { open, readFile, stat } from 'node:fs/promises';
 import { dirname, join, relative, posix } from 'node:path';
 import { glob } from 'tinyglobby';
@@ -79,7 +78,7 @@ async function getWorkspaceRootLockfiles(projectDir: string): Promise<string[]> 
  */
 async function hashFile(filePath: string): Promise<string> {
   const content = await readFile(filePath);
-  return createHash('sha256').update(content).digest('hex');
+  return Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', content)).toString('hex');
 }
 
 /**
@@ -93,7 +92,7 @@ async function hashFile(filePath: string): Promise<string> {
  *
  * Also includes workspace root lockfiles if the project is in a monorepo.
  */
-export async function computeSourceHash(rootDir: string, mastraDir: string): Promise<string> {
+export async function computeSourceHash(rootDir: string, mastraDir: string, projectType?: string): Promise<string> {
   const relMastraDir = relative(rootDir, mastraDir);
   const normalizedMastraDir = relMastraDir.split('\\').join('/'); // Normalize for Windows
 
@@ -113,20 +112,37 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
     'tsconfig.json',
   ];
 
+  // Software Factory projects have a project-owned SPA whose source and
+  // config live outside src/mastra. Include those UI inputs so a UI-only
+  // edit triggers a staleness mismatch. Do NOT hash the generated output
+  // at src/mastra/public/factory — it is a build artifact, not a source.
+  if (projectType === 'factory') {
+    patterns.push(
+      // SPA source (React/TS components, styles, hooks, etc.)
+      'src/web/ui/**/*.{ts,tsx,js,jsx,css,scss,json}',
+      // Vite config
+      'src/web/vite.config.{ts,js,mts,mjs}',
+      // Static public assets consumed by Vite
+      'src/web/public/**/*',
+      // Exclude generated Factory UI output so it doesn't self-invalidate
+      `!${posix.join(normalizedMastraDir, 'public/factory/**')}`,
+    );
+  }
+
   const files = await collectFiles(rootDir, patterns);
 
   // Also check for workspace root lockfiles (monorepo support)
   const workspaceRootLockfiles = await getWorkspaceRootLockfiles(rootDir);
 
   // Create a hash of all file hashes combined with their paths
-  const masterHash = createHash('sha256');
+  const hashParts: string[] = [];
 
   // Hash project files
   for (const filePath of files) {
     const relPath = relative(rootDir, filePath);
     const fileHash = await hashFile(filePath);
     // Include path in hash so file renames are detected
-    masterHash.update(`${relPath}:${fileHash}\n`);
+    hashParts.push(`${relPath}:${fileHash}\n`);
   }
 
   // Hash workspace root lockfiles (if any)
@@ -134,10 +150,11 @@ export async function computeSourceHash(rootDir: string, mastraDir: string): Pro
     const fileHash = await hashFile(lockfilePath);
     // Use just the lockfile name to ensure determinism across machines
     const lockfileName = lockfilePath.split(/[/\\]/).pop()!;
-    masterHash.update(`[workspace-root]${lockfileName}:${fileHash}\n`);
+    hashParts.push(`[workspace-root]${lockfileName}:${fileHash}\n`);
   }
 
-  return `sha256:${masterHash.digest('hex')}`;
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashParts.join('')));
+  return `sha256:${Buffer.from(digest).toString('hex')}`;
 }
 
 /**
@@ -197,6 +214,7 @@ export async function checkBuildStaleness(
   rootDir: string,
   mastraDir: string,
   outputDirectory: string,
+  projectType?: string,
 ): Promise<StalenessCheckResult> {
   // Check if build output exists
   const outputPath = join(outputDirectory, 'output', 'index.mjs');
@@ -213,7 +231,7 @@ export async function checkBuildStaleness(
   }
 
   // Compute current source hash
-  const currentHash = await computeSourceHash(rootDir, mastraDir);
+  const currentHash = await computeSourceHash(rootDir, mastraDir, projectType);
 
   if (currentHash !== manifest.sourceHash) {
     return {

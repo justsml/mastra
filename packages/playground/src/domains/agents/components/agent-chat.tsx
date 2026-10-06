@@ -1,7 +1,7 @@
+import { useEntityRequestContext } from '@mastra/playground-ui/domains/request-context/hooks/use-entity-request-context';
+import { useAgentMessages } from '@mastra/react/hooks/agents';
 import { useEffect, useRef } from 'react';
 import { useAgentSettings } from '../context/agent-context';
-import { useMergedRequestContext } from '@/domains/request-context/context/schema-request-context';
-import { useAgentMessages } from '@/hooks/use-agent-messages';
 import { ChatProvider } from '@/lib/ai-ui/chat/chat-provider';
 import { Thread } from '@/lib/ai-ui/thread';
 
@@ -18,23 +18,32 @@ export const AgentChat = ({
   supportsMemory,
   modelList,
   messageId,
+  suggestedPrompts,
   isNewThread,
   hideModelSwitcher,
   runOptionsSlot,
 }: Omit<ChatProps, 'initialMessages'> & {
   memory?: boolean;
   messageId?: string;
+  suggestedPrompts?: string[];
   isNewThread?: boolean;
   hideModelSwitcher?: boolean;
   runOptionsSlot?: React.ReactNode;
 }) => {
   const { settings } = useAgentSettings();
-  const requestContext = useMergedRequestContext();
+  const requestContext = useEntityRequestContext('agent', agentId)[0];
 
-  const { data, isLoading: isMessagesLoading } = useAgentMessages({
+  const {
+    data,
+    isLoading: isMessagesLoading,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useAgentMessages({
     agentId: agentId,
-    threadId: isNewThread ? undefined : threadId!, // Prevent fetching when thread is new
+    threadId: isNewThread ? undefined : threadId!,
     memory: memory ?? false,
+    requestContext: requestContext,
   });
 
   // Handle scrolling to message after navigation
@@ -45,9 +54,9 @@ export const AgentChat = ({
         const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
         if (messageElement) {
           messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          messageElement.classList.add('bg-surface4');
+          messageElement.classList.add('bg-muted');
           setTimeout(() => {
-            messageElement.classList.remove('bg-surface4');
+            messageElement.classList.remove('bg-muted');
           }, 2000);
         }
       }, 100);
@@ -63,6 +72,10 @@ export const AgentChat = ({
   }
 
   const messages = data?.messages ?? emptyMessagesRef.current.messages;
+
+  const loadOlderMessages = () => {
+    if (!isFetchingNextPage) void fetchNextPage();
+  };
 
   return (
     <ChatProvider
@@ -81,10 +94,14 @@ export const AgentChat = ({
         agentName={agentName ?? ''}
         agentId={agentId}
         threadId={threadId}
+        suggestedPrompts={suggestedPrompts}
         hasModelList={Boolean(modelList)}
         hideModelSwitcher={hideModelSwitcher}
         refreshThreadList={refreshThreadList}
         runOptionsSlot={runOptionsSlot}
+        isHistoryLoading={isMessagesLoading}
+        onLoadPrevious={hasNextPage ? loadOlderMessages : undefined}
+        isLoadingPrevious={isFetchingNextPage}
       />
     </ChatProvider>
   );

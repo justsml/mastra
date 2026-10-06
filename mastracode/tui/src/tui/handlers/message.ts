@@ -9,15 +9,26 @@
  * therefore delegated to `addUserMessage` / `renderSignalMessage`; this file
  * only drives the streaming assistant component and its tool boundaries.
  */
+import { MODEL_FALLBACK_STATE_KEY } from '@mastra/code-sdk/auth/account-rotation-processor';
+import type { PendingModelFallback } from '@mastra/code-sdk/auth/account-rotation-processor';
+import {
+  loadSettings,
+  resolveDefaultThinkingLevel,
+  THREAD_FALLBACK_STATUS_KEY,
+} from '@mastra/code-sdk/onboarding/settings';
 import type { MastraDBMessage } from '@mastra/core/agent-controller';
 
+import {
+  ensureAssistantRenderSegment,
+  finalizeStreamingAssistant,
+  getAssistantSegmentKey,
+} from '../assistant-render-registry.js';
 import { reconcileChatBoundarySpacers } from '../chat-boundary-reconciliation.js';
-import { AssistantMessageComponent } from '../components/assistant-message.js';
 import { ToolExecutionComponentEnhanced } from '../components/tool-execution-enhanced.js';
 import { getAssistantRenderParts, isGoalJudgeEvaluationSignal } from '../db-message-parts.js';
 import type { ToolRenderPart } from '../db-message-parts.js';
+import { applyPackToSession, listResolvableModePacks } from '../model-packs/apply.js';
 import { flushRender, requestRender } from '../render-scheduler.js';
-import { getMarkdownTheme } from '../theme.js';
 
 import { createStaticSubagentComponent } from './tool.js';
 import type { EventHandlerContext } from './types.js';
@@ -38,6 +49,21 @@ function getContent(message: MastraDBMessage): MessageContent | undefined {
 
 function getRawParts(message: MastraDBMessage): MessagePart[] {
   return getContent(message)?.parts ?? [];
+}
+
+/**
+ * Quiet mode keeps "Thinking..." out of the chat and shows it in the status line above the input
+ * while the streaming message's latest content is reasoning.
+ */
+function syncQuietThinkingStatus(ctx: EventHandlerContext, message?: MastraDBMessage): void {
+  const { state } = ctx;
+  const latest = message
+    ? getRawParts(message).findLast(
+        part => part.type === 'text' || part.type === 'reasoning' || part.type === 'tool-invocation',
+      )
+    : undefined;
+  const thinking = state.quietMode && state.hideThinkingBlock && latest?.type === 'reasoning';
+  state.idleCounter?.setThinking(thinking);
 }
 
 function isToolPart(part: MessagePart): boolean {
@@ -125,15 +151,16 @@ export function handleMessageStart(ctx: EventHandlerContext, message: MastraDBMe
   }
 
   if (message.role === 'assistant') {
+    syncQuietThinkingStatus(ctx, message);
     // Clear tool component references when starting a new assistant message
     state.lastAskUserComponent = undefined;
     state.lastSubmitPlanComponent = undefined;
+    state.streamingMessage = message;
     if (!state.streamingComponent) {
-      state.streamingComponent = new AssistantMessageComponent(undefined, state.hideThinkingBlock, getMarkdownTheme());
-      ctx.addChildBeforeFollowUps(state.streamingComponent);
-      state.streamingMessage = message;
-      state.streamingComponent.updateContent(withParts(message, getTrailingParts(message)));
-      reconcileChatBoundarySpacers(state.chatContainer);
+      ensureAssistantRenderSegment(state, message.id, ctx.addChildBeforeFollowUps);
+      state.assistantRenderRegistry.queueActive(message.id, withParts(message, getTrailingParts(message)), () => {
+        reconcileChatBoundarySpacers(state.chatContainer);
+      });
     }
     flushRender(state);
   }
@@ -151,20 +178,21 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
   }
 
   if (message.role !== 'assistant') return;
+  syncQuietThinkingStatus(ctx, message);
 
   const renderParts = getAssistantRenderParts(message);
   const toolParts = renderParts.filter((part): part is ToolRenderPart => part.kind === 'tool');
   const trailingParts = getTrailingParts(message);
   const hasToolCalls = toolParts.length > 0;
 
-  let createdStreamingComponent = false;
   if (!state.streamingComponent) {
     if (trailingParts.length === 0 && !hasToolCalls) {
       return;
     }
-    state.streamingComponent = new AssistantMessageComponent(undefined, state.hideThinkingBlock, getMarkdownTheme());
-    ctx.addChildBeforeFollowUps(state.streamingComponent);
-    createdStreamingComponent = true;
+    ensureAssistantRenderSegment(state, message.id, ctx.addChildBeforeFollowUps);
+  } else if (!state.assistantRenderRegistry.getActive(message.id)) {
+    const component = state.streamingComponent;
+    state.assistantRenderRegistry.start(message.id, getAssistantSegmentKey(message.id), () => component);
   }
 
   state.streamingMessage = message;
@@ -175,12 +203,12 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
       state.seenToolCallIds.add(tool.toolCallId);
 
       const preParts = getPartsBeforeTool(message, tool.toolCallId, state.seenToolCallIds);
-      state.streamingComponent.updateContent(withParts(message, preParts));
+      state.assistantRenderRegistry.queueActive(message.id, withParts(message, preParts));
+      state.assistantRenderRegistry.finalizeActive(message.id);
 
       const staticSubagent = createStaticSubagentComponent(ctx, tool.toolCallId, tool.toolName, tool.args);
       if (staticSubagent) {
         state.subagentToolCallIds.add(tool.toolCallId);
-        createdStreamingComponent = true;
         continue;
       }
 
@@ -188,20 +216,14 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
       // assistant slice before the tool and continue text in a fresh component.
       if (tool.toolName === 'subagent' && !state.subagentToolCallIds.has(tool.toolCallId)) {
         state.subagentToolCallIds.add(tool.toolCallId);
-        state.streamingComponent = new AssistantMessageComponent(
-          undefined,
-          state.hideThinkingBlock,
-          getMarkdownTheme(),
-        );
-        ctx.addChildBeforeFollowUps(state.streamingComponent);
-        createdStreamingComponent = true;
+        ensureAssistantRenderSegment(state, message.id, ctx.addChildBeforeFollowUps, tool.toolCallId);
         continue;
       }
 
       const component = new ToolExecutionComponentEnhanced(
         tool.toolName,
         tool.args as Record<string, unknown>,
-        { showImages: false, collapsedByDefault: !state.toolOutputExpanded },
+        { showImages: false, collapsedByDefault: !state.toolOutputExpanded, projectRoot: state.projectInfo?.rootPath },
         state.ui,
       );
       component.setExpanded(state.toolOutputExpanded);
@@ -215,9 +237,7 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
       state.allToolComponents.push(component);
       reconcileChatBoundarySpacers(state.chatContainer);
 
-      state.streamingComponent = new AssistantMessageComponent(undefined, state.hideThinkingBlock, getMarkdownTheme());
-      ctx.addChildBeforeFollowUps(state.streamingComponent);
-      createdStreamingComponent = true;
+      ensureAssistantRenderSegment(state, message.id, ctx.addChildBeforeFollowUps, tool.toolCallId);
     } else {
       const component = state.pendingTools.get(tool.toolCallId);
       if (component) {
@@ -230,14 +250,9 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
   // Avoid replacing visible assistant text with an empty trailing segment
   // (commonly happens immediately after tool-result-only updates).
   if (trailingParts.length > 0) {
-    const wasSpacingParticipant = state.streamingComponent.getChatSpacingKind() !== undefined;
-    state.streamingComponent.updateContent(withParts(message, trailingParts));
-    if (
-      createdStreamingComponent ||
-      (!wasSpacingParticipant && state.streamingComponent.getChatSpacingKind() !== undefined)
-    ) {
+    state.assistantRenderRegistry.queueActive(message.id, withParts(message, trailingParts), () => {
       reconcileChatBoundarySpacers(state.chatContainer);
-    }
+    });
   }
 
   requestRender(state);
@@ -246,6 +261,7 @@ export function handleMessageUpdate(ctx: EventHandlerContext, message: MastraDBM
 export function handleMessageEnd(ctx: EventHandlerContext, message: MastraDBMessage): void {
   const { state } = ctx;
   if (message.role === 'signal' || message.role === 'user') return;
+  syncQuietThinkingStatus(ctx);
 
   if (state.streamingComponent && message.role === 'assistant') {
     state.streamingMessage = message;
@@ -255,12 +271,15 @@ export function handleMessageEnd(ctx: EventHandlerContext, message: MastraDBMess
     // If the final assistant chunk has no trailing text/thinking after tools,
     // keep the last rendered content instead of blanking the component.
     if (trailingParts.length > 0 || stopReason === 'aborted' || stopReason === 'error') {
-      state.streamingComponent.updateContent(withParts(message, trailingParts));
+      state.assistantRenderRegistry.queueActive(message.id, withParts(message, trailingParts), () => {
+        reconcileChatBoundarySpacers(state.chatContainer);
+      });
     }
 
     if (stopReason === 'aborted' || stopReason === 'error') {
       const abortMessage = errorMessage || 'Operation aborted';
-      for (const [, component] of state.pendingTools) {
+      for (const [toolCallId, component] of state.pendingTools) {
+        if (component.getBackgroundTaskId?.()) continue;
         component.updateResult(
           {
             content: [{ type: 'text', text: abortMessage }],
@@ -268,17 +287,111 @@ export function handleMessageEnd(ctx: EventHandlerContext, message: MastraDBMess
           },
           false,
         );
+        state.pendingTools.delete(toolCallId);
+        state.pendingTaskToolIds?.delete(toolCallId);
       }
       reconcileChatBoundarySpacers(state.chatContainer);
-      state.pendingTools.clear();
-      state.pendingTaskToolIds?.clear();
     }
 
-    state.streamingComponent = undefined;
-    state.streamingMessage = undefined;
+    state.assistantRenderRegistry.finalize(message.id);
+    finalizeStreamingAssistant(state);
     state.seenToolCallIds.clear();
     state.subagentToolCallIds.clear();
     state.currentRunSystemReminderKeys.clear();
   }
   flushRender(state);
+}
+
+/**
+ * Keep a thread on the pack selected by a generic model-route hop.
+ */
+export async function handlePackFallbackState(
+  ectx: EventHandlerContext,
+  event: { state: Record<string, unknown>; changedKeys: string[] },
+): Promise<void> {
+  if (!event.changedKeys.includes(MODEL_FALLBACK_STATE_KEY)) return;
+  const pending = event.state[MODEL_FALLBACK_STATE_KEY] as PendingModelFallback | null | undefined;
+  if (pending === null || pending === undefined) return;
+
+  const entryThreadId = ectx.state.session.thread.getId();
+  const pendingThreadId = typeof pending.threadId === 'string' ? pending.threadId : entryThreadId;
+  const setOriginThreadSetting = async (setting: { key: string; value: unknown }) => {
+    if (pendingThreadId) {
+      await ectx.state.session.thread.setSettingOn({ threadId: pendingThreadId, ...setting });
+    }
+  };
+  const isOriginThreadActive = () => !pendingThreadId || ectx.state.session.thread.getId() === pendingThreadId;
+  const clearPending = async () => {
+    await setOriginThreadSetting({ key: MODEL_FALLBACK_STATE_KEY, value: undefined });
+    if (isOriginThreadActive()) {
+      await ectx.state.session.state.set({ [MODEL_FALLBACK_STATE_KEY]: null });
+    }
+  };
+
+  if (
+    typeof pending.fromEntryId !== 'string' ||
+    typeof pending.toEntryId !== 'string' ||
+    typeof pending.toModelId !== 'string' ||
+    (pending.threadId !== undefined && typeof pending.threadId !== 'string') ||
+    pending.toEntryId.length === 0 ||
+    pending.toModelId.length === 0
+  ) {
+    await clearPending();
+    return;
+  }
+  if (!isOriginThreadActive()) return;
+
+  const settings = loadSettings();
+  const packs = listResolvableModePacks(settings);
+  const pack = packs.find(candidate => candidate.id === pending.toEntryId);
+  if (!pack) {
+    await clearPending();
+    return;
+  }
+  const failedPack = packs.find(candidate => candidate.id === pending.fromEntryId);
+  const fallbackStatus = {
+    usingPack: pack.name,
+    failedPack: failedPack?.name ?? pending.fromEntryId,
+  };
+
+  try {
+    await applyPackToSession(ectx, pending.toEntryId, {
+      clearPendingFallback: false,
+      afterApply: async selection => {
+        if (!isOriginThreadActive()) return;
+        await setOriginThreadSetting({ key: THREAD_FALLBACK_STATUS_KEY, value: fallbackStatus });
+        if (!isOriginThreadActive()) return;
+
+        const sessionOverride = (ectx.state.session.state.get() as Record<string, unknown>)?.thinkingLevel as
+          | string
+          | undefined;
+        const currentModeId = ectx.state.session.mode.get();
+        const runtimeSettings = {
+          ...settings,
+          models: { ...settings.models, activeModelPackId: pending.toEntryId },
+        };
+        const defaultThinking = resolveDefaultThinkingLevel(runtimeSettings, currentModeId);
+        const effectiveThinking = sessionOverride ?? defaultThinking.level;
+        const routeUsesOpenAI = selection.modelRoute.entries.some(entry => entry.modelId.startsWith('openai/'));
+        if (
+          routeUsesOpenAI &&
+          sessionOverride === undefined &&
+          defaultThinking.source === 'global' &&
+          defaultThinking.level === 'off'
+        ) {
+          await ectx.state.session.state.set({ thinkingLevel: 'low' });
+        } else if (selection.modelId.startsWith('openai/') && effectiveThinking === 'max') {
+          await ectx.state.session.state.set({ thinkingLevel: 'xhigh' });
+        }
+
+        ectx.state.fallbackStatus = fallbackStatus;
+        ectx.updateStatusLine();
+        await ectx.refreshModelAuthStatus();
+        await clearPending();
+      },
+    });
+  } catch (error) {
+    await clearPending();
+    throw error;
+  }
 }

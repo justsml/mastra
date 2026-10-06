@@ -1,5 +1,123 @@
 # @mastra/auth-studio
 
+## 1.3.8
+
+### Patch Changes
+
+- Fixed local dev auth: MastraAuthStudio now falls back to organizationId in .mastra-project.json when neither the constructor option nor MASTRA_ORGANIZATION_ID env var is set. Running pnpm mastra dev in a project linked to a platform organization now pins AuthKit to that org and skips the WorkOS org picker for multi-org users, without requiring the env var to be exported locally. ([#25583](https://github.com/mastra-ai/mastra/pull/25583))
+
+## 1.3.8-alpha.0
+
+### Patch Changes
+
+- Fixed local dev auth: MastraAuthStudio now falls back to organizationId in .mastra-project.json when neither the constructor option nor MASTRA_ORGANIZATION_ID env var is set. Running pnpm mastra dev in a project linked to a platform organization now pins AuthKit to that org and skips the WorkOS org picker for multi-org users, without requiring the env var to be exported locally. ([#25583](https://github.com/mastra-ai/mastra/pull/25583))
+
+## 1.3.7
+
+### Patch Changes
+
+- Improved Studio authentication portability by hashing credential cache keys with Web Crypto. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.3.7-alpha.0
+
+### Patch Changes
+
+- Improved Studio authentication portability by hashing credential cache keys with Web Crypto. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.3.6
+
+### Patch Changes
+
+- Fixed deployments pinned to an organization (`MASTRA_ORGANIZATION_ID`) serving members under whatever organization their shared Mastra session cookie happened to be on. A member is now served in the pinned organization with their role in that organization, and bearer tokens are verified against it. Signing in to one deployment no longer changes which organization another deployment treats you as. ([#23427](https://github.com/mastra-ai/mastra/pull/23427))
+
+## 1.3.6-alpha.0
+
+### Patch Changes
+
+- Fixed deployments pinned to an organization (`MASTRA_ORGANIZATION_ID`) serving members under whatever organization their shared Mastra session cookie happened to be on. A member is now served in the pinned organization with their role in that organization, and bearer tokens are verified against it. Signing in to one deployment no longer changes which organization another deployment treats you as. ([#23427](https://github.com/mastra-ai/mastra/pull/23427))
+
+## 1.3.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.3.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.3.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.3.4
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.3.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.3.3
+
+### Patch Changes
+
+- Speed up Factory hot paths: ([#20261](https://github.com/mastra-ai/mastra/pull/20261))
+
+  - Much lower latency on authenticated requests — successful auth verifications are cached briefly instead of hitting the platform on every request, and credential verification requests time out after 15 seconds instead of hanging
+  - Faster GitHub repository listing and connecting
+  - Opening the same session concurrently no longer provisions duplicate sandboxes, and stuck sandbox commands now fail with a clear error instead of hanging
+  - Factory run dispatching stays fast as work-item history grows
+
+## 1.3.3-alpha.0
+
+### Patch Changes
+
+- Speed up Factory hot paths: ([#20261](https://github.com/mastra-ai/mastra/pull/20261))
+
+  - Much lower latency on authenticated requests — successful auth verifications are cached briefly instead of hitting the platform on every request, and credential verification requests time out after 15 seconds instead of hanging
+  - Faster GitHub repository listing and connecting
+  - Opening the same session concurrently no longer provisions duplicate sandboxes, and stuck sandbox commands now fail with a clear error instead of hanging
+  - Factory run dispatching stays fast as work-item history grows
+
+## 1.3.2
+
+### Patch Changes
+
+- `MastraAuthStudio` now automatically creates a personal organization for users who don't belong to one yet, and can check whether a user is an organization admin — matching the behavior already available in `MastraAuthWorkos` and `MastraAuthBetterAuth`. This lets hosts like a self-hosted MastraCode deployment authorize organization-level actions without users needing to manually set up an organization first. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- `MastraAuthStudio.ensureOrganization` now dedupes concurrent bootstraps for the same user, so parallel tabs or requests for a brand-new sign-in no longer end up creating duplicate personal organizations. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- Changed the default shared API URL for Studio auth from http://localhost:3010/v1 to https://platform.mastra.ai/v1, so deployed instances work against the production platform without extra configuration. Set MASTRA_SHARED_API_URL or the sharedApiUrl option to point at a different environment. Production cookie settings (Secure + Domain=.mastra.ai) are now only auto-enabled when the shared API URL is explicitly configured on .mastra.ai, keeping local development cookies host-only. ([#19958](https://github.com/mastra-ai/mastra/pull/19958))
+
+## 1.3.2-alpha.1
+
+### Patch Changes
+
+- Changed the default shared API URL for Studio auth from http://localhost:3010/v1 to https://platform.mastra.ai/v1, so deployed instances work against the production platform without extra configuration. Set MASTRA_SHARED_API_URL or the sharedApiUrl option to point at a different environment. Production cookie settings (Secure + Domain=.mastra.ai) are now only auto-enabled when the shared API URL is explicitly configured on .mastra.ai, keeping local development cookies host-only. ([#19958](https://github.com/mastra-ai/mastra/pull/19958))
+
+## 1.3.2-alpha.0
+
+### Patch Changes
+
+- `MastraAuthStudio` now automatically creates a personal organization for users who don't belong to one yet, and can check whether a user is an organization admin — matching the behavior already available in `MastraAuthWorkos` and `MastraAuthBetterAuth`. This lets hosts like a self-hosted MastraCode deployment authorize organization-level actions without users needing to manually set up an organization first. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
+- `MastraAuthStudio.ensureOrganization` now dedupes concurrent bootstraps for the same user, so parallel tabs or requests for a brand-new sign-in no longer end up creating duplicate personal organizations. ([#19858](https://github.com/mastra-ai/mastra/pull/19858))
+
 ## 1.3.1
 
 ### Patch Changes

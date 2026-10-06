@@ -1,6 +1,6 @@
 ---
 title: "Reference: .listSkills() | Agents"
-description: "API reference for the Agent .listSkills() method, which returns metadata for all configured skills."
+description: "Use Agent.listSkills() to return metadata for every configured agent-level and workspace skill, including the names and descriptions available to the agent."
 packages:
   - "@mastra/core"
 ---
@@ -58,7 +58,6 @@ interface SkillMetadata {
   name: string
   description: string
   path: string
-  source: { type: string; projectPath: string }
   references: string[]
   scripts: string[]
   assets: string[]
@@ -71,10 +70,10 @@ interface SkillMetadata {
 
 ## Merging behavior
 
-When both agent-level skills and workspace skills are configured, `.listSkills()` returns the merged set. Agent-level skills take precedence on name conflicts — if both define a skill named `code-review`, only the agent-level version is returned.
+When both agent-level skills and workspace skills are configured, `.listSkills()` returns the merged set. Agent-level skills take precedence on name conflicts. If both define a skill called `code-review`, only the agent-level version is returned.
 
 ## Related
 
-- [Agent skills](/docs/agents/skills)
+- [Agent skills](/docs/skills)
 - [`.getSkill()` reference](/reference/agents/getSkill)
 - [`createSkill()` reference](/reference/agents/createSkill)

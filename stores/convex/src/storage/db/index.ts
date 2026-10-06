@@ -148,16 +148,19 @@ export class ConvexDB extends MastraBase {
     tableName,
     id,
     record,
+    expected,
   }: {
     tableName: ConvexStorageTable;
     id: string;
     record: Record<string, any>;
+    expected?: Record<string, any>;
   }): Promise<boolean> {
     return this.client.callStorage<boolean>({
       op: 'patch',
       tableName,
       id,
       record: this.normalizePatch(record),
+      expected,
     });
   }
 
@@ -168,8 +171,8 @@ export class ConvexDB extends MastraBase {
     updatedAt,
   }: {
     id: string;
-    title: string;
-    metadata: Record<string, any>;
+    title?: string;
+    metadata?: Record<string, any>;
     updatedAt: Date;
   }): Promise<(Omit<StorageThreadType, 'createdAt' | 'updatedAt'> & { createdAt: string; updatedAt: string }) | null> {
     return this.client.callStorage({
@@ -293,14 +296,27 @@ export class ConvexDB extends MastraBase {
     workflowName: string;
     runId: string;
     opts: UpdateWorkflowStateOptions;
-  }): Promise<WorkflowRunState> {
-    const snapshot = await this.client.callStorage<string>({
-      op: 'mergeWorkflowState',
-      tableName: TABLE_WORKFLOW_SNAPSHOT,
-      workflowName,
-      runId,
-      opts: JSON.stringify(opts),
-    });
+  }): Promise<WorkflowRunState | undefined> {
+    let snapshot: string;
+    try {
+      snapshot = await this.client.callStorage<string>({
+        op: 'mergeWorkflowState',
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        workflowName,
+        runId,
+        opts: JSON.stringify(opts),
+      });
+    } catch (error) {
+      // Missing run resolves to undefined, matching the other storage adapters.
+      if (error instanceof Error && error.message.startsWith('Workflow snapshot not found for runId')) {
+        return undefined;
+      }
+      throw error;
+    }
+    if (snapshot === '') {
+      // The `expectedStatus` guard did not match, so the server applied nothing.
+      return undefined;
+    }
     if (!snapshot) {
       throw new Error(`Convex workflow state merge returned no snapshot for runId ${runId}`);
     }
@@ -346,12 +362,14 @@ export class ConvexDB extends MastraBase {
     newNextFireAt,
     lastFireAt,
     lastRunId,
+    newStatus,
   }: {
     id: string;
     expectedNextFireAt: number;
     newNextFireAt: number;
     lastFireAt: number;
     lastRunId: string;
+    newStatus?: string;
   }): Promise<boolean> {
     return this.client.callStorage<boolean>({
       op: 'updateScheduleNextFire',
@@ -361,6 +379,7 @@ export class ConvexDB extends MastraBase {
       newNextFireAt,
       lastFireAt,
       lastRunId,
+      newStatus,
     });
   }
 
@@ -426,6 +445,11 @@ export class ConvexDB extends MastraBase {
     from?: string;
     to?: string;
     offset?: number;
+    groupId?: string;
+    recordId?: string;
+    beforeGeneration?: number;
+    afterGeneration?: number;
+    sortDirection?: 'ASC' | 'DESC';
   }): Promise<R[]> {
     return this.client.callStorage<R[]>({
       op: 'omGetHistory',

@@ -5,6 +5,7 @@ import {
   createSampleTask,
   createSampleThread,
   createSampleWorkflowSnapshot,
+  createSpan,
   createTestSuite,
   createConfigValidationTests,
   createDomainDirectTests,
@@ -123,6 +124,71 @@ if (ENABLE_TESTS) {
   };
 
   createTestSuite(new SpannerStore(sharedConfig));
+
+  describe('retention', () => {
+    it('prunes expired observability spans and metrics', async () => {
+      const retentionStore = new SpannerStore({
+        ...sharedConfig,
+        id: 'spanner-retention-test',
+        retention: {
+          observability: {
+            spans: { maxAge: '30d', batchSize: 1 },
+            metrics: { maxAge: '30d', batchSize: 1 },
+          },
+        },
+      });
+
+      try {
+        await retentionStore.init();
+        const observability = (await retentionStore.getStore('observability')) as ObservabilitySpanner | undefined;
+        expect(observability).toBeDefined();
+        await observability!.dangerouslyClearAll();
+        await observability!.createSpan({
+          span: createSpan({
+            traceId: 'expired',
+            spanId: 'expired',
+            startedAt: new Date(Date.now() - 31 * 86_400_000),
+          }),
+        });
+        await observability!.createSpan({
+          span: createSpan({
+            traceId: 'retained',
+            spanId: 'retained',
+            startedAt: new Date(Date.now() - 29 * 86_400_000),
+          }),
+        });
+        await observability!.batchCreateMetrics({
+          metrics: [
+            {
+              metricId: 'expired',
+              name: 'expired',
+              value: 1,
+              timestamp: new Date(Date.now() - 31 * 86_400_000),
+              labels: {},
+            },
+            {
+              metricId: 'retained',
+              name: 'retained',
+              value: 1,
+              timestamp: new Date(Date.now() - 29 * 86_400_000),
+              labels: {},
+            },
+          ],
+        });
+
+        await expect(retentionStore.prune()).resolves.toEqual([
+          { domain: 'observability', table: 'mastra_ai_spans', deleted: 1, done: true },
+          { domain: 'observability', table: 'mastra_ai_metrics', deleted: 1, done: true },
+        ]);
+        await expect(observability!.getTrace({ traceId: 'expired' })).resolves.toBeNull();
+        await expect(observability!.getTrace({ traceId: 'retained' })).resolves.not.toBeNull();
+        const metrics = await observability!.listMetrics({ filters: {} });
+        expect(metrics.metrics.map(metric => metric.name)).toEqual(['retained']);
+      } finally {
+        await retentionStore.close();
+      }
+    });
+  });
 
   // Domain-level direct usage with a pre-configured Database handle.
   createDomainDirectTests({
@@ -737,7 +803,48 @@ if (ENABLE_TESTS) {
       );
     });
 
-    it('updateExperimentResult sets review status/tags and is a no-op without changes', async () => {
+    it('listExperimentResults filters by tags (all must match)', async () => {
+      const exp = await experiments.createExperiment(baseExp());
+      const now = Date.now();
+      await experiments.addExperimentResult(
+        baseResult(exp.id, { itemId: 'only-a', tags: ['a'], status: 'reviewed', startedAt: new Date(now) }),
+      );
+      await experiments.addExperimentResult(
+        baseResult(exp.id, { itemId: 'a-and-b', tags: ['a', 'b'], startedAt: new Date(now + 1000) }),
+      );
+      await experiments.addExperimentResult(
+        baseResult(exp.id, { itemId: 'only-b', tags: ['b'], startedAt: new Date(now + 2000) }),
+      );
+      await experiments.addExperimentResult(
+        baseResult(exp.id, { itemId: 'untagged', tags: null, startedAt: new Date(now + 3000) }),
+      );
+      const pagination = { page: 0, perPage: 10 };
+
+      const both = await experiments.listExperimentResults({ experimentId: exp.id, tags: ['a', 'b'], pagination });
+      expect(both.results.map(r => r.itemId)).toEqual(['a-and-b']);
+      expect(both.pagination.total).toBe(1);
+
+      const onlyA = await experiments.listExperimentResults({ experimentId: exp.id, tags: ['a'], pagination });
+      expect(onlyA.results.map(r => r.itemId)).toEqual(['only-a', 'a-and-b']);
+      expect(onlyA.pagination.total).toBe(2);
+
+      const withStatus = await experiments.listExperimentResults({
+        experimentId: exp.id,
+        tags: ['a'],
+        status: 'reviewed',
+        pagination,
+      });
+      expect(withStatus.results.map(r => r.itemId)).toEqual(['only-a']);
+
+      const empty = await experiments.listExperimentResults({ experimentId: exp.id, tags: [], pagination });
+      expect(empty.pagination.total).toBe(4);
+
+      const missing = await experiments.listExperimentResults({ experimentId: exp.id, tags: ['nope'], pagination });
+      expect(missing.results).toHaveLength(0);
+      expect(missing.pagination.total).toBe(0);
+    });
+
+    it('updateExperimentResult sets review status/tags/comment and is a no-op without changes', async () => {
       const exp = await experiments.createExperiment(baseExp());
       const r = await experiments.addExperimentResult(baseResult(exp.id, { itemId: 'i1' }));
       const updated = await experiments.updateExperimentResult({
@@ -745,12 +852,15 @@ if (ENABLE_TESTS) {
         experimentId: exp.id,
         status: 'reviewed',
         tags: ['a', 'b'],
+        comment: 'note',
       });
       expect(updated.status).toBe('reviewed');
       expect(updated.tags).toEqual(['a', 'b']);
-      // No-op (no status/tags) returns the existing row.
+      expect(updated.comment).toBe('note');
+      // No-op (no status/tags/comment) returns the existing row.
       const same = await experiments.updateExperimentResult({ id: r.id });
       expect(same.status).toBe('reviewed');
+      expect(same.comment).toBe('note');
       await expect(experiments.updateExperimentResult({ id: 'missing', status: 'complete' })).rejects.toThrow();
     });
 
@@ -5740,6 +5850,21 @@ if (ENABLE_TESTS) {
           );
         });
 
+        it('batchDeleteTraces deletes trace-linked metrics and preserves unrelated or trace-less metrics', async () => {
+          await observability.batchCreateMetrics({
+            metrics: [
+              makeMetric({ metricId: 'metric-delete', traceId: 'trace-delete' }),
+              makeMetric({ metricId: 'metric-keep', traceId: 'trace-keep' }),
+              makeMetric({ metricId: 'metric-trace-less', traceId: null }),
+            ],
+          });
+
+          await observability.batchDeleteTraces({ traceIds: ['trace-delete'] });
+
+          const result = await observability.listMetrics({ pagination: { page: 0, perPage: 50 } });
+          expect(result.metrics.map(metric => metric.metricId).sort()).toEqual(['metric-keep', 'metric-trace-less']);
+        });
+
         it('round-trips JSON columns (labels, tags, costMetadata, metadata, scope)', async () => {
           const id = randomUUID();
           await observability.batchCreateMetrics({
@@ -5932,6 +6057,32 @@ if (ENABLE_TESTS) {
           );
           expect(byProvider.get('openai')).toBe(300);
           expect(byProvider.get('anthropic')).toBe(50);
+        });
+
+        it('getMetricBreakdown: filters a batch of trace IDs', async () => {
+          await observability.batchCreateMetrics({
+            metrics: [
+              makeMetric({ traceId: 'trace-a', value: 10 }),
+              makeMetric({ traceId: 'trace-b', value: 20 }),
+              makeMetric({ traceId: 'trace-c', value: 30 }),
+            ],
+          });
+
+          const result = await observability.getMetricBreakdown({
+            name: ['agent.duration_ms'],
+            aggregation: 'sum',
+            groupBy: ['traceId'],
+            filters: { traceIds: ['trace-a', 'trace-c'] },
+          });
+
+          expect(
+            result.groups
+              .map(group => [group.dimensions.traceId, group.value])
+              .sort(([left], [right]) => String(left).localeCompare(String(right))),
+          ).toEqual([
+            ['trace-a', 10],
+            ['trace-c', 30],
+          ]);
         });
 
         it('getMetricBreakdown: groups by a label key', async () => {

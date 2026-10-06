@@ -1,3 +1,4 @@
+export * from './agent-learning';
 export * from './client';
 export * from './types';
 export * from './tools';
@@ -15,41 +16,52 @@ export type {
   GetAgentCardOptions,
   VerifyAgentCardSignatureOptions,
 } from './resources/a2a';
-export { agentControllerMessageText } from './resources/agent-controller';
+export { agentControllerMessageText, isKnownAgentControllerEvent } from './resources/agent-controller';
 export type {
-  AgentControllerInfo,
   MastraDBMessage,
   MastraMessageContentV2,
   MastraMessagePart,
   AgentControllerEvent,
   KnownAgentControllerEvent,
   OtherAgentControllerEvent,
-  CreateAgentControllerSessionResponse,
   AgentControllerRequestOptions,
   SubscribeAgentControllerSessionOptions,
   AgentControllerSubscription,
-  AgentControllerSessionState,
-  AgentControllerSessionSettings,
-  AgentControllerOMProgress,
-  AgentControllerModeInfo,
-  AgentControllerThreadInfo,
-  AgentControllerTaskSnapshot,
-  AgentControllerAvailableModel,
-  AgentControllerWorkspaceStatus,
-  AgentControllerGoalRecord,
-  SendNotificationInput,
-  SendNotificationResult,
   PlanResume,
-  PermissionPolicy,
-  PermissionRules,
-  ToolCategory,
+  AgentControllerCommandAck,
+  AgentControllerCommandRejection,
 } from './resources/agent-controller';
 export { RequestContext } from '@mastra/core/request-context';
 // ObservabilityCollector type is available for power users but most
 // users interact via `observe` on the tool execution context.
 export type { ObservabilityCollector } from './observability/types';
+export type {
+  QuerySpansInput,
+  QuerySpansResult,
+  QueryTraceThreadsInput,
+  QueryTraceThreadsResult,
+  QueryTracesInput,
+  QueryTracesDeltaInput,
+  QueryTracesKeysetInput,
+  QueryTracesPaginatedInput,
+} from './resources/observability';
 export type { UIMessageWithMetadata } from '@mastra/core/agent';
-export type { GetMetricTimeSeriesResponse } from '@mastra/core/storage';
+export type { GetMetricTimeSeriesResponse } from './types';
+export type {
+  GetTraceQueryFieldsArgs,
+  GetTraceQueryFieldsResponse,
+  GetTraceQueryValuesArgs,
+  GetTraceQueryValuesResponse,
+  TraceQueryCanonicalFieldDescriptor,
+  TraceQueryGroupResponse,
+  TraceQueryKeysetTraceResponse,
+  TraceQueryObservedFieldDescriptor,
+  TraceQueryOperator,
+  TraceQueryPredicateScope,
+  TraceQueryResponse,
+  TraceQueryTraceResponse,
+  TraceQueryValueKind,
+} from './resources/observability-route-types';
 export type {
   Body,
   Client,

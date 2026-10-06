@@ -4,20 +4,24 @@ import { Notice } from '@mastra/playground-ui/components/Notice';
 import { Popover, PopoverTrigger, PopoverContent } from '@mastra/playground-ui/components/Popover';
 import { ScrollArea } from '@mastra/playground-ui/components/ScrollArea';
 import { Section, SubSectionRoot } from '@mastra/playground-ui/components/Section';
+import { Txt } from '@mastra/playground-ui/components/Txt';
 import { Icon } from '@mastra/playground-ui/icons/Icon';
 import { ToolsIcon } from '@mastra/playground-ui/icons/ToolsIcon';
+import { controlStateColorTransition, focusRing } from '@mastra/playground-ui/primitives/transitions';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
 import { cn } from '@mastra/playground-ui/utils/cn';
 import type { RuleGroup } from '@mastra/playground-ui/utils/rule-engine';
+import { useTools } from '@mastra/react/hooks/tools';
 import { PlusIcon, XIcon } from 'lucide-react';
 import { useCallback, useMemo } from 'react';
 import { useWatch } from 'react-hook-form';
 
 import { useAgentEditFormContext } from '../../context/agent-edit-form-context';
+import { getEditorOwnership } from '../../utils/editor-ownership';
 import { DisplayConditionsDialog } from '@/domains/cms';
 import { SubSectionHeader } from '@/domains/cms/components/section/section-header';
 import { MCPClientList } from '@/domains/mcps/components/mcp-client-list';
 import { IntegrationToolsSection } from '@/domains/tool-providers/components';
-import { useTools } from '@/domains/tools/hooks/use-all-tools';
 
 export function ToolsPage() {
   const { form, readOnly, isCodeAgentOverride, editorConfig } = useAgentEditFormContext();
@@ -26,11 +30,13 @@ export function ToolsPage() {
   const selectedTools = useWatch({ control, name: 'tools' });
   const selectedIntegrationTools = useWatch({ control, name: 'integrationTools' });
   const variables = useWatch({ control, name: 'variables' });
-  const toolsConfig = editorConfig === false ? false : editorConfig?.tools;
-  const descriptionsOnly = isCodeAgentOverride && typeof toolsConfig === 'object' && toolsConfig.description === true;
-  const isToolsLocked = isCodeAgentOverride && (editorConfig === false || toolsConfig === false);
+  const {
+    isToolsLocked,
+    toolDescriptionsOnly: descriptionsOnly,
+    ownsToolDescriptions,
+  } = getEditorOwnership(isCodeAgentOverride, editorConfig);
   const canEditToolMembership = !readOnly && !descriptionsOnly && !isToolsLocked;
-  const canEditToolDescriptions = !readOnly && !isToolsLocked && (!isCodeAgentOverride || toolsConfig !== false);
+  const canEditToolDescriptions = !readOnly && ownsToolDescriptions;
   // MCP clients and integration tools are tool-membership additions, so they
   // are hidden whenever tool membership cannot be edited (locked or descriptions-only).
   const hideToolMembershipSections = isToolsLocked || descriptionsOnly;
@@ -146,17 +152,18 @@ export function ToolsPage() {
 
   const renderToolEntity = (tool: (typeof options)[number]) => {
     return (
-      <Entity key={tool.value} className="bg-surface2">
+      <Entity key={tool.value} className="bg-background">
         <EntityContent>
-          <EntityName className="text-ui-md! leading-ui-md! font-medium">{tool.label}</EntityName>
+          <EntityName className="text-subheading">{tool.label}</EntityName>
           <EntityDescription>
             <input
               type="text"
               aria-label={`Description for ${tool.label}`}
               disabled={!canEditToolDescriptions}
               className={cn(
-                'border border-transparent appearance-none block w-full text-neutral3 bg-transparent rounded px-1 -mx-1 transition-colors focus:outline-solid focus:outline-1 focus:outline-white focus-visible:outline-solid focus-visible:outline-1 focus-visible:outline-white',
-                canEditToolDescriptions && 'hover:bg-surface4 focus:bg-surface4',
+                '-mx-1 block w-full appearance-none rounded border border-transparent bg-transparent px-1 text-muted-foreground',
+                focusRing,
+                canEditToolDescriptions && 'hover:bg-fill-subtle focus:bg-fill-subtle',
               )}
               value={selectedTools?.[tool.value]?.description ?? tool.description}
               onChange={e => handleDescriptionChange(tool.value, e.target.value)}
@@ -177,10 +184,10 @@ export function ToolsPage() {
           <button
             type="button"
             onClick={() => handleValueChange(tool.value)}
-            className="text-neutral3 hover:text-neutral5 transition-colors rounded-sm focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-white/30"
+            className={cn('rounded-sm', focusRing, quietTextHover, controlStateColorTransition)}
             aria-label={`Remove ${tool.label}`}
           >
-            <Icon size="sm">
+            <Icon size="xs">
               <XIcon />
             </Icon>
           </button>
@@ -191,7 +198,7 @@ export function ToolsPage() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 pt-4">
+      <div className="flex flex-col gap-4 pt-4">
         {isToolsLocked && (
           <Notice variant="info" title="Tools are owned by code">
             <Notice.Message>
@@ -215,23 +222,26 @@ export function ToolsPage() {
             {canEditToolMembership && unselectedOptions.length > 0 && (
               <Popover>
                 <PopoverTrigger asChild>
-                  <Button variant="ghost" size="sm">
-                    <Icon size="sm">
-                      <PlusIcon />
-                    </Icon>
+                  <Button variant="ghost" size="sm" icon={<PlusIcon />}>
                     Add Tools
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent align="end" className="w-80 p-0 pt-4 max-h-72 overflow-y-auto">
+                <PopoverContent align="end" className="max-h-72 w-80 overflow-y-auto p-0 pt-4">
                   {unselectedOptions.map(tool => (
                     <button
                       key={tool.value}
                       type="button"
                       onClick={() => handleAddTool(tool.value)}
-                      className="flex flex-col gap-0.5 w-full text-left px-3 py-2.5 hover:bg-white/10 focus:bg-white/10 transition-colors focus-visible:outline-hidden focus-visible:ring-0"
+                      className="flex w-full flex-col gap-0.5 px-3 py-2.5 text-left hover:bg-white/10 focus:bg-white/10 focus-visible:ring-0 focus-visible:outline-hidden"
                     >
-                      <span className="text-ui-md font-normal text-neutral5">{tool.label}</span>
-                      {tool.description && <span className="text-ui-xs text-neutral3">{tool.description}</span>}
+                      <Txt as="span" tone="ink">
+                        {tool.label}
+                      </Txt>
+                      {tool.description && (
+                        <Txt as="span" variant="meta" tone="muted">
+                          {tool.description}
+                        </Txt>
+                      )}
                     </button>
                   ))}
                 </PopoverContent>

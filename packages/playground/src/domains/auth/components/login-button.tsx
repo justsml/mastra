@@ -1,6 +1,8 @@
 import { Button } from '@mastra/playground-ui/components/Button';
-import { useSSOLogin } from '../hooks';
-import type { LoginConfig, SSOConfig } from '../types';
+import { useSSOLogin } from '@mastra/react/hooks/auth';
+import type { LoginConfig, SSOConfig } from '@mastra/react/hooks/auth';
+import { LogIn } from 'lucide-react';
+import { withStudioBasePath } from '@/lib/studio-base-path';
 
 export type LoginButtonProps = {
   config: LoginConfig;
@@ -20,7 +22,8 @@ export type LoginButtonProps = {
  * @example
  * ```tsx
  * import { LoginButton } from '@/domains/auth/components/login-button';
-import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
+import { useAuthCapabilities } from '@mastra/react/hooks/auth';
+import { LogIn } from 'lucide-react';
  *
  * function LoginPage() {
  *   const { data: capabilities } = useAuthCapabilities();
@@ -66,7 +69,7 @@ export function LoginButton({ config, redirectUri, className, loginUrl = '/login
 
   // For credentials login - redirect to login page
   const handleCredentialsLogin = () => {
-    const url = new URL(loginUrl, window.location.origin);
+    const url = new URL(withStudioBasePath(loginUrl), window.location.origin);
     if (redirectUri) {
       url.searchParams.set('redirect', redirectUri);
     }
@@ -74,7 +77,7 @@ export function LoginButton({ config, redirectUri, className, loginUrl = '/login
   };
 
   return (
-    <Button onClick={handleCredentialsLogin} className={className}>
+    <Button icon={<LogIn />} onClick={handleCredentialsLogin} className={className}>
       Sign in
     </Button>
   );

@@ -32,9 +32,16 @@ export type {
   InlineSkill,
   SkillInput,
   AgentSkillsInput,
+  AgentSkillsResolver,
   AgentSkillsContext,
   Skill,
   SkillMetadata,
   SkillFormat,
   WorkspaceSkills,
 } from './types';
+export { validateSkillMetadata, validateSkillContent, SKILL_LIMITS } from '../workspace/skills/schemas';
+export type {
+  SkillValidationResult,
+  SkillContentValidationResult,
+  SkillMetadataInput,
+} from '../workspace/skills/schemas';

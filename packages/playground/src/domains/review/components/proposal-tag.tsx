@@ -1,3 +1,7 @@
+import { Input } from '@mastra/playground-ui/components/Input';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { quietTextHover } from '@mastra/playground-ui/primitives/typography';
+import { cn } from '@mastra/playground-ui/utils/cn';
 import { Pencil, Check, X } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 
@@ -31,8 +35,9 @@ export function ProposalTag({
 
   if (isEditing) {
     return (
-      <span className="inline-flex items-center gap-0.5 bg-surface3 border border-border1 rounded-md px-1">
-        <input
+      <span className="inline-flex items-center gap-0.5 rounded-md border border-border bg-card px-1">
+        <Input
+          variant="unstyled"
           ref={inputRef}
           value={editValue}
           onChange={e => setEditValue(e.target.value)}
@@ -47,7 +52,7 @@ export function ProposalTag({
             }
           }}
           onBlur={handleConfirm}
-          className="bg-transparent text-xs text-neutral4 outline-hidden w-20 py-0.5"
+          className="h-auto w-20 bg-transparent px-0 py-0.5 text-caption text-muted-foreground outline-hidden"
         />
         <button
           type="button"
@@ -55,35 +60,37 @@ export function ProposalTag({
             e.preventDefault();
             handleConfirm();
           }}
-          className="text-positive1 hover:text-positive2 p-0.5"
+          className={cn(quietTextHover, 'p-0.5')}
         >
-          <Check className="w-3 h-3" />
+          <Check className="h-3 w-3" />
         </button>
       </span>
     );
   }
 
   return (
-    <span className="inline-flex items-center gap-0.5 bg-surface3 border border-border1 rounded-md px-1.5 py-0.5 text-xs text-neutral4 group">
-      {tag}
+    <span className="group inline-flex items-center gap-0.5 rounded-md border border-border bg-card px-1.5 py-0.5 text-muted-foreground">
+      <Txt as="span" variant="caption">
+        {tag}
+      </Txt>
       <button
         type="button"
         onClick={() => {
           setEditValue(tag);
           setIsEditing(true);
         }}
-        className="text-neutral2 hover:text-neutral4 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+        className={cn(quietTextHover, 'p-0.5 opacity-0 transition-opacity group-hover:opacity-100')}
         title="Edit tag"
       >
-        <Pencil className="w-3 h-3" />
+        <Pencil className="h-3 w-3" />
       </button>
       <button
         type="button"
         onClick={onRemove}
-        className="text-neutral2 hover:text-negative1 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+        className="p-0.5 text-placeholder opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive-foreground"
         title="Remove tag"
       >
-        <X className="w-3 h-3" />
+        <X className="h-3 w-3" />
       </button>
     </span>
   );

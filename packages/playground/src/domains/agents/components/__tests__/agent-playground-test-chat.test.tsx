@@ -8,8 +8,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentPlaygroundTestChat } from '../agent-playground/agent-playground-test-chat';
 import { memoryDisabled, v2Agent } from './fixtures/composer-model-settings';
-import { TracingSettingsProvider } from '@/domains/observability/context/tracing-settings-context';
-import { SchemaRequestContextProvider } from '@/domains/request-context/context/schema-request-context';
 import { server } from '@/test/msw-server';
 
 const BASE_URL = 'http://localhost:4111';
@@ -25,16 +23,7 @@ const renderEditorTestChat = () => {
       <QueryClientProvider client={queryClient}>
         <MemoryRouter>
           <TooltipProvider>
-            <TracingSettingsProvider entityId={AGENT_ID} entityType="agent">
-              <SchemaRequestContextProvider>
-                <AgentPlaygroundTestChat
-                  agentId={AGENT_ID}
-                  agentName="Test Agent"
-                  modelVersion="v2"
-                  hasMemory={false}
-                />
-              </SchemaRequestContextProvider>
-            </TracingSettingsProvider>
+            <AgentPlaygroundTestChat agentId={AGENT_ID} agentName="Test Agent" modelVersion="v2" hasMemory={false} />
           </TooltipProvider>
         </MemoryRouter>
       </QueryClientProvider>
@@ -75,13 +64,85 @@ describe('AgentPlaygroundTestChat', () => {
 
     renderEditorTestChat();
 
-    const runOptionsTrigger = await screen.findByTestId('composer-run-options-trigger');
+    const runOptionsTrigger = await screen.findByRole('button', { name: 'Request context' });
     expect(runOptionsTrigger.closest('form')).not.toBeNull();
     expect(screen.getByRole('dialog', { name: /browser view/i, hidden: true })).not.toBeNull();
 
     await waitFor(() => {
       expect(onBrowserProbe).toHaveBeenCalled();
     });
+  });
+
+  it('probes the browser session for a CLI browser provider (hasBrowser: true, no SDK browser tools)', async () => {
+    const onBrowserProbe = vi.fn();
+
+    server.use(
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}`, () =>
+        HttpResponse.json({
+          ...v2Agent,
+          browserTools: [],
+          hasBrowser: true,
+          modelList: [],
+        }),
+      ),
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}/browser/session`, () => {
+        onBrowserProbe();
+        return HttpResponse.json({ hasSession: false, screencastAvailable: true });
+      }),
+      http.get(`${BASE_URL}/api/memory/config`, () => HttpResponse.json({ config: {} })),
+      http.get(`${BASE_URL}/api/memory/status`, () => HttpResponse.json(memoryDisabled)),
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}/voice/speakers`, () => HttpResponse.json([])),
+      http.post(`${BASE_URL}/api/agents/${AGENT_ID}/threads/subscribe`, () => HttpResponse.json({ ok: true })),
+      http.get(`${BASE_URL}/api/auth/capabilities`, () => HttpResponse.json({ enabled: false, login: null })),
+      http.get(`${BASE_URL}/api/agents/providers`, () => HttpResponse.json({ providers: [] })),
+      http.get(`${BASE_URL}/api/editor/builder/settings`, () => HttpResponse.json({ enabled: false })),
+      http.get(`${BASE_URL}/api/editor/builder/models/available`, () => HttpResponse.json({ providers: [] })),
+    );
+
+    renderEditorTestChat();
+
+    await screen.findByRole('button', { name: 'Request context' });
+
+    await waitFor(() => {
+      expect(onBrowserProbe).toHaveBeenCalled();
+    });
+  });
+
+  it('does not probe the browser session when the agent has no browser (hasBrowser: false)', async () => {
+    const onBrowserProbe = vi.fn();
+
+    server.use(
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}`, () =>
+        HttpResponse.json({
+          ...v2Agent,
+          browserTools: [],
+          hasBrowser: false,
+          modelList: [],
+        }),
+      ),
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}/browser/session`, () => {
+        onBrowserProbe();
+        return HttpResponse.json({ hasSession: false, screencastAvailable: true });
+      }),
+      http.get(`${BASE_URL}/api/memory/config`, () => HttpResponse.json({ config: {} })),
+      http.get(`${BASE_URL}/api/memory/status`, () => HttpResponse.json(memoryDisabled)),
+      http.get(`${BASE_URL}/api/agents/${AGENT_ID}/voice/speakers`, () => HttpResponse.json([])),
+      http.post(`${BASE_URL}/api/agents/${AGENT_ID}/threads/subscribe`, () => HttpResponse.json({ ok: true })),
+      http.get(`${BASE_URL}/api/auth/capabilities`, () => HttpResponse.json({ enabled: false, login: null })),
+      http.get(`${BASE_URL}/api/agents/providers`, () => HttpResponse.json({ providers: [] })),
+      http.get(`${BASE_URL}/api/editor/builder/settings`, () => HttpResponse.json({ enabled: false })),
+      http.get(`${BASE_URL}/api/editor/builder/models/available`, () => HttpResponse.json({ providers: [] })),
+    );
+
+    renderEditorTestChat();
+
+    await screen.findByRole('button', { name: 'Request context' });
+
+    // Give the probe a chance to fire if it (incorrectly) would.
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    });
+    expect(onBrowserProbe).not.toHaveBeenCalled();
   });
 
   it('accepts typed input in the composer textarea', async () => {

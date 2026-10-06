@@ -1,14 +1,3 @@
-/**
- * Code Mode — stdio JSON-RPC transport (v1)
- *
- * Runs the runner inside the sandbox via `sandbox.processes.spawn`, parses
- * protocol frames off stdout, dispatches `external_*` calls back to the host,
- * and writes results to the runner stdin. Abstracted behind
- * {@link CodeModeTransport} so socket/file-queue transports can be added for
- * remote sandboxes later.
- */
-
-import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 import { SandboxFeatureNotSupportedError } from '../../workspace/errors';
 import { buildRunner, buildProgramModule, FRAME_PREFIX } from './runner';
+import { sanitizeToolId } from './stub-generator';
 import type { CodeModeRunnerFrame, CodeModeToolResult, CodeModeTransport } from './types';
 
 /**
@@ -26,15 +16,18 @@ export class StdioCodeModeTransport implements CodeModeTransport {
   async run(opts: Parameters<CodeModeTransport['run']>[0]): Promise<CodeModeToolResult> {
     const { sandbox, program, toolIds, dispatch, timeout, abortSignal, onExternalCall, onExternalResult } = opts;
 
+    if (!sandbox) {
+      throw new Error('StdioCodeModeTransport requires a sandbox');
+    }
     if (!sandbox.processes) {
       throw new SandboxFeatureNotSupportedError('processes');
     }
 
-    const externals = toolIds.map(toolId => ({ toolId, externalName: sanitize(toolId) }));
+    const externals = toolIds.map(toolId => ({ toolId, externalName: sanitizeToolId(toolId) }));
     const allowList = new Set(toolIds);
 
     const dir = await mkdtemp(join(tmpdir(), 'mastra-code-mode-'));
-    const suffix = randomBytes(4).toString('hex');
+    const suffix = Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(4))).toString('hex');
     // The model's TypeScript program is written to its own .ts module; node
     // strips the type annotations when the runner imports it (see the
     // --experimental-strip-types flag on the spawn below).
@@ -194,9 +187,4 @@ export class StdioCodeModeTransport implements CodeModeTransport {
       await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }
-}
-
-function sanitize(id: string): string {
-  const cleaned = id.replace(/[^A-Za-z0-9_$]/g, '_');
-  return /^[A-Za-z_$]/.test(cleaned) ? cleaned : `_${cleaned}`;
 }

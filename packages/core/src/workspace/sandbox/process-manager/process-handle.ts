@@ -53,7 +53,7 @@ interface RetainedOutputChunk {
   dataBytes: number;
 }
 
-class RetainedOutputBuffer {
+export class RetainedOutputBuffer {
   private chunks: RetainedOutputChunk[] = [];
   private bytes = 0;
   private droppedBytes = 0;
@@ -134,6 +134,17 @@ class RetainedOutputBuffer {
 }
 
 /**
+ * Thrown by {@link ProcessHandle.closeStdin} when the sandbox provider has no
+ * way to close a running process's stdin.
+ *
+ * `handle.writer.end()` treats this error as a successful finish, so piping to
+ * a process stays safe on providers without stdin close support.
+ */
+export class UnsupportedStdinCloseError extends Error {
+  readonly name = 'UnsupportedStdinCloseError';
+}
+
+/**
  * Handle to a spawned process.
  *
  * Subclasses implement the platform-specific primitives (kill, sendStdin,
@@ -190,24 +201,43 @@ export abstract class ProcessHandle {
   abstract sendStdin(data: string): Promise<void>;
 
   /**
+   * Close the process's stdin, signaling EOF.
+   *
+   * Providers that cannot close stdin throw {@link UnsupportedStdinCloseError}.
+   * The default implementation is the unsupported case, so providers only
+   * override this when their transport exposes a stdin close primitive.
+   */
+  async closeStdin(): Promise<void> {
+    throw new UnsupportedStdinCloseError(`${this.constructor.name} does not support closing stdin`);
+  }
+
+  /**
    * Wait for the process to finish and return the result.
    *
    * Optionally pass `onStdout`/`onStderr` callbacks to stream output chunks
    * while waiting. The callbacks are automatically removed when `wait()`
    * resolves, so there's no cleanup needed by the caller.
    *
-   * Subclasses implement `wait()` with platform-specific logic — the base
+   * Optionally pass an `abortSignal` to couple the blocking wait to a caller
+   * lifetime: on abort the process is killed (mirroring the spawn-time
+   * `abortSignal` convention in {@link CommandOptions}), which lets the wait
+   * settle with the killed process's result instead of blocking forever.
+   *
+   * Subclasses implement `wait()` with platform-specific logic; the base
    * constructor wraps it to handle the optional streaming callbacks.
    */
   async wait(_options?: {
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    abortSignal?: AbortSignal;
   }): Promise<CommandResult> {
     throw new Error(`${this.constructor.name} must implement wait()`);
   }
 
   private _stdout: RetainedOutputBuffer;
   private _stderr: RetainedOutputBuffer;
+  private _killedByAbort = false;
+  private _abortKill?: Promise<void>;
   private _stdoutListeners = new Set<(data: string) => void>();
   private _stderrListeners = new Set<(data: string) => void>();
   private _reader?: Readable;
@@ -228,9 +258,22 @@ export abstract class ProcessHandle {
     // with a wrapper that handles optional streaming callbacks.
     const implWait = this.wait.bind(this);
 
-    this.wait = async (waitOptions?: { onStdout?: (data: string) => void; onStderr?: (data: string) => void }) => {
+    this.wait = async (waitOptions?: {
+      onStdout?: (data: string) => void;
+      onStderr?: (data: string) => void;
+      abortSignal?: AbortSignal;
+    }) => {
       if (waitOptions?.onStdout) this._stdoutListeners.add(waitOptions.onStdout);
       if (waitOptions?.onStderr) this._stderrListeners.add(waitOptions.onStderr);
+      // Abort kills the process (same convention as spawn-time `abortSignal`
+      // in the process manager) so the wait settles via the normal exit path
+      // instead of blocking past the caller's lifetime.
+      const abortSignal = waitOptions?.abortSignal;
+      const onAbort = () => {
+        void this.killForAbort().catch(() => {});
+      };
+      if (abortSignal?.aborted) onAbort();
+      else abortSignal?.addEventListener('abort', onAbort, { once: true });
       try {
         const result = await implWait();
         return {
@@ -241,10 +284,42 @@ export abstract class ProcessHandle {
           stderrDroppedBytes: this.stderrDroppedBytes,
         };
       } finally {
+        abortSignal?.removeEventListener('abort', onAbort);
         if (waitOptions?.onStdout) this._stdoutListeners.delete(waitOptions.onStdout);
         if (waitOptions?.onStderr) this._stderrListeners.delete(waitOptions.onStderr);
       }
     };
+  }
+
+  /**
+   * @internal Whether the process was killed because an `abortSignal` passed to spawn or
+   * `wait()` fired while it was still running. A direct `kill()` does not set it.
+   */
+  get killedByAbort(): boolean {
+    return this._killedByAbort;
+  }
+
+  /** @internal Kill the process for a fired abort signal and record it in {@link killedByAbort}. */
+  async killForAbort(): Promise<void> {
+    if (this.exitCode !== undefined) return;
+    // Spawn and wait() can both listen to the same signal; share one kill so a
+    // second kill() reporting "already gone" can't clear the first one's flag.
+    return (this._abortKill ??= this.runAbortKill());
+  }
+
+  private async runAbortKill(): Promise<void> {
+    this._killedByAbort = true;
+    try {
+      // `false` means the process exited on its own before the kill landed.
+      if (!(await this.kill())) {
+        this._killedByAbort = false;
+        this._abortKill = undefined;
+      }
+    } catch (error) {
+      this._killedByAbort = false;
+      this._abortKill = undefined;
+      throw error;
+    }
   }
 
   /** Retained stdout so far */
@@ -314,6 +389,12 @@ export abstract class ProcessHandle {
       this._writer = new Writable({
         write: (chunk, _encoding, cb) => {
           this.sendStdin(chunk.toString()).then(() => cb(), cb);
+        },
+        final: cb => {
+          this.closeStdin().then(
+            () => cb(),
+            (err: unknown) => cb(err instanceof UnsupportedStdinCloseError ? null : (err as Error)),
+          );
         },
       });
     }

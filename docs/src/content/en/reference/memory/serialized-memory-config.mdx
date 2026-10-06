@@ -1,6 +1,6 @@
 ---
 title: "Reference: SerializedMemoryConfig | Memory"
-description: "Reference for SerializedMemoryConfig, the JSON-serializable subset of Memory configuration stored on agent records."
+description: "SerializedMemoryConfig is the JSON-serializable subset of Memory configuration that lives on a stored agent record."
 packages:
   - "@mastra/core"
 ---
@@ -9,7 +9,7 @@ packages:
 
 `SerializedMemoryConfig` is the JSON-serializable subset of [`Memory`](/reference/memory/memory-class) configuration that lives on a stored agent record. The runtime hydrates it back into a `Memory` instance by resolving the vector and embedder IDs against the configured `Mastra` instance.
 
-It's the type used by [`BuilderAgentDefaults.memory`](/reference/editor/agent-builder/builder-agent-defaults) and by `EditorAgentNamespace.create({ memory })`.
+It's the type used by [`BuilderAgentDefaults.memory`](https://agent-builder.mastra.ai/reference/builder-agent-defaults) and by `EditorAgentNamespace.create({ memory })`.
 
 ## Usage example
 
@@ -85,9 +85,9 @@ new MastraEditor({
           },
           {
             name: 'generateTitle',
-            type: 'boolean | { model: ModelRouterModelId; instructions?: string }',
+            type: 'boolean | { model?: ModelRouterModelId; instructions?: string; minMessages?: number; emitEvent?: boolean }',
             description:
-              'Title generation configuration. Pass an object with `model` (in `"provider/model"` form) and optional `instructions`.',
+              'Title generation configuration. Pass an object with an optional `model` (in `"provider/model"` form, defaults to the agent\'s own model), optional `instructions`, an optional minimum message count, and optional `emitEvent` to stream the title as a `data-thread-title` chunk. Durable and evented agents persist the title but don\'t emit the chunk.',
             isOptional: true,
           },
         ],
@@ -167,7 +167,7 @@ new MastraEditor({
 
 ## Related
 
-- [Memory class](/reference/memory/memory-class) — the runtime type this config hydrates into.
-- [Observational memory](/reference/memory/observational-memory) — full observational memory reference.
-- [BuilderAgentDefaults](/reference/editor/agent-builder/builder-agent-defaults) — where this type is pinned as the Builder default.
-- [Agent Builder: Memory](/docs/agent-builder/memory) — concept and worked examples.
+- [Memory class](/reference/memory/memory-class): The runtime type this config hydrates into.
+- [Observational memory](/reference/memory/observational-memory): Full observational memory reference.
+- [BuilderAgentDefaults](https://agent-builder.mastra.ai/reference/builder-agent-defaults): Where this type is pinned as the Builder default.
+- [Agent Builder: Memory](https://agent-builder.mastra.ai/memory): Concept and worked examples.

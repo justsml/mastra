@@ -2,23 +2,23 @@ import { Button } from '@mastra/playground-ui/components/Button';
 import { Checkbox } from '@mastra/playground-ui/components/Checkbox';
 import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from '@mastra/playground-ui/components/Dialog';
 import { Entry } from '@mastra/playground-ui/components/Entry';
-import { Label } from '@mastra/playground-ui/components/Label';
+import { FieldItem, FieldLabel } from '@mastra/playground-ui/components/Field';
 import { Popover, PopoverContent, PopoverTrigger } from '@mastra/playground-ui/components/Popover';
 import { RadioGroup, RadioGroupItem } from '@mastra/playground-ui/components/RadioGroup';
 import { Skeleton } from '@mastra/playground-ui/components/Skeleton';
 import { Slider } from '@mastra/playground-ui/components/Slider';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@mastra/playground-ui/components/Tooltip';
 import { Txt } from '@mastra/playground-ui/components/Txt';
-import { cn } from '@mastra/playground-ui/utils/cn';
-import { Info, Sliders } from 'lucide-react';
+import { useEntityRequestContext } from '@mastra/playground-ui/domains/request-context/hooks/use-entity-request-context';
+import { useAgent } from '@mastra/react/hooks/agents';
+import { useMemory } from '@mastra/react/hooks/memory';
+import { Info, Sliders, Settings2, RotateCcw } from 'lucide-react';
 import { useState } from 'react';
 
 import { useAgentSettings } from '../context/agent-context';
-import { useAgent } from '../hooks/use-agent';
 import { useSamplingRestriction } from '../hooks/use-sampling-restriction';
 import { AgentAdvancedSettingsBody } from './agent-advanced-settings';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
-import { useMemory } from '@/domains/memory/hooks/use-memory';
 
 export interface ComposerModelSettingsProps {
   agentId: string;
@@ -35,15 +35,10 @@ const NetworkRadio = ({ hasMemory, hasSubAgents, disabled }: NetworkRadioProps) 
   const itemDisabled = disabled || !isNetworkAvailable;
 
   const radio = (
-    <div className="flex items-center gap-2">
-      <RadioGroupItem value="network" id="network" className="text-neutral6" disabled={itemDisabled} />
-      <Label
-        className={cn('text-neutral6 text-ui-md', !isNetworkAvailable && 'text-neutral3! cursor-not-allowed')}
-        htmlFor="network"
-      >
-        Network
-      </Label>
-    </div>
+    <FieldItem disabled={itemDisabled}>
+      <RadioGroupItem value="network" className="text-foreground" />
+      <FieldLabel>Network</FieldLabel>
+    </FieldItem>
   );
 
   if (isNetworkAvailable) {
@@ -77,20 +72,10 @@ const StreamSubscriptionRadio = ({ supported, disabled }: StreamSubscriptionRadi
   const itemDisabled = disabled || !supported;
 
   const radio = (
-    <div className="flex items-center gap-2">
-      <RadioGroupItem
-        value="streamSubscription"
-        id="streamSubscription"
-        className="text-neutral6"
-        disabled={itemDisabled}
-      />
-      <Label
-        className={cn('text-neutral6 text-ui-md', !supported && 'text-neutral3! cursor-not-allowed')}
-        htmlFor="streamSubscription"
-      >
-        Stream subscription (default)
-      </Label>
-    </div>
+    <FieldItem disabled={itemDisabled}>
+      <RadioGroupItem value="streamSubscription" className="text-foreground" />
+      <FieldLabel>Stream subscription (default)</FieldLabel>
+    </FieldItem>
   );
 
   if (supported) {
@@ -108,8 +93,16 @@ const StreamSubscriptionRadio = ({ supported, disabled }: StreamSubscriptionRadi
 };
 
 export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) => {
-  const { data: agent, isLoading } = useAgent(agentId);
-  const { data: memory, isLoading: isMemoryLoading } = useMemory(agentId);
+  const { data: agent, isLoading } = useAgent({
+    agentId: agentId,
+    requestContext: useEntityRequestContext('agent', agentId)[0],
+    queryOptions: { enabled: Boolean(agentId) },
+  });
+  const { data: memory, isLoading: isMemoryLoading } = useMemory({
+    agentId: agentId,
+    requestContext: useEntityRequestContext('agent', agentId)[0],
+    queryOptions: { enabled: Boolean(agentId) },
+  });
   const { settings, setSettings, resetAll } = useAgentSettings();
   const { canEdit } = usePermissions();
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -161,10 +154,6 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
       <Popover
         open={popoverOpen}
         onOpenChange={(open, details) => {
-          // While the Advanced Settings dialog is open, ignore every popover
-          // dismissal — outside-press, close button, focus loss, etc. The
-          // dialog owns its own close lifecycle and is the only thing that
-          // can dismiss the popover indirectly (by being closed first).
           if (!open && advancedOpen) {
             details?.cancel?.();
             return;
@@ -174,20 +163,20 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
       >
         <PopoverTrigger asChild>
           <Button
-            variant="default"
+            variant="ghost"
             size="icon-md"
             type="button"
             tooltip="Model settings"
             data-testid="composer-model-settings-trigger"
           >
-            <Sliders className="h-5 w-5 text-neutral3 hover:text-neutral6" />
+            <Sliders />
           </Button>
         </PopoverTrigger>
         <PopoverContent align="start" className="w-80 p-4">
           {isLoading || isMemoryLoading ? (
             <Skeleton className="h-40 w-full" data-testid="composer-model-settings-skeleton" />
           ) : (
-            <section className="space-y-5 @container">
+            <section className="@container space-y-5">
               <Entry label="Chat Method">
                 <RadioGroup
                   value={radioValue}
@@ -208,59 +197,31 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
                   className="flex flex-col gap-3"
                 >
                   {!isSupportedModel && (
-                    <div className="flex items-center gap-2">
-                      <RadioGroupItem
-                        value="generateLegacy"
-                        id="generateLegacy"
-                        className="text-neutral6"
-                        disabled={!canEditSettings}
-                      />
-                      <Label className="text-neutral6 text-ui-md" htmlFor="generateLegacy">
-                        Generate (Legacy)
-                      </Label>
-                    </div>
+                    <FieldItem disabled={!canEditSettings}>
+                      <RadioGroupItem value="generateLegacy" className="text-foreground" />
+                      <FieldLabel>Generate (Legacy)</FieldLabel>
+                    </FieldItem>
                   )}
                   {isSupportedModel && (
-                    <div className="flex items-center gap-2">
-                      <RadioGroupItem
-                        value="generate"
-                        id="generate"
-                        className="text-neutral6"
-                        disabled={!canEditSettings}
-                      />
-                      <Label className="text-neutral6 text-ui-md" htmlFor="generate">
-                        Generate
-                      </Label>
-                    </div>
+                    <FieldItem disabled={!canEditSettings}>
+                      <RadioGroupItem value="generate" className="text-foreground" />
+                      <FieldLabel>Generate</FieldLabel>
+                    </FieldItem>
                   )}
                   {!isSupportedModel && (
-                    <div className="flex items-center gap-2">
-                      <RadioGroupItem
-                        value="streamLegacy"
-                        id="streamLegacy"
-                        className="text-neutral6"
-                        disabled={!canEditSettings}
-                      />
-                      <Label className="text-neutral6 text-ui-md" htmlFor="streamLegacy">
-                        Stream (Legacy)
-                      </Label>
-                    </div>
+                    <FieldItem disabled={!canEditSettings}>
+                      <RadioGroupItem value="streamLegacy" className="text-foreground" />
+                      <FieldLabel>Stream (Legacy)</FieldLabel>
+                    </FieldItem>
                   )}
                   {isSupportedModel && (
                     <StreamSubscriptionRadio supported={supportsThreadSubscription} disabled={!canEditSettings} />
                   )}
                   {isSupportedModel && (
-                    <div className="flex items-center gap-2">
-                      <RadioGroupItem
-                        value="stream"
-                        id="stream"
-                        className="text-neutral6"
-                        disabled={!canEditSettings}
-                      />
-                      <Label className="text-neutral6 text-ui-md" htmlFor="stream">
-                        Stream
-                      </Label>
-                    </div>
+                    <FieldItem disabled={!canEditSettings}>
+                      <RadioGroupItem value="stream" className="text-foreground" />
+                      <FieldLabel>Stream</FieldLabel>
+                    </FieldItem>
                   )}
                   {isSupportedModel && (
                     <NetworkRadio hasMemory={hasMemory} hasSubAgents={hasSubAgents} disabled={!canEditSettings} />
@@ -276,7 +237,7 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
                     canEditSettings &&
                     setSettings({
                       ...settings,
-                      modelSettings: { ...settings?.modelSettings, requireToolApproval: value as boolean },
+                      modelSettings: { ...settings?.modelSettings, requireToolApproval: value },
                     })
                   }
                 />
@@ -284,20 +245,20 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
 
               {showSamplingBanner && (
                 <div
-                  className="flex items-center gap-2 text-xs text-neutral3 bg-surface3 rounded px-3 py-2"
                   data-testid="sampling-restriction-banner"
+                  className="flex items-center gap-2 rounded bg-card px-3 py-2 text-muted-foreground"
                 >
-                  <Info className="w-3.5 h-3.5 shrink-0" />
-                  <span>
+                  <Info className="h-3.5 w-3.5 shrink-0" />
+                  <Txt as="span" variant="caption">
                     {settings?.modelSettings?.temperature !== undefined
                       ? 'Claude 4.5+ models only accept Temperature OR Top P. Clear Temperature to use Top P.'
                       : 'Claude 4.5+ models only accept Temperature OR Top P. Setting Temperature will clear Top P.'}
-                  </span>
+                  </Txt>
                 </div>
               )}
 
               <Entry label="Temperature">
-                <div className="flex flex-row justify-between items-center gap-2">
+                <div className="flex flex-row items-center justify-between gap-2">
                   <Slider
                     value={[settings?.modelSettings?.temperature ?? -0.1]}
                     max={1}
@@ -315,14 +276,14 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
                       })
                     }
                   />
-                  <Txt as="p" variant="ui-sm" className="text-neutral3">
+                  <Txt as="p" variant="caption" tone="muted">
                     {settings?.modelSettings?.temperature ?? 'n/a'}
                   </Txt>
                 </div>
               </Entry>
 
               <Entry label="Top P">
-                <div className="flex flex-row justify-between items-center gap-2">
+                <div className="flex flex-row items-center justify-between gap-2">
                   <Slider
                     disabled={!canEditSettings}
                     onValueChange={value =>
@@ -337,7 +298,7 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
                     min={-0.1}
                     step={0.1}
                   />
-                  <Txt as="p" variant="ui-sm" className="text-neutral3">
+                  <Txt as="p" variant="caption" tone="muted">
                     {settings?.modelSettings?.topP ?? 'n/a'}
                   </Txt>
                 </div>
@@ -345,6 +306,7 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
 
               <div className="flex items-center justify-between gap-2 pt-1">
                 <Button
+                  icon={<RotateCcw />}
                   variant="ghost"
                   size="sm"
                   type="button"
@@ -354,6 +316,7 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
                   Reset
                 </Button>
                 <Button
+                  icon={<Settings2 />}
                   variant="default"
                   size="sm"
                   type="button"
@@ -369,7 +332,7 @@ export const ComposerModelSettings = ({ agentId }: ComposerModelSettingsProps) =
       </Popover>
 
       <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>Advanced model settings</DialogTitle>
           </DialogHeader>

@@ -1,5 +1,9 @@
-import { cn } from '@/lib/utils';
+import { Txt } from '@/ds/components/Txt';
 
 export function MetricsKpiCardLabel({ children, className }: { children: string; className?: string }) {
-  return <span className={cn('text-ui-md leading-relaxed text-neutral3', className)}>{children}</span>;
+  return (
+    <Txt as="span" variant="subheading" tone="ink" className={className}>
+      {children}
+    </Txt>
+  );
 }

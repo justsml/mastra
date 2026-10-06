@@ -1,4 +1,5 @@
 import type { ComponentPropsWithoutRef } from 'react';
+import { Txt } from '@/ds/components/Txt';
 import { cn } from '@/lib/utils';
 
 export type DataListNoMatchProps = ComponentPropsWithoutRef<'div'> & {
@@ -12,10 +13,13 @@ export function DataListNoMatch({
 }: DataListNoMatchProps) {
   return (
     <div
-      className={cn('col-span-full flex flex-col items-center justify-center gap-2 py-12 text-neutral3', className)}
+      className={cn(
+        'col-span-full flex flex-col items-center justify-center gap-2 rounded-lg bg-background py-8 text-muted-foreground',
+        className,
+      )}
       {...props}
     >
-      <p className="text-ui-md">{message}</p>
+      <Txt>{message}</Txt>
     </div>
   );
 }

@@ -301,10 +301,11 @@ export class LaminarExporter extends BaseExporter {
       isRemote: false,
     };
 
-    const parentSpanContext = span.parentSpanId
+    const exportedParentSpanId = span.parentSpanId ?? span.externalParentSpanId;
+    const parentSpanContext = exportedParentSpanId
       ? {
           traceId,
-          spanId: normalizeSpanId(span.parentSpanId),
+          spanId: normalizeSpanId(exportedParentSpanId),
           traceFlags: TraceFlags.SAMPLED,
           isRemote: false,
         }
@@ -710,6 +711,8 @@ function getSpanKind(type: SpanType): SpanKind {
     case SpanType.MODEL_GENERATION:
     case SpanType.MCP_TOOL_CALL:
       return SpanKind.CLIENT;
+    case SpanType.MCP_SERVER_REQUEST:
+      return SpanKind.SERVER;
     default:
       return SpanKind.INTERNAL;
   }

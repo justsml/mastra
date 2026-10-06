@@ -23,9 +23,11 @@ export const isMastraTextStreamChunk = (chunk: any): chunk is ChunkType<OutputSc
       'tool-input-delta',
       'tool-call-approval',
       'tool-call-suspended',
+      'tool-call-resumed',
       'tool-call',
       'tool-result',
       'tool-error',
+      'tool-output-denied',
       'error',
       'start-step',
       'finish-step',
@@ -98,3 +100,10 @@ export const isWorkflowExecutionDataChunkType = (
     chunk.payload.type?.startsWith('data-')
   );
 };
+
+export const toUIDataChunk = ({ type, data, id, transient }: DataChunkType): DataChunkType => ({
+  type,
+  data,
+  ...(id !== undefined && { id }),
+  ...(transient !== undefined && { transient }),
+});

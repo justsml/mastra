@@ -12,10 +12,23 @@ function createSubscription() {
 }
 
 function createAgentMock() {
+  let mastra: unknown;
   return {
     id: 'agent-1',
-    getMastraInstance: vi.fn(() => undefined),
+    getMastraInstance: vi.fn(() => mastra),
+    __setLogger: vi.fn(),
+    __registerMastra: vi.fn((nextMastra: unknown) => {
+      mastra = nextMastra;
+    }),
+    __registerPrimitives: vi.fn(),
+    getConfiguredProcessorWorkflows: vi.fn(async () => []),
+    listScorers: vi.fn(async () => []),
+    getChannels: vi.fn(() => null),
     subscribeToThread: vi.fn(async () => createSubscription()),
+    subscribeThreadEvents: vi.fn((_scope, listener) => {
+      listener({ type: 'queue-count-changed', count: 0 });
+      return vi.fn();
+    }),
     sendNotificationSignal: vi.fn(async (_input, target) => ({
       record: { id: 'notification-1', threadId: target.threadId, source: 'mastracode' },
       decision: { action: 'deliver' },
@@ -46,7 +59,12 @@ describe('AgentController notification signals', () => {
     expect(threadId).toBeTruthy();
     expect(result).toMatchObject({ decision: { action: 'deliver' }, record: { id: 'notification-1', threadId } });
     expect(agent.subscribeToThread).toHaveBeenCalledTimes(1);
-    expect(agent.subscribeToThread).toHaveBeenCalledWith({ resourceId: 'resource-1', threadId });
+    expect(agent.subscribeToThread).toHaveBeenCalledWith({
+      resourceId: 'resource-1',
+      threadId,
+      withInitialHistory: true,
+      requestContext: expect.anything(),
+    });
     expect(agent.sendNotificationSignal).toHaveBeenCalledTimes(1);
     expect(agent.sendNotificationSignal).toHaveBeenCalledWith(
       {
@@ -60,7 +78,7 @@ describe('AgentController notification signals', () => {
         threadId,
         ifIdle: expect.objectContaining({
           streamOptions: expect.objectContaining({
-            memory: { resource: 'resource-1', thread: threadId },
+            memory: expect.objectContaining({ resource: 'resource-1', thread: threadId }),
             maxSteps: 1000,
             savePerStep: false,
           }),

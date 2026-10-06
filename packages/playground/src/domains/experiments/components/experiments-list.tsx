@@ -1,12 +1,21 @@
 import type { DatasetExperiment, DatasetRecord } from '@mastra/client-js';
-import { Chip } from '@mastra/playground-ui/components/Chip';
+import { Button } from '@mastra/playground-ui/components/Button';
+import { DataList, DataListSkeleton, useDataListKeyboard } from '@mastra/playground-ui/components/DataList';
+import { getShortId } from '@mastra/playground-ui/components/Text';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
+import type { ListSort } from '@mastra/playground-ui/sort/sort-by';
+import { Trash2 } from 'lucide-react';
+import type { MouseEvent, ReactNode, SyntheticEvent } from 'react';
+import { useMemo, useRef, useState } from 'react';
+import { DeleteExperimentDialog } from './delete-experiment-dialog';
 import {
-  DataList as EntityList,
-  DataListSkeleton as EntityListSkeleton,
-} from '@mastra/playground-ui/components/DataList';
-import { StatusBadge } from '@mastra/playground-ui/components/StatusBadge';
-import { useMemo } from 'react';
-import { useLinkComponent } from '@/lib/framework';
+  EXPERIMENT_DATASET_COLUMN,
+  EXPERIMENT_DESCRIPTION_COLUMN,
+  EXPERIMENT_DETAIL_COLUMNS,
+  EXPERIMENT_NAME_COLUMN,
+  experimentColumnLabels,
+} from './experiment-columns';
+import { ExperimentRowCells } from './experiment-row-cells';
 
 export interface ExperimentsListProps {
   experiments: DatasetExperiment[];
@@ -16,22 +25,118 @@ export interface ExperimentsListProps {
   search?: string;
   statusFilter?: string;
   datasetFilter?: string;
+  /** When provided, rows toggle selection (for comparison) instead of navigating. */
+  selection?: ExperimentsListSelection;
+  /** When provided, rows call this instead of navigating (e.g. to open a side panel). */
+  onSelectExperiment?: (experiment: DatasetExperiment) => void;
+  /** Highlights the row matching this id when `onSelectExperiment` is used. */
+  selectedExperimentId?: string;
+  /** Whether keyboard roving is bound globally. Defaults to true. */
+  keyboardGlobal?: boolean;
+  isFetchingNextPage?: boolean;
+  hasNextPage?: boolean;
+  setEndOfListElement?: (element: HTMLDivElement | null) => void;
+  /**
+   * Server-side sort. When provided the list keeps the server order instead of
+   * re-sorting by `createdAt` client-side; headers are sortable when `onSortChange` is set.
+   */
+  sort?: ListSort<ExperimentsSortKey>;
+  onSortChange?: (direction: 'asc' | 'desc', key: ExperimentsSortKey) => void;
 }
 
-const COLUMNS = 'auto 1fr auto auto auto auto auto auto auto';
+export type ExperimentsSortKey = 'createdAt' | 'status';
 
-function formatDate(dateStr: string | Date | undefined | null): string {
-  if (!dateStr) return '—';
-  const d = typeof dateStr === 'string' ? new Date(dateStr) : dateStr;
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+export interface ExperimentsListSelection {
+  selectedExperimentIds: string[];
+  onToggleSelection: (experimentId: string) => void;
 }
 
-const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'error' | 'neutral'> = {
-  completed: 'success',
-  running: 'warning',
-  failed: 'error',
-  pending: 'neutral',
-};
+const BASE_COLUMNS = `${EXPERIMENT_NAME_COLUMN} ${EXPERIMENT_DESCRIPTION_COLUMN} ${EXPERIMENT_DATASET_COLUMN} ${EXPERIMENT_DETAIL_COLUMNS}`;
+
+// Trailing `auto` track hosts the row actions cell (delete), which only navigating rows render.
+const COLUMNS = `${BASE_COLUMNS} auto`;
+
+const columnHeaders: { label: string; className?: string; sortKey?: ExperimentsSortKey }[] = [
+  { label: experimentColumnLabels.experiment },
+  { label: experimentColumnLabels.description },
+  { label: experimentColumnLabels.dataset },
+  { label: experimentColumnLabels.target },
+  { label: experimentColumnLabels.status, sortKey: 'status' },
+  { label: experimentColumnLabels.items, className: 'text-center' },
+  { label: experimentColumnLabels.succeeded, className: 'text-center' },
+  { label: experimentColumnLabels.failed, className: 'text-center' },
+  { label: experimentColumnLabels.review, className: 'text-center' },
+  { label: experimentColumnLabels.date, sortKey: 'createdAt' },
+];
+
+const stopPropagation = (event: SyntheticEvent) => event.stopPropagation();
+
+/**
+ * Wrapper owns focus/roving and activation so the whole row activates; the
+ * link/button and the delete button stop propagation to avoid double activation.
+ */
+function ExperimentRow({
+  experiment: exp,
+  rowProps,
+  onSelect,
+  featured,
+  onDelete,
+  children,
+}: {
+  experiment: DatasetExperiment;
+  rowProps: ReturnType<ReturnType<typeof useDataListKeyboard>['getRowProps']>;
+  onSelect?: () => void;
+  featured?: boolean;
+  onDelete: () => void;
+  children: ReactNode;
+}) {
+  const { paths, Link } = useLinkComponent();
+  const linkRef = useRef<HTMLAnchorElement>(null);
+
+  return (
+    <DataList.RowWrapper {...rowProps} onSelectRow={onSelect ?? (() => linkRef.current?.click())}>
+      {onSelect ? (
+        <DataList.RowButton
+          colEnd={-2}
+          featured={featured}
+          tabIndex={-1}
+          onClick={(e: MouseEvent) => {
+            e.stopPropagation();
+            onSelect();
+          }}
+        >
+          {children}
+        </DataList.RowButton>
+      ) : (
+        <DataList.RowLink
+          ref={linkRef}
+          colEnd={-2}
+          to={paths.experimentLink(exp.id)}
+          LinkComponent={Link}
+          tabIndex={-1}
+          onClick={stopPropagation}
+        >
+          {children}
+        </DataList.RowLink>
+      )}
+      <DataList.ActionsCell className="pl-2">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          tooltip="Delete experiment"
+          aria-label={`Delete experiment ${exp.name ?? exp.id}`}
+          onClick={(e: MouseEvent) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      </DataList.ActionsCell>
+    </DataList.RowWrapper>
+  );
+}
 
 export function ExperimentsList({
   experiments,
@@ -41,9 +146,17 @@ export function ExperimentsList({
   search = '',
   statusFilter = 'all',
   datasetFilter = 'all',
+  selection,
+  onSelectExperiment,
+  selectedExperimentId,
+  keyboardGlobal = true,
+  isFetchingNextPage,
+  hasNextPage,
+  setEndOfListElement,
+  sort,
+  onSortChange,
 }: ExperimentsListProps) {
-  const { paths, Link } = useLinkComponent();
-
+  const isSelectionActive = selection !== undefined;
   const datasetMap = useMemo(() => {
     const map = new Map<string, string>();
     datasets?.forEach(ds => map.set(ds.id, ds.name));
@@ -51,12 +164,13 @@ export function ExperimentsList({
   }, [datasets]);
 
   const sortedExperiments = useMemo(() => {
+    if (sort) return experiments;
     return [...experiments].sort((a, b) => {
       const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
       const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
       return db - da;
     });
-  }, [experiments]);
+  }, [experiments, sort]);
 
   const filteredData = useMemo(() => {
     const term = search.toLowerCase();
@@ -65,6 +179,7 @@ export function ExperimentsList({
       const matchesSearch =
         !term ||
         exp.id.toLowerCase().includes(term) ||
+        (exp.name ?? '').toLowerCase().includes(term) ||
         dsName.toLowerCase().includes(term) ||
         (exp.targetId ?? '').toLowerCase().includes(term);
       const matchesStatus = statusFilter === 'all' || exp.status === statusFilter;
@@ -73,79 +188,101 @@ export function ExperimentsList({
     });
   }, [sortedExperiments, search, datasetMap, statusFilter, datasetFilter]);
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: filteredData.length, global: keyboardGlobal });
+
+  const [experimentToDelete, setExperimentToDelete] = useState<DatasetExperiment | null>(null);
+
   if (isLoading) {
-    return <EntityListSkeleton columns={COLUMNS} />;
+    return <DataListSkeleton columns={COLUMNS} />;
   }
 
-  return (
-    <EntityList columns={COLUMNS} variant="striped">
-      <EntityList.Top>
-        <EntityList.TopCell>Experiment</EntityList.TopCell>
-        <EntityList.TopCell>Dataset</EntityList.TopCell>
-        <EntityList.TopCell>Target</EntityList.TopCell>
-        <EntityList.TopCell>Status</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Items</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Succeeded</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Failed</EntityList.TopCell>
-        <EntityList.TopCell className="text-center">Review</EntityList.TopCell>
-        <EntityList.TopCell>Date</EntityList.TopCell>
-      </EntityList.Top>
+  const gridColumns = isSelectionActive ? `auto ${BASE_COLUMNS}` : COLUMNS;
+  const headerCells = columnHeaders.map(col =>
+    col.sortKey && onSortChange ? (
+      <DataList.SortableTopCell
+        key={col.label}
+        className={col.className}
+        sortKey={col.sortKey}
+        sort={sort?.key === col.sortKey ? sort.direction : undefined}
+        onSortChange={onSortChange}
+      >
+        {col.label}
+      </DataList.SortableTopCell>
+    ) : (
+      <DataList.TopCell key={col.label} className={col.className}>
+        {col.label}
+      </DataList.TopCell>
+    ),
+  );
 
-      {filteredData.map(exp => {
-        const dsName = exp.datasetId ? (datasetMap.get(exp.datasetId) ?? exp.datasetId.slice(0, 8)) : '—';
-        const status = exp.status ?? 'pending';
-        const succeeded = exp.succeededCount ?? 0;
-        const failed = exp.failedCount ?? 0;
-        const total = exp.totalItems ?? 0;
-        const successPct = total > 0 ? Math.round((succeeded / total) * 100) : 0;
+  return (
+    <DataList columns={gridColumns} scrollRef={containerRef}>
+      <DataList.Top hasLeadingCell={isSelectionActive}>
+        {isSelectionActive ? (
+          <>
+            <DataList.TopCell>&nbsp;</DataList.TopCell>
+            <DataList.TopCells colStart={2}>{headerCells}</DataList.TopCells>
+          </>
+        ) : (
+          <>
+            {headerCells}
+            <DataList.TopCell aria-hidden>{null}</DataList.TopCell>
+          </>
+        )}
+      </DataList.Top>
+
+      {filteredData.map((exp, index) => {
+        const dsName = exp.datasetId
+          ? (datasetMap.get(exp.datasetId) ?? getShortId(exp.datasetId) ?? exp.datasetId)
+          : '—';
+        const rowCells = (
+          <ExperimentRowCells experiment={exp} datasetName={dsName} review={reviewByExperiment?.get(exp.id)} />
+        );
+
+        if (!selection) {
+          return (
+            <ExperimentRow
+              key={exp.id}
+              experiment={exp}
+              rowProps={getRowProps(index)}
+              onSelect={onSelectExperiment ? () => onSelectExperiment(exp) : undefined}
+              featured={selectedExperimentId === exp.id}
+              onDelete={() => setExperimentToDelete(exp)}
+            >
+              {rowCells}
+            </ExperimentRow>
+          );
+        }
+
+        const isSelected = selection.selectedExperimentIds.includes(exp.id);
+        const toggle = () => selection.onToggleSelection(exp.id);
 
         return (
-          <EntityList.RowLink key={exp.id} to={paths.experimentLink(exp.id)} LinkComponent={Link}>
-            <EntityList.NameCell className="font-mono">{exp.id.slice(0, 8)}</EntityList.NameCell>
-            <EntityList.TextCell>{dsName}</EntityList.TextCell>
-            <EntityList.Cell>
-              <span className="truncate">
-                {exp.targetType} {exp.targetId}
-              </span>
-            </EntityList.Cell>
-            <EntityList.Cell>
-              <StatusBadge variant={STATUS_VARIANT[status] ?? 'neutral'} withDot>
-                {status}
-              </StatusBadge>
-            </EntityList.Cell>
-            <EntityList.TextCell className="text-center">{total}</EntityList.TextCell>
-            <EntityList.TextCell className="text-center">
-              <span className={succeeded > 0 ? 'text-accent1' : ''}>
-                {succeeded} ({successPct}%)
-              </span>
-            </EntityList.TextCell>
-            <EntityList.TextCell className="text-center">
-              <span className={failed > 0 ? 'text-accent2' : ''}>{failed}</span>
-            </EntityList.TextCell>
-            <EntityList.Cell className="text-center">
-              {(() => {
-                const review = reviewByExperiment?.get(exp.id);
-                if (!review) return <span className="text-neutral2">—</span>;
-                const inPipeline = review.needsReview + review.complete;
-                if (inPipeline === 0) return <span className="text-neutral2">—</span>;
-                if (review.needsReview > 0) {
-                  return (
-                    <Chip size="small" color="yellow">
-                      {review.needsReview} pending
-                    </Chip>
-                  );
-                }
-                return (
-                  <Chip size="small" color="green">
-                    {review.complete}/{inPipeline} reviewed
-                  </Chip>
-                );
-              })()}
-            </EntityList.Cell>
-            <EntityList.TextCell>{formatDate(exp.createdAt)}</EntityList.TextCell>
-          </EntityList.RowLink>
+          <DataList.RowWrapper key={exp.id} {...getRowProps(index)} onSelectRow={toggle}>
+            <DataList.SelectCell checked={isSelected} onToggle={toggle} aria-label={`Select experiment ${exp.id}`} />
+            <DataList.RowButton colStart={2} featured={isSelected} tabIndex={-1} onClick={stopPropagation}>
+              {rowCells}
+            </DataList.RowButton>
+          </DataList.RowWrapper>
         );
       })}
-    </EntityList>
+
+      <DataList.NextPageLoading
+        isLoading={isFetchingNextPage}
+        hasMore={hasNextPage}
+        setEndOfListElement={setEndOfListElement}
+      />
+
+      {experimentToDelete && (
+        <DeleteExperimentDialog
+          open
+          onOpenChange={open => {
+            if (!open) setExperimentToDelete(null);
+          }}
+          experimentId={experimentToDelete.id}
+          experimentName={experimentToDelete.name ?? undefined}
+        />
+      )}
+    </DataList>
   );
 }

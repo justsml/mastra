@@ -151,6 +151,44 @@ describe('CustomEditor image paste handling', () => {
     expect(followUp).not.toHaveBeenCalled();
   });
 
+  it('preserves the slash and adds a trailing space when Tab accepts a namespaced slash command', () => {
+    mocks.matchesKey.mockImplementation((_data: string, key: string) => key === 'tab');
+
+    const editor = new CustomEditor({} as any, {} as any);
+    editor.getText = vi.fn().mockReturnValueOnce('/sk/abc').mockReturnValue('skill/always-be-cooking');
+    editor.isShowingAutocomplete = vi.fn(() => true);
+
+    editor.handleInput('\t');
+
+    expect(mocks.superHandleInput).toHaveBeenCalledWith('\t');
+    expect(mocks.editorSetText).toHaveBeenCalledWith('/skill/always-be-cooking ');
+  });
+
+  it('does not rewrite a Tab completion that already keeps its slash', () => {
+    mocks.matchesKey.mockImplementation((_data: string, key: string) => key === 'tab');
+
+    const editor = new CustomEditor({} as any, {} as any);
+    editor.getText = vi.fn().mockReturnValueOnce('/sk').mockReturnValue('/skills ');
+    editor.isShowingAutocomplete = vi.fn(() => true);
+
+    editor.handleInput('\t');
+
+    expect(mocks.superHandleInput).toHaveBeenCalledWith('\t');
+    expect(mocks.editorSetText).not.toHaveBeenCalled();
+  });
+
+  it('falls through to the base editor on Tab when autocomplete is hidden', () => {
+    mocks.matchesKey.mockImplementation((_data: string, key: string) => key === 'tab');
+
+    const editor = new CustomEditor({} as any, {} as any);
+    editor.isShowingAutocomplete = vi.fn(() => false);
+
+    editor.handleInput('\t');
+
+    expect(mocks.superHandleInput).toHaveBeenCalledWith('\t');
+    expect(mocks.editorSetText).not.toHaveBeenCalled();
+  });
+
   it('queues a follow-up on Ctrl+F', () => {
     mocks.matchesKey.mockImplementation((_data: string, key: string) => key === 'ctrl+f');
 
@@ -178,6 +216,26 @@ describe('CustomEditor image paste handling', () => {
     expect(mocks.superHandleInput).toHaveBeenCalledWith('\t');
     expect(mocks.editorSetText).toHaveBeenCalledWith('/review ');
     expect(queueFollowUp).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes Ctrl+G to the read-only activity center and Alt+G to clear finished tasks', () => {
+    mocks.matchesKey.mockImplementation(
+      (data: string, key: string) => (data === '\x07' && key === 'ctrl+g') || (data === '\u001bg' && key === 'alt+g'),
+    );
+
+    const editor = new CustomEditor({} as any, {} as any);
+    const open = vi.fn();
+    const clear = vi.fn();
+    editor.onAction('openBackgroundActivityCenter', open);
+    editor.onAction('clearFinishedBackgroundActivities', clear);
+
+    editor.handleInput('\x07');
+    expect(open).toHaveBeenCalledOnce();
+    expect(clear).not.toHaveBeenCalled();
+
+    editor.handleInput('\u001bg');
+    expect(clear).toHaveBeenCalledOnce();
+    expect(mocks.superHandleInput).not.toHaveBeenCalled();
   });
 
   it('routes Ctrl+Z to suspend and Alt+Z to undo without falling through to the base editor', () => {
@@ -220,6 +278,7 @@ describe('CustomEditor image paste handling', () => {
     it.each([
       { marker: '/', text: '/1234567890123' },
       { marker: '@', text: '@1234567890123' },
+      { marker: '!', text: '!1234567890123' },
     ])('removes $marker before wrapping and restores editor state', ({ marker, text }) => {
       const editor = new CustomEditor({ terminal: { rows: 24 } } as any, {} as any);
       editor.getModeColor = vi.fn(() => '#16c858');
@@ -234,7 +293,7 @@ describe('CustomEditor image paste handling', () => {
       expect(stripAnsi(output[1]!)).toBe(`│ ${marker} 1234567890123  │`);
     });
 
-    it.each(['/', '@'])('accounts for a cursor-highlighted %s across explicit multiline input', marker => {
+    it.each(['/', '@', '!'])('accounts for a cursor-highlighted %s across explicit multiline input', marker => {
       const editor = new CustomEditor({ terminal: { rows: 24 } } as any, {} as any);
       editor.getModeColor = vi.fn(() => '#16c858');
       editor.setText(`${marker}1234567\n7654321`);
@@ -266,7 +325,7 @@ describe('CustomEditor image paste handling', () => {
       expect(stripAnsi(output[1]!)).toHaveLength(20);
     });
 
-    it.each(['/', '@'])('keeps multiline narrow rows and right borders aligned for %s', marker => {
+    it.each(['/', '@', '!'])('keeps multiline narrow rows and right borders aligned for %s', marker => {
       const editor = new CustomEditor({ terminal: { rows: 24 } } as any, {} as any);
       editor.getModeColor = vi.fn(() => '#16c858');
       editor.setText(`${marker}12345678901234567890`);
@@ -781,6 +840,35 @@ describe('CustomEditor voice push-to-talk', () => {
     mocks.matchesKey.mockReturnValue(false);
     editor.handleInput('x');
     expect(editor.render(40).join('\n')).not.toContain(greySeq);
+  });
+
+  it('does not grey typed text on earlier lines when dictation contains an emoji', async () => {
+    const { theme } = await import('../../theme.js');
+    const [r, g, b] = theme
+      .getTheme()
+      .muted.match(/\w\w/g)!
+      .map(h => parseInt(h, 16));
+    const greySeq = `\x1b[38;2;${r};${g};${b}m`;
+
+    const editor = new CustomEditor({ requestRender: vi.fn() } as any, {} as any);
+    let text = 'hello world!';
+    editor.getText = vi.fn(() => text);
+    editor.setText = vi.fn((t: string) => {
+      text = t;
+    });
+    (editor as any).insertTextAtCursor = undefined;
+
+    mocks.superRender.mockImplementation(() => ['────', 'hello world!', ' 😀hi', '────']);
+
+    editor.setVoiceListening(true);
+    editor.replaceVoiceTranscript('😀hi');
+    expect(text).toBe('hello world! 😀hi');
+    const lines = editor.render(14);
+    editor.setVoiceListening(false);
+    const typedLine = lines.find(l => stripAnsi(l).includes('hello world!'))!;
+    expect(typedLine).not.toContain(greySeq);
+    const dictatedLine = lines.find(l => stripAnsi(l).includes('😀hi'))!;
+    expect(dictatedLine).toContain(`${greySeq} 😀hi`);
   });
 
   it('renders an animated soundwave bar while listening', () => {

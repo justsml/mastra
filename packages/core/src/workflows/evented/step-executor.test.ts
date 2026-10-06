@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import type { ActorSignal } from '../../auth/ee';
 import { MastraError } from '../../error';
 import { Mastra } from '../../mastra';
 import { RequestContext } from '../../request-context';
@@ -12,6 +13,7 @@ interface SleepFnContext {
   runId: string;
   mastra: Mastra;
   requestContext: RequestContext;
+  actor?: ActorSignal;
   inputData: any;
   retryCount: number;
   resumeData: any;
@@ -46,6 +48,7 @@ describe('StepExecutor', () => {
     const fnSpy = vi.fn().mockReturnValue(5000);
     const step: Extract<StepFlowEntry, { type: 'sleep' }> = {
       type: 'sleep',
+      id: 'sleep-duration',
       duration,
       fn: fnSpy,
     };
@@ -76,11 +79,13 @@ describe('StepExecutor', () => {
     // Test undefined fn case
     const undefinedStep: Extract<StepFlowEntry, { type: 'sleep' }> = {
       type: 'sleep',
+      id: 'sleep-undefined-fn',
     };
 
     // Test null fn case
     const nullStep: Extract<StepFlowEntry, { type: 'sleep' }> = {
       type: 'sleep',
+      id: 'sleep-null-fn',
       fn: null as any,
     };
 
@@ -107,12 +112,13 @@ describe('StepExecutor', () => {
     const resumeData = { state: 'resumed' };
     const retryCount = 2;
     const requestContext = new RequestContext();
+    const actor: ActorSignal = { actorKind: 'system', sourceWorkflow: 'test-workflow' };
 
     const step: Extract<StepFlowEntry, { type: 'sleep' }> = {
       id: 'sleep-1',
       type: 'sleep',
-      fn: context => {
-        capturedContexts.push(context);
+      fn: async context => {
+        capturedContexts.push(context as unknown as SleepFnContext);
         return EXPECTED_DURATION;
       },
     };
@@ -121,10 +127,16 @@ describe('StepExecutor', () => {
       input: {
         status: 'success',
         output: { initData: 'test' },
+        payload: {},
+        startedAt: 0,
+        endedAt: 0,
       },
       'previous-step': {
         status: 'success',
         output: { prevStepData: 'test' },
+        payload: {},
+        startedAt: 0,
+        endedAt: 0,
       },
     };
 
@@ -137,17 +149,19 @@ describe('StepExecutor', () => {
       resumeData,
       stepResults,
       requestContext,
+      actor,
       retryCount,
     });
 
     // Assert: Verify context passed to fn and return value
     expect(capturedContexts.length).toBe(1);
-    const capturedContext = capturedContexts[0];
+    const capturedContext = capturedContexts[0]!;
 
     expect(capturedContext.workflowId).toBe(workflowId);
     expect(capturedContext.runId).toBe(runId);
     expect(capturedContext.mastra).toBe(mastra);
     expect(capturedContext.requestContext).toBe(requestContext);
+    expect(capturedContext.actor).toBe(actor);
     expect(capturedContext.inputData).toBe(inputData);
     expect(capturedContext.retryCount).toBe(retryCount);
     expect(capturedContext.resumeData).toBe(resumeData);
@@ -165,6 +179,7 @@ describe('StepExecutor', () => {
     // Arrange: Create a step object with fn that throws an error
     const throwingStep: Extract<StepFlowEntry, { type: 'sleep' }> = {
       type: 'sleep',
+      id: 'sleep-throwing-fn',
       fn: () => {
         throw new Error('Test error');
       },
@@ -197,7 +212,7 @@ describe('StepExecutor', () => {
 
     const result = await stepExecutor.execute({
       workflowId: 'test-workflow',
-      step: failingStep,
+      entry: { type: 'step', step: failingStep },
       runId: 'test-run',
       input: {},
       stepResults: {},
@@ -240,7 +255,7 @@ describe('StepExecutor', () => {
 
     const result = await stepExecutor.execute({
       workflowId: 'test-workflow',
-      step: failingStep,
+      entry: { type: 'step', step: failingStep },
       runId: 'test-run',
       input: {},
       stepResults: {},
@@ -276,7 +291,8 @@ describe('StepExecutor', () => {
 
       const step: Extract<StepFlowEntry, { type: 'sleep' }> = {
         type: 'sleep',
-        fn: context => {
+        id: 'sleep-abort-propagation',
+        fn: async context => {
           receivedAbortSignal = context.abortSignal;
           return 1000;
         },
@@ -303,7 +319,8 @@ describe('StepExecutor', () => {
 
       const step: Extract<StepFlowEntry, { type: 'sleep' }> = {
         type: 'sleep',
-        fn: context => {
+        id: 'sleep-abort-reflected',
+        fn: async context => {
           // Abort the parent controller during fn execution
           parentAbortController.abort();
           wasAbortedDuringExecution = context.abortSignal.aborted;
@@ -328,12 +345,16 @@ describe('StepExecutor', () => {
     it('should propagate parent abortController to resolveSleepUntil fn context', async () => {
       // Arrange: Create a parent abort controller and track what abortSignal the fn receives
       const parentAbortController = new AbortController();
+      const actor: ActorSignal = { actorKind: 'system', sourceWorkflow: 'test-workflow' };
       let receivedAbortSignal: AbortSignal | undefined;
+      let receivedActor: ActorSignal | undefined;
 
       const step: Extract<StepFlowEntry, { type: 'sleepUntil' }> = {
         type: 'sleepUntil',
-        fn: context => {
+        id: 'sleep-until-abort-propagation',
+        fn: async context => {
           receivedAbortSignal = context.abortSignal;
+          receivedActor = context.actor;
           return new Date(Date.now() + 1000);
         },
       };
@@ -345,11 +366,13 @@ describe('StepExecutor', () => {
         runId: 'test-run',
         requestContext,
         stepResults: {},
+        actor,
         abortController: parentAbortController,
       });
 
-      // Assert: The fn should receive the parent's abort signal
+      // Assert: The fn should receive the parent's abort signal and actor
       expect(receivedAbortSignal).toBe(parentAbortController.signal);
+      expect(receivedActor).toBe(actor);
     });
 
     it('should propagate parent abortController to evaluateConditions condition fn context', async () => {
@@ -360,12 +383,13 @@ describe('StepExecutor', () => {
       const step: Extract<StepFlowEntry, { type: 'conditional' }> = {
         type: 'conditional',
         conditions: [
-          context => {
+          async context => {
             receivedAbortSignal = context.abortSignal;
             return true;
           },
         ],
-        branches: [[{ type: 'step', step: { id: 'dummy' } as any }]],
+        serializedConditions: [{ id: 'dummy-condition', fn: 'async () => true' }],
+        steps: [{ type: 'step', step: { id: 'dummy' } as any }],
       };
 
       // Act: Call evaluateConditions with parent abort controller
@@ -389,7 +413,8 @@ describe('StepExecutor', () => {
 
       const step: Extract<StepFlowEntry, { type: 'sleep' }> = {
         type: 'sleep',
-        fn: context => {
+        id: 'sleep-no-abort-controller',
+        fn: async context => {
           receivedAbortSignal = context.abortSignal;
           return 1000;
         },
@@ -408,6 +433,52 @@ describe('StepExecutor', () => {
       // Assert: An abortSignal should still be provided (from internally created controller)
       expect(receivedAbortSignal).toBeDefined();
       expect(receivedAbortSignal).toBeInstanceOf(AbortSignal);
+    });
+  });
+
+  describe('evaluateConditions error handling', () => {
+    const run = (conditions: any[]) =>
+      stepExecutor.evaluateConditions({
+        workflowId: 'test-workflow',
+        step: {
+          type: 'conditional',
+          conditions,
+          serializedConditions: conditions.map((_, i) => ({ id: `c${i}`, fn: '' })),
+          steps: conditions.map((_, i) => ({ type: 'step', step: { id: `s${i}` } as any })),
+        },
+        runId: 'test-run',
+        requestContext,
+        stepResults: {},
+        state: {},
+      });
+
+    it('treats an async-throwing condition as falsy and evaluates the rest', async () => {
+      const result = await run([
+        async () => {
+          throw new Error('boom');
+        },
+        async () => true,
+      ]);
+      expect(result).toEqual([1]);
+    });
+
+    it('treats a sync-throwing condition as falsy and evaluates the rest', async () => {
+      const result = await run([
+        () => {
+          throw new Error('boom');
+        },
+        async () => true,
+      ]);
+      expect(result).toEqual([1]);
+    });
+
+    it('returns no indexes when every condition throws', async () => {
+      const result = await run([
+        async () => {
+          throw new Error('boom');
+        },
+      ]);
+      expect(result).toEqual([]);
     });
   });
 });

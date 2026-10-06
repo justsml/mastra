@@ -1,4 +1,8 @@
-import { formatCompactTokens } from './thread-context-progress-utils';
+import { formatCompactTokens } from '@/ds/components/TokenBudget/format-tokens';
+import { toneClass } from '@/ds/components/TokenBudget/tones';
+import type { TokenBudgetTone } from '@/ds/components/TokenBudget/tones';
+import { Txt } from '@/ds/components/Txt';
+import { cn } from '@/lib/utils';
 
 interface ThreadContextProgressProps {
   messageTokens?: number;
@@ -18,21 +22,22 @@ function ProgressBar({
   label: string;
   value: number;
   max: number;
-  tone: 'message' | 'memory';
+  tone: TokenBudgetTone;
 }) {
   const percent = Math.max(0, Math.min(100, (value / max) * 100));
-  const toneClass = tone === 'message' ? 'bg-blue-500/80' : 'bg-violet-500/80';
 
   return (
-    <div className="min-w-0 flex-1">
-      <div className="text-icon3 mb-1 flex items-center justify-between gap-2 font-mono text-ui-xs">
-        <span className="text-icon6 tracking-wide uppercase">{label}</span>
-        <span className="text-icon3 tabular-nums">
+    <div className={cn('min-w-0 flex-1', toneClass[tone])}>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <Txt as="span" variant="meta" tone="ink" className="uppercase">
+          {label}
+        </Txt>
+        <Txt as="span" variant="meta" tone="muted" className="tabular-nums">
           {formatCompactTokens(value)}/{formatCompactTokens(max)}k
-        </span>
+        </Txt>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
-        <div className={`h-full rounded-full ${toneClass}`} style={{ width: `${percent}%` }} />
+        <div className="h-full rounded-full bg-current/80" style={{ width: `${percent}%` }} />
       </div>
     </div>
   );
@@ -45,18 +50,18 @@ export function ThreadContextProgress({
   memoryThreshold,
   memoryLabel = 'Memory',
 }: ThreadContextProgressProps) {
-  const showMessages = messageTokens != null && messageThreshold != null;
-  const showMemory = memoryTokens != null && memoryThreshold != null;
+  const showMessages = messageTokens != null && messageThreshold != null && messageThreshold > 0;
+  const showMemory = memoryTokens != null && memoryThreshold != null && memoryThreshold > 0;
 
   if (!showMessages && !showMemory) {
     return null;
   }
 
   return (
-    <div className="border-b border-border1 px-3 py-2">
+    <div className="border-b border-border px-3 py-2">
       <div className="flex flex-col gap-2 sm:flex-row">
         {showMessages ? (
-          <ProgressBar label="Messages" value={messageTokens} max={messageThreshold} tone="message" />
+          <ProgressBar label="Messages" value={messageTokens} max={messageThreshold} tone="messages" />
         ) : null}
         {showMemory ? (
           <ProgressBar label={memoryLabel} value={memoryTokens} max={memoryThreshold} tone="memory" />

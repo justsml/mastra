@@ -3,54 +3,184 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Badge } from './Badge';
+import type { BadgeSize, BadgeVariant } from './Badge';
+
+const variants = [
+  'neutral',
+  'success',
+  'destructive',
+  'info',
+  'warning',
+  'purple',
+  'orange',
+  'cyan',
+  'pink',
+] as const satisfies ReadonlyArray<BadgeVariant>;
+
+const sizes = ['xs', 'sm', 'md'] as const satisfies ReadonlyArray<BadgeSize>;
+
+const indicatorOf = (badge: HTMLElement) => badge.querySelector('[aria-hidden="true"]')?.className ?? '';
 
 afterEach(() => {
   cleanup();
 });
 
-const expectClasses = (element: HTMLElement, classes: string[]) => {
-  classes.forEach(className => expect(element.classList.contains(className)).toBe(true));
-};
-
 describe('Badge', () => {
-  it('uses the md size by default and keeps intrinsic width', () => {
-    render(<Badge>Published</Badge>);
-
-    const badge = screen.getByText('Published');
-    expectClasses(badge, ['inline-flex', 'w-fit', 'max-w-full', 'h-badge-default', 'text-ui-sm', 'gap-1', 'px-2.5']);
-  });
-
-  it('supports the sm size', () => {
-    render(<Badge size="sm">Draft</Badge>);
-
-    const badge = screen.getByText('Draft');
-    expectClasses(badge, ['h-form-xs', 'text-ui-xs', 'gap-1', 'px-2']);
-  });
-
-  it('supports the xs size', () => {
-    render(<Badge size="xs">New</Badge>);
-
-    const badge = screen.getByText('New');
-    expectClasses(badge, ['h-5', 'text-ui-xs', 'gap-0.5', 'px-1.5']);
-  });
-
-  it('uses size-specific padding when an icon is present', () => {
-    const { rerender } = render(<Badge icon={<svg />}>Medium</Badge>);
-
-    expectClasses(screen.getByText('Medium'), ['pl-2', 'pr-2.5']);
-
-    rerender(
-      <Badge size="sm" icon={<svg />}>
-        Small
-      </Badge>,
+  it.each([
+    ['green', 'success'],
+    ['red', 'destructive'],
+    ['amber', 'warning'],
+    ['blue', 'info'],
+  ] as const)('keeps the %s category indicator apart from the %s status indicator', (hue, status) => {
+    render(
+      <>
+        <Badge variant={hue} indicator="dot">
+          {hue}
+        </Badge>
+        <Badge variant={status} indicator="dot">
+          {status}
+        </Badge>
+      </>,
     );
-    expectClasses(screen.getByText('Small'), ['pl-1.5', 'pr-2']);
+    expect(indicatorOf(screen.getByText(hue))).not.toBe(indicatorOf(screen.getByText(status)));
+  });
+  describe('when rendered inside text', () => {
+    it('uses phrasing content and forwards span attributes', () => {
+      render(
+        <p>
+          Status: <Badge title="Publication status">Published</Badge>
+        </p>,
+      );
 
-    rerender(
-      <Badge size="xs" icon={<svg />}>
-        Extra small
-      </Badge>,
-    );
-    expectClasses(screen.getByText('Extra small'), ['pl-1', 'pr-1.5']);
+      const badge = screen.getByText('Published');
+      expect(badge.tagName).toBe('SPAN');
+      expect(badge.getAttribute('title')).toBe('Publication status');
+      expect(badge.parentElement?.textContent).toBe('Status: Published');
+      expect(Array.from(badge.classList)).toEqual(expect.arrayContaining(['rounded-[7px]', 'shadow-inset']));
+    });
+  });
+
+  describe('when rendered with a status indicator', () => {
+    it('keeps the indicator decorative and off the public DOM attributes', () => {
+      render(<Badge indicator="dot">Connected</Badge>);
+
+      const badge = screen.getByText('Connected');
+      const indicator = badge.querySelector('[aria-hidden="true"]');
+
+      expect(badge.hasAttribute('indicator')).toBe(false);
+      expect(indicator).not.toBeNull();
+      expect(indicator?.textContent).toBe('');
+    });
+
+    it('only animates pulse indicators', () => {
+      const { container, rerender } = render(
+        <Badge variant="info" indicator="pulse">
+          Live
+        </Badge>,
+      );
+
+      const pulse = container.querySelector('[aria-hidden="true"]');
+      expect(pulse?.classList.contains('motion-safe:animate-pulse')).toBe(true);
+
+      rerender(
+        <Badge variant="info" indicator="dot">
+          Connected
+        </Badge>,
+      );
+
+      expect(container.querySelector('[aria-hidden="true"]')?.classList.contains('motion-safe:animate-pulse')).toBe(
+        false,
+      );
+    });
+  });
+
+  describe('when a tone is selected', () => {
+    it.each(variants)('gives %s a muted step of its own', variant => {
+      render(
+        <>
+          <Badge variant={variant}>default</Badge>
+          <Badge variant={variant} emphasis="subtle">
+            muted
+          </Badge>
+        </>,
+      );
+
+      expect(screen.getByText('muted').className).not.toBe(screen.getByText('default').className);
+    });
+
+    it('never reuses a tone between two variants', () => {
+      render(
+        <>
+          {variants.map(variant => (
+            <Badge key={variant} variant={variant} indicator="dot">
+              {variant}
+            </Badge>
+          ))}
+        </>,
+      );
+
+      const badges = variants.map(variant => screen.getByText(variant));
+      expect(new Set(badges.map(badge => badge.className)).size).toBe(variants.length);
+      expect(new Set(badges.map(indicatorOf)).size).toBe(variants.length);
+    });
+  });
+
+  describe('when a compact size is selected', () => {
+    it('gives each size its own scale', () => {
+      render(
+        <>
+          {sizes.map(size => (
+            <Badge key={size} size={size} indicator="dot">
+              {size}
+            </Badge>
+          ))}
+        </>,
+      );
+
+      const badges = sizes.map(size => screen.getByText(size));
+      expect(new Set(badges.map(badge => badge.className)).size).toBe(sizes.length);
+    });
+
+    it.each(sizes)('pads %s the same for an icon and an indicator', size => {
+      render(
+        <>
+          <Badge size={size} icon={<svg data-testid="icon" />}>
+            icon
+          </Badge>
+          <Badge size={size} indicator="dot">
+            indicator
+          </Badge>
+        </>,
+      );
+
+      expect(screen.getByTestId('icon')).not.toBeNull();
+      expect(screen.getByText('icon').className).toBe(screen.getByText('indicator').className);
+    });
+
+    it('rebalances padding once a leading visual takes the lead', () => {
+      render(
+        <>
+          <Badge>plain</Badge>
+          <Badge indicator="dot">indicator</Badge>
+        </>,
+      );
+
+      expect(screen.getByText('indicator').className).not.toBe(screen.getByText('plain').className);
+    });
+  });
+
+  describe('when rendered with an icon', () => {
+    it('renders the icon while preserving the badge label', () => {
+      render(<Badge icon={<svg data-testid="badge-icon" />}>Template</Badge>);
+
+      expect(screen.getByText('Template')).not.toBeNull();
+      expect(screen.getByTestId('badge-icon')).not.toBeNull();
+    });
+
+    it('does not reserve an icon wrapper for an empty icon', () => {
+      render(<Badge icon={null}>Template</Badge>);
+
+      expect(screen.getByText('Template').querySelector('span')).toBeNull();
+    });
   });
 });

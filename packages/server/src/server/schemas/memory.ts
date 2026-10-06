@@ -1,5 +1,6 @@
 import { z } from 'zod/v4';
 import { paginationInfoSchema, createPagePaginationSchema, successResponseSchema } from './common';
+import { lastMessagesSchema, messageHistorySchema } from './message-history';
 
 // Path parameter schemas
 export const threadIdPathParams = z.object({
@@ -58,7 +59,7 @@ const storageOrderBySchema = z
  * Handles JSON parsing from query strings. See `storageOrderBySchema` for why
  * the inner object schema is also `.optional()`.
  */
-const messageOrderBySchema = z
+export const messageOrderBySchema = z
   .preprocess(
     val => {
       if (val === undefined) return val;
@@ -83,7 +84,7 @@ const messageOrderBySchema = z
 /**
  * Include schema for message listing - handles JSON parsing from query strings
  */
-const includeSchema = z
+export const includeSchema = z
   .preprocess(
     val => {
       if (val === undefined) return val;
@@ -108,10 +109,23 @@ const includeSchema = z
   )
   .optional();
 
+const metadataFilterValueSchema = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
+const metadataFilterKeySchema = z
+  .string()
+  .max(128)
+  .regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/)
+  .refine(key => !['__proto__', 'prototype', 'constructor'].includes(key));
+
+/**
+ * Metadata filters are deliberately shallow scalar maps so storage adapters can
+ * apply exact-match AND semantics consistently.
+ */
+const metadataFilterSchema = z.record(metadataFilterKeySchema, metadataFilterValueSchema);
+
 /**
  * Filter schema for message listing - handles JSON parsing from query strings
  */
-const filterSchema = z
+export const filterSchema = z
   .preprocess(
     val => {
       if (val === undefined) return val;
@@ -135,6 +149,7 @@ const filterSchema = z
         })
         .optional(),
       roles: z.array(z.string()).optional(),
+      metadata: metadataFilterSchema.optional(),
     }),
   )
   .optional();
@@ -467,7 +482,8 @@ export const memoryConfigResponseSchema = z.object({
   memoryType: z.enum(['local', 'gateway']).optional(),
   config: z
     .object({
-      lastMessages: z.union([z.number(), z.literal(false)]).optional(),
+      lastMessages: lastMessagesSchema.optional(),
+      messageHistory: messageHistorySchema.optional(),
       semanticRecall: z.union([z.boolean(), z.unknown()]).optional(),
       workingMemory: z
         .object({
@@ -502,6 +518,11 @@ export const getThreadByIdResponseSchema = threadSchema;
 export const listMessagesResponseSchema = z.object({
   messages: z.array(messageSchema),
   uiMessages: z.array(z.unknown()).nullable(), // Converted messages in UI format
+  // Absent on the gateway path, which has no page metadata to report.
+  total: z.number().optional(),
+  page: z.number().optional(),
+  perPage: z.union([z.number(), z.literal(false)]).optional(),
+  hasMore: z.boolean().optional(),
 });
 
 /**
@@ -543,6 +564,19 @@ export const updateThreadBodySchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
   resourceId: z.string().optional(),
 });
+
+/**
+ * Body schema for POST /memory/threads/:threadId/transfer
+ * Reassigns the thread (and its messages) to a different resource.
+ */
+export const transferThreadBodySchema = z.object({
+  resourceId: z.string().min(1),
+});
+
+/**
+ * Response schema for POST /memory/threads/:threadId/transfer
+ */
+export const transferThreadResponseSchema = threadSchema;
 
 /**
  * Body schema for PUT /memory/threads/:threadId/working-memory

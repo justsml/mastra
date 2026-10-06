@@ -1,17 +1,14 @@
 import { Skeleton } from '@mastra/playground-ui/components/Skeleton';
 import { Txt } from '@mastra/playground-ui/components/Txt';
+import { jsonSchemaToZodRuntime } from '@mastra/playground-ui/lib/form/json-schema-to-zod-runtime';
 import { toast } from '@mastra/playground-ui/utils/toast';
-import { jsonSchemaToZod } from '@mastra/schema-compat/json-to-zod';
+import { useAgents } from '@mastra/react/hooks/agents';
+import { useTool, useExecuteTool } from '@mastra/react/hooks/tools';
 import { useMemo, useEffect } from 'react';
 import { parse } from 'superjson';
 import { z } from 'zod';
 import ToolExecutor from './ToolExecutor';
-import { useAgents } from '@/domains/agents/hooks/use-agents';
 import { usePermissions } from '@/domains/auth/hooks/use-permissions';
-import { useTool } from '@/domains/tools/hooks';
-import { useExecuteTool } from '@/domains/tools/hooks/use-execute-tool';
-import { resolveSerializedZodOutput } from '@/lib/form/utils';
-import { usePlaygroundStore } from '@/store/playground-store';
 
 export interface ToolPanelProps {
   toolId: string;
@@ -37,12 +34,11 @@ export const ToolPanel = ({ toolId }: ToolPanelProps) => {
   }, [agents, toolId]);
 
   // Only fetch from API if tool not found in agents
-  const { data: apiTool, isLoading, error } = useTool(toolId!, { enabled: !agentTool });
+  const { data: apiTool, isLoading, error } = useTool({ toolId: toolId!, queryOptions: { enabled: !agentTool } });
 
   const tool: any = agentTool || apiTool;
 
   const { mutateAsync: executeTool, isPending: isExecuting, data: result } = useExecuteTool();
-  const { requestContext: playgroundRequestContext } = usePlaygroundStore();
 
   useEffect(() => {
     if (error) {
@@ -51,32 +47,28 @@ export const ToolPanel = ({ toolId }: ToolPanelProps) => {
     }
   }, [error]);
 
-  const handleExecuteTool = async (data: any, schemaRequestContext?: Record<string, any>) => {
+  const handleExecuteTool = async (data: any, requestContext?: Record<string, any>) => {
     if (!tool) return;
 
-    // Merge global playground request context with schema request context.
-    // Schema values take precedence and explicitly override global values,
-    // including when schema values are empty strings (user intentionally cleared them).
-    const requestContext = {
-      ...(playgroundRequestContext ?? {}),
-      ...(schemaRequestContext ?? {}),
-    };
-
-    return executeTool({
-      toolId: tool.id,
-      input: data,
-      requestContext,
-    });
+    try {
+      return await executeTool({
+        toolId: tool.id,
+        input: data,
+        requestContext,
+      });
+    } catch (error) {
+      toast.error('Error executing dev tool');
+      console.error('Error executing dev tool:', error);
+      throw error;
+    }
   };
 
-  const zodInputSchema = tool?.inputSchema
-    ? resolveSerializedZodOutput(jsonSchemaToZod(parse(tool?.inputSchema)))
-    : z.object({});
+  const zodInputSchema = tool?.inputSchema ? jsonSchemaToZodRuntime(parse(tool?.inputSchema)) : z.object({});
 
   if (isLoading) {
     return (
-      <div className="p-6">
-        <Skeleton className="h-8 w-48 mb-4" />
+      <div className="p-4">
+        <Skeleton className="mb-4 h-8 w-48" />
         <Skeleton className="h-32 w-full" />
       </div>
     );
@@ -86,8 +78,8 @@ export const ToolPanel = ({ toolId }: ToolPanelProps) => {
 
   if (!tool)
     return (
-      <div className="py-12 text-center px-6">
-        <Txt variant="header-md" className="text-neutral3">
+      <div className="px-4 py-8 text-center">
+        <Txt variant="heading" tone="muted">
           Tool not found
         </Txt>
       </div>
@@ -95,8 +87,8 @@ export const ToolPanel = ({ toolId }: ToolPanelProps) => {
 
   if (!canExecuteTool)
     return (
-      <div className="py-12 text-center px-6">
-        <Txt variant="ui-sm" className="text-neutral3">
+      <div className="px-4 py-8 text-center">
+        <Txt variant="caption" tone="muted">
           You don't have permission to execute tools.
         </Txt>
       </div>
@@ -110,7 +102,8 @@ export const ToolPanel = ({ toolId }: ToolPanelProps) => {
       handleExecuteTool={handleExecuteTool}
       toolDescription={tool.description}
       toolId={tool.id}
-      requestContextSchema={tool.requestContextSchema}
+      requestContextEntityType="tool"
+      requestContextEntityId={tool.id}
     />
   );
 };

@@ -25,7 +25,8 @@ import type {
   ListVersionsOutput,
 } from '@mastra/core/storage/domains/agents';
 import { PgDB, resolvePgConfig, generateTableSQL } from '../../db';
-import type { PgDomainConfig } from '../../db';
+import type { DbClient, PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { getTableName, getSchemaName, parseJsonResilient } from '../utils';
 
 export class AgentsPG extends AgentsStorage {
@@ -39,8 +40,8 @@ export class AgentsPG extends AgentsStorage {
 
   constructor(config: PgDomainConfig) {
     super();
-    const { client, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
-    this.#db = new PgDB({ client, schemaName, skipDefaultIndexes });
+    const { client, readClient, schemaName, skipDefaultIndexes, indexes } = resolvePgConfig(config);
+    this.#db = new PgDB({ client, readClient, schemaName, skipDefaultIndexes });
     this.#schema = schemaName || 'public';
     this.#skipDefaultIndexes = skipDefaultIndexes;
     // Filter indexes to only those for tables managed by this domain
@@ -110,6 +111,7 @@ export class AgentsPG extends AgentsStorage {
         'workspace',
         'skills',
         'skillsFormat',
+        'durable',
         'browser',
         'toolProviders',
       ],
@@ -143,9 +145,15 @@ export class AgentsPG extends AgentsStorage {
     const hasLegacyColumns = await this.#db.hasColumn(TABLE_AGENTS, 'name');
 
     if (hasLegacyColumns) {
-      // Current table has legacy schema — rename it and drop old versions table
+      // Current table has legacy schema — rename it and drop old versions table.
+      // Raw DDL bypasses the snapshot-maintaining createTable/alterTable paths,
+      // so each statement reports itself to the init snapshot: otherwise the
+      // createTable() calls below would skip rebuilding the tables this just
+      // renamed away or dropped.
       await this.#db.client.none(`ALTER TABLE ${fullTableName} RENAME TO "${TABLE_AGENTS}_legacy"`);
+      this.#db.noteTableRenamed(TABLE_AGENTS, `${TABLE_AGENTS}_legacy`);
       await this.#db.client.none(`DROP TABLE IF EXISTS ${fullVersionsTableName}`);
+      this.#db.noteTableDropped(TABLE_AGENT_VERSIONS);
     }
 
     // Check if legacy table exists (either just renamed, or left behind by a previous partial migration)
@@ -176,7 +184,7 @@ export class AgentsPG extends AgentsStorage {
           'published',
           versionId,
           row.ownerId ?? row.authorId ?? null,
-          row.metadata ? JSON.stringify(row.metadata) : null,
+          row.metadata ? toPgJson(row.metadata) : null,
           row.createdAt ?? now,
           row.updatedAt ?? now,
         ],
@@ -196,17 +204,17 @@ export class AgentsPG extends AgentsStorage {
           row.name ?? agentId,
           row.description ?? null,
           this.serializeInstructions(row.instructions ?? ''),
-          row.model ? JSON.stringify(row.model) : '{}',
-          row.tools ? JSON.stringify(row.tools) : null,
-          row.defaultOptions ? JSON.stringify(row.defaultOptions) : null,
-          row.workflows ? JSON.stringify(row.workflows) : null,
-          row.agents ? JSON.stringify(row.agents) : null,
-          row.integrationTools ? JSON.stringify(row.integrationTools) : null,
-          row.toolProviders ? JSON.stringify(row.toolProviders) : null,
-          row.inputProcessors ? JSON.stringify(row.inputProcessors) : null,
-          row.outputProcessors ? JSON.stringify(row.outputProcessors) : null,
-          row.memory ? JSON.stringify(row.memory) : null,
-          row.scorers ? JSON.stringify(row.scorers) : null,
+          row.model ? toPgJson(row.model) : '{}',
+          row.tools ? toPgJson(row.tools) : null,
+          row.defaultOptions ? toPgJson(row.defaultOptions) : null,
+          row.workflows ? toPgJson(row.workflows) : null,
+          row.agents ? toPgJson(row.agents) : null,
+          row.integrationTools ? toPgJson(row.integrationTools) : null,
+          row.toolProviders ? toPgJson(row.toolProviders) : null,
+          row.inputProcessors ? toPgJson(row.inputProcessors) : null,
+          row.outputProcessors ? toPgJson(row.outputProcessors) : null,
+          row.memory ? toPgJson(row.memory) : null,
+          row.scorers ? toPgJson(row.scorers) : null,
           null,
           'Migrated from legacy schema',
           row.createdAt ?? now,
@@ -216,6 +224,7 @@ export class AgentsPG extends AgentsStorage {
 
     // Drop legacy table only after all inserts succeed
     await this.#db.client.none(`DROP TABLE IF EXISTS ${legacyTableName}`);
+    this.#db.noteTableDropped(`${TABLE_AGENTS}_legacy`);
   }
 
   /**
@@ -236,11 +245,14 @@ export class AgentsPG extends AgentsStorage {
       schemaName: getSchemaName(this.#schema),
     });
 
-    // Drop the old versions table - the new schema will be created by init()
+    // Drop the old versions table - the new schema will be created by init(),
+    // which only happens if the snapshot reflects the drop.
     await this.#db.client.none(`DROP TABLE IF EXISTS ${fullVersionsTableName}`);
+    this.#db.noteTableDropped(TABLE_AGENT_VERSIONS);
 
     // Also clean up any lingering legacy table from a partial migration
     await this.#db.client.none(`DROP TABLE IF EXISTS ${legacyTableName}`);
+    this.#db.noteTableDropped(`${TABLE_AGENTS}_legacy`);
   }
 
   /**
@@ -281,7 +293,7 @@ export class AgentsPG extends AgentsStorage {
           `UPDATE ${fullVersionsTableName} 
            SET tools = $1::jsonb 
            WHERE id = $2`,
-          [JSON.stringify(toolsObject), record.id],
+          [toPgJson(toolsObject), record.id],
         );
       }
 
@@ -360,10 +372,18 @@ export class AgentsPG extends AgentsStorage {
   }
 
   async getById(id: string): Promise<StorageAgentType | null> {
+    return this.#getById(this.#db.readClient, id);
+  }
+
+  /**
+   * Same lookup against an explicit client. Mutation paths pass the writer so a
+   * lagging read replica cannot yield stale or missing rows mid-update.
+   */
+  async #getById(client: DbClient, id: string): Promise<StorageAgentType | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_AGENTS, schemaName: getSchemaName(this.#schema) });
 
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -393,6 +413,7 @@ export class AgentsPG extends AgentsStorage {
 
       // Default visibility to 'private' for owned agents; leave null for unowned/legacy rows
       const visibility = agent.visibility ?? (agent.authorId ? 'private' : null);
+      const metadataJson = agent.metadata ? toPgJson(agent.metadata) : null;
 
       // 1. Create the thin agent record with status='draft' and activeVersionId=null
       await this.#db.client.none(
@@ -406,7 +427,7 @@ export class AgentsPG extends AgentsStorage {
           'draft',
           agent.authorId ?? null,
           visibility,
-          agent.metadata ? JSON.stringify(agent.metadata) : null,
+          metadataJson,
           0,
           null, // activeVersionId starts as null
           nowIso,
@@ -437,7 +458,7 @@ export class AgentsPG extends AgentsStorage {
         activeVersionId: undefined,
         authorId: agent.authorId,
         visibility: visibility ?? undefined,
-        metadata: agent.metadata,
+        metadata: metadataJson ? JSON.parse(metadataJson) : agent.metadata,
         favoriteCount: 0,
         createdAt: now,
         updatedAt: now,
@@ -473,7 +494,7 @@ export class AgentsPG extends AgentsStorage {
       const tableName = getTableName({ indexName: TABLE_AGENTS, schemaName: getSchemaName(this.#schema) });
 
       // First, get the existing agent
-      const existingAgent = await this.getById(id);
+      const existingAgent = await this.#getById(this.#db.client, id);
       if (!existingAgent) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_AGENT', 'NOT_FOUND'),
@@ -515,7 +536,7 @@ export class AgentsPG extends AgentsStorage {
       if (metadata !== undefined) {
         // REPLACE metadata (not merge) - this is standard DB behavior
         setClauses.push(`metadata = $${paramIndex++}`);
-        values.push(JSON.stringify(metadata));
+        values.push(toPgJson(metadata));
       }
 
       // Always update the updatedAt timestamp
@@ -532,7 +553,7 @@ export class AgentsPG extends AgentsStorage {
       await this.#db.client.none(`UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`, values);
 
       // Return the updated agent
-      const updatedAgent = await this.getById(id);
+      const updatedAgent = await this.#getById(this.#db.client, id);
       if (!updatedAgent) {
         throw new MastraError({
           id: createStorageErrorId('PG', 'UPDATE_AGENT', 'NOT_FOUND_AFTER_UPDATE'),
@@ -658,7 +679,7 @@ export class AgentsPG extends AgentsStorage {
 
       if (metadata && Object.keys(metadata).length > 0) {
         conditions.push(`a.metadata @> $${paramIdx++}::jsonb`);
-        queryParams.push(JSON.stringify(metadata));
+        queryParams.push(toPgJson(metadata));
       }
 
       if (entityIds && entityIds.length > 0) {
@@ -683,7 +704,7 @@ export class AgentsPG extends AgentsStorage {
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
       // Total count (mirrors join + where, no ORDER BY / LIMIT).
-      const countResult = await this.#db.client.one(
+      const countResult = await this.#db.readClient.one(
         `SELECT COUNT(*) as count FROM ${tableName} a ${joinClause} ${whereClause}`,
         [...joinParams, ...queryParams],
       );
@@ -711,7 +732,7 @@ export class AgentsPG extends AgentsStorage {
       const limitValue = perPageInput === false ? total : perPage;
       const limitIdx = paramIdx++;
       const offsetIdx = paramIdx++;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT a.* FROM ${tableName} a ${joinClause} ${whereClause} ${orderByClause} LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
         [...joinParams, ...queryParams, limitValue, offset],
       );
@@ -755,17 +776,17 @@ export class AgentsPG extends AgentsStorage {
       const now = new Date();
       const nowIso = now.toISOString();
 
-      await this.#db.client.none(
+      const row = await this.#db.client.one(
         `INSERT INTO ${tableName} (
           id, "agentId", "versionNumber",
           name, description, instructions, model, tools,
           "defaultOptions", workflows, agents, "integrationTools", "toolProviders",
           "inputProcessors", "outputProcessors", memory, scorers,
           "mcpClients", "requestContextSchema", workspace, skills, "skillsFormat",
-          browser,
+          durable, browser,
           "changedFields", "changeMessage",
           "createdAt", "createdAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) RETURNING *`,
         [
           input.id,
           input.agentId,
@@ -773,34 +794,32 @@ export class AgentsPG extends AgentsStorage {
           input.name,
           input.description ?? null,
           this.serializeInstructions(input.instructions),
-          JSON.stringify(input.model),
-          input.tools ? JSON.stringify(input.tools) : null,
-          input.defaultOptions ? JSON.stringify(input.defaultOptions) : null,
-          input.workflows ? JSON.stringify(input.workflows) : null,
-          input.agents ? JSON.stringify(input.agents) : null,
-          input.integrationTools ? JSON.stringify(input.integrationTools) : null,
-          input.toolProviders ? JSON.stringify(input.toolProviders) : null,
-          input.inputProcessors ? JSON.stringify(input.inputProcessors) : null,
-          input.outputProcessors ? JSON.stringify(input.outputProcessors) : null,
-          input.memory ? JSON.stringify(input.memory) : null,
-          input.scorers ? JSON.stringify(input.scorers) : null,
-          input.mcpClients ? JSON.stringify(input.mcpClients) : null,
-          input.requestContextSchema ? JSON.stringify(input.requestContextSchema) : null,
-          input.workspace ? JSON.stringify(input.workspace) : null,
-          input.skills ? JSON.stringify(input.skills) : null,
+          toPgJson(input.model),
+          input.tools ? toPgJson(input.tools) : null,
+          input.defaultOptions ? toPgJson(input.defaultOptions) : null,
+          input.workflows ? toPgJson(input.workflows) : null,
+          input.agents ? toPgJson(input.agents) : null,
+          input.integrationTools ? toPgJson(input.integrationTools) : null,
+          input.toolProviders ? toPgJson(input.toolProviders) : null,
+          input.inputProcessors ? toPgJson(input.inputProcessors) : null,
+          input.outputProcessors ? toPgJson(input.outputProcessors) : null,
+          input.memory ? toPgJson(input.memory) : null,
+          input.scorers ? toPgJson(input.scorers) : null,
+          input.mcpClients ? toPgJson(input.mcpClients) : null,
+          input.requestContextSchema ? toPgJson(input.requestContextSchema) : null,
+          input.workspace ? toPgJson(input.workspace) : null,
+          input.skills ? toPgJson(input.skills) : null,
           input.skillsFormat ?? null,
-          input.browser ? JSON.stringify(input.browser) : null,
-          input.changedFields ? JSON.stringify(input.changedFields) : null,
+          input.durable !== undefined ? toPgJson(input.durable) : null,
+          input.browser ? toPgJson(input.browser) : null,
+          input.changedFields ? toPgJson(input.changedFields) : null,
           input.changeMessage ?? null,
           nowIso,
           nowIso,
         ],
       );
 
-      return {
-        ...input,
-        createdAt: now,
-      };
+      return this.parseVersionRow(row);
     } catch (error) {
       if (error instanceof MastraError) throw error;
       throw new MastraError(
@@ -818,7 +837,7 @@ export class AgentsPG extends AgentsStorage {
   async getVersion(id: string): Promise<AgentVersion | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
+      const result = await this.#db.readClient.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [id]);
 
       if (!result) {
         return null;
@@ -839,10 +858,36 @@ export class AgentsPG extends AgentsStorage {
     }
   }
 
+  async getVersions(ids: string[]): Promise<AgentVersion[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    try {
+      const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
+      const rows = await this.#db.readClient.manyOrNone(
+        `SELECT * FROM ${tableName} WHERE id IN (${placeholders})`,
+        ids,
+      );
+      return rows.map(row => this.parseVersionRow(row));
+    } catch (error) {
+      if (error instanceof MastraError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_VERSIONS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { count: ids.length },
+        },
+        error,
+      );
+    }
+  }
+
   async getVersionByNumber(agentId: string, versionNumber: number): Promise<AgentVersion | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(
+      const result = await this.#db.readClient.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "agentId" = $1 AND "versionNumber" = $2`,
         [agentId, versionNumber],
       );
@@ -869,7 +914,7 @@ export class AgentsPG extends AgentsStorage {
   async getLatestVersion(agentId: string): Promise<AgentVersion | null> {
     try {
       const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.oneOrNone(
+      const result = await this.#db.readClient.oneOrNone(
         `SELECT * FROM ${tableName} WHERE "agentId" = $1 ORDER BY "versionNumber" DESC LIMIT 1`,
         [agentId],
       );
@@ -916,9 +961,10 @@ export class AgentsPG extends AgentsStorage {
       const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
 
       // Get total count
-      const countResult = await this.#db.client.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "agentId" = $1`, [
-        agentId,
-      ]);
+      const countResult = await this.#db.readClient.one(
+        `SELECT COUNT(*) as count FROM ${tableName} WHERE "agentId" = $1`,
+        [agentId],
+      );
       const total = parseInt(countResult.count, 10);
 
       if (total === 0) {
@@ -933,7 +979,7 @@ export class AgentsPG extends AgentsStorage {
 
       // Get paginated results
       const limitValue = perPageInput === false ? total : perPage;
-      const dataResult = await this.#db.client.manyOrNone(
+      const dataResult = await this.#db.readClient.manyOrNone(
         `SELECT * FROM ${tableName} WHERE "agentId" = $1 ORDER BY "${field}" ${direction} LIMIT $2 OFFSET $3`,
         [agentId, limitValue, offset],
       );
@@ -1007,7 +1053,7 @@ export class AgentsPG extends AgentsStorage {
   async countVersions(agentId: string): Promise<number> {
     try {
       const tableName = getTableName({ indexName: TABLE_AGENT_VERSIONS, schemaName: getSchemaName(this.#schema) });
-      const result = await this.#db.client.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "agentId" = $1`, [
+      const result = await this.#db.readClient.one(`SELECT COUNT(*) as count FROM ${tableName} WHERE "agentId" = $1`, [
         agentId,
       ]);
       return parseInt(result.count, 10);
@@ -1069,6 +1115,7 @@ export class AgentsPG extends AgentsStorage {
       workspace: parseJsonResilient(row.workspace, 'workspace'),
       skills: parseJsonResilient(row.skills, 'skills'),
       skillsFormat: row.skillsFormat as 'xml' | 'json' | 'markdown' | undefined,
+      durable: parseJsonResilient(row.durable, 'durable'),
       browser: parseJsonResilient(row.browser, 'browser'),
       changedFields: parseJsonResilient(row.changedFields, 'changedFields'),
       changeMessage: row.changeMessage as string | undefined,

@@ -57,6 +57,30 @@ export interface DurableAgentLike<TOutput = undefined> {
     runId: string;
     cleanup: () => void;
   }>;
+  /**
+   * Crash-recovery surface (recovery domain). Optional because not every
+   * engine supports in-process crash recovery (e.g. Inngest orchestrates its
+   * own retries externally); legs without it set `skip.recovery`.
+   */
+  listActiveRuns?(options?: any): Promise<{
+    runs: Array<{ runId: string; status: string; threadId?: string; resourceId?: string; updatedAt: Date }>;
+    total: number;
+  }>;
+  recoverActiveRuns?(options?: any): Promise<{
+    recovered: Array<{ runId: string; status: 'success' | 'failed'; error?: Error }>;
+    succeeded: number;
+    failed: number;
+  }>;
+  recover?(
+    runId: string,
+    options?: any,
+  ): Promise<{
+    output: any;
+    runId: string;
+    threadId?: string;
+    resourceId?: string;
+    cleanup: () => void;
+  }>;
 }
 
 /**
@@ -69,6 +93,50 @@ export interface CreateAgentConfig<TTools extends ToolsInput = ToolsInput, TOutp
   instructions: string;
   model: any;
   tools?: TTools;
+  /**
+   * Wire the agent into a Mastra host backed by this exact storage instance
+   * instead of a fresh MockStore. Lets a test build two "hosts" over the same
+   * store to simulate a process crash + restart (recovery domain).
+   */
+  storage?: MastraStorage;
+  /**
+   * Use `id` verbatim instead of appending a per-test uniqueness suffix.
+   * Recovery tests create a second host that must resolve the same agent id
+   * the crashed host persisted into the run snapshot, so the ids must match
+   * exactly across both createAgent calls.
+   */
+  exactId?: boolean;
+  /**
+   * Give this agent (and its Mastra host, for engines that host one) a fresh
+   * pubsub instead of the suite-shared instance. A recovered host must not
+   * share the crashed host's bus, mirroring a real process restart.
+   */
+  isolatedPubsub?: boolean;
+  /**
+   * Configure the Mastra host with `recovery: { durableAgents: 'auto' }`.
+   * Since #23915, `running` checkpoints — the records `listActiveRuns()` /
+   * `recover()` discover orphaned runs from — are only persisted when crash
+   * recovery is enabled (they are pure write amplification otherwise).
+   * Recovery-domain hosts must opt in per that contract.
+   */
+  recovery?: boolean;
+  /**
+   * Wire this FGA provider into the Mastra host (`server: { fga }`) so the
+   * agent's agents:execute gate is active. FGA-domain tests pass a mock
+   * provider here; legs must thread it into their Mastra construction.
+   */
+  fga?: unknown;
+  /**
+   * Sub-agents forwarded to the underlying Agent (`agents: {}`), turning it
+   * into a supervisor that can delegate via `agent-<key>` tool calls.
+   * Network-domain tests use this; legs must thread it into their Agent
+   * construction.
+   */
+  agents?: Record<string, any>;
+  /** Forwarded to the underlying Agent when set (shared MastraMemory instance). */
+  memory?: any;
+  /** Forwarded to the underlying Agent when set. */
+  outputProcessors?: any;
   /** Any other agent config options */
   [key: string]: any;
 }
@@ -126,7 +194,19 @@ export type DurableAgentTestDomain =
   | 'processorPipeline'
   | 'versionOverrides'
   | 'memoryPersistence'
-  | 'backgroundTasks';
+  | 'backgroundTasks'
+  // Crash-recovery domain (kill mid-run, fresh host over same storage, recover)
+  | 'recovery'
+  // FGA / actor-identity domain (actor threading, agents:execute enforcement)
+  | 'fga'
+  // Network-equivalent delegation domain (supervisor → sub-agent routing)
+  | 'network'
+  // agentId propagation into tool execution context
+  | 'agentIdContext'
+  // requestContextSchema validation at the stream() boundary
+  | 'requestContextSchema'
+  // stream({ untilIdle }) idle-loop entry point (no-background-manager contract)
+  | 'streamUntilIdle';
 
 /**
  * Configuration for creating a DurableAgent test suite
@@ -617,6 +697,14 @@ export interface WorkflowTestConfig {
   ) => Promise<WorkflowResult>;
 
   /**
+   * Whether the engine deletes a run's snapshot row when the run reaches a
+   * non-paused terminal status that `shouldPersistSnapshot` declined to persist
+   * (evented engine, #22209). Engines that simply skip the terminal write keep
+   * the last persisted (e.g. suspended) snapshot instead.
+   */
+  deletesDeclinedTerminalSnapshots?: boolean;
+
+  /**
    * Resume a suspended workflow.
    * This is optional - only implement if the engine supports explicit resume testing.
    *
@@ -852,6 +940,12 @@ export interface WorkflowTestContext extends WorkflowCreatorContext {
   ) => Promise<WorkflowResult>;
 
   /**
+   * Whether the engine deletes a run's snapshot row when the run reaches a
+   * non-paused terminal status that `shouldPersistSnapshot` declined to persist.
+   */
+  deletesDeclinedTerminalSnapshots?: boolean;
+
+  /**
    * Time travel to a specific step in a workflow.
    * This allows re-running a workflow from a specific step with provided context.
    * Returns undefined if the engine doesn't support time travel testing.
@@ -909,6 +1003,18 @@ export interface WorkflowRegistryEntry {
    * Call this in beforeEach to prevent mock call count accumulation.
    */
   resetMocks?: () => void;
+  /**
+   * Agents this workflow expects to be registered on the shared Mastra instance
+   * (used by `.agent('id')` by-id forms). Engine harnesses aggregate these
+   * across all entries when constructing Mastra.
+   */
+  mastraAgents?: Record<string, any>;
+  /**
+   * Tools this workflow expects to be registered on the shared Mastra instance
+   * (used by `.tool('id')` by-id forms). Engine harnesses aggregate these
+   * across all entries when constructing Mastra.
+   */
+  mastraTools?: Record<string, any>;
   // Optional getters/resetters for test state
   [key: string]: any;
 }

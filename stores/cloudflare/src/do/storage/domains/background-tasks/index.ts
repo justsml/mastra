@@ -4,6 +4,7 @@ import type {
   TaskFilter,
   TaskListResult,
   UpdateBackgroundTask,
+  UpdateBackgroundTaskOptions,
 } from '@mastra/core/background-tasks';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
@@ -57,6 +58,8 @@ function rowToTask(row: Record<string, unknown>): BackgroundTask {
     startedAt: asDate(row.startedAt),
     suspendedAt: asDate(row.suspendedAt),
     completedAt: asDate(row.completedAt),
+    ownerId: row.ownerId != null ? String(row.ownerId) : undefined,
+    leaseExpiresAt: asDate(row.leaseExpiresAt),
   };
 }
 
@@ -80,7 +83,7 @@ export class BackgroundTasksStorageDO extends BackgroundTasksStorage {
     await this.#db.alterTable({
       tableName: TABLE_BACKGROUND_TASKS,
       schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
-      ifNotExists: ['suspend_payload', 'suspendedAt'],
+      ifNotExists: ['suspend_payload', 'suspendedAt', 'ownerId', 'leaseExpiresAt'],
     });
   }
 
@@ -112,6 +115,8 @@ export class BackgroundTasksStorageDO extends BackgroundTasksStorage {
           startedAt: task.startedAt?.toISOString() ?? null,
           suspendedAt: task.suspendedAt?.toISOString() ?? null,
           completedAt: task.completedAt?.toISOString() ?? null,
+          ownerId: task.ownerId ?? null,
+          leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null,
         },
       });
     } catch (error) {
@@ -126,7 +131,11 @@ export class BackgroundTasksStorageDO extends BackgroundTasksStorage {
     }
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
+  async updateTask(
+    taskId: string,
+    update: UpdateBackgroundTask,
+    options?: UpdateBackgroundTaskOptions,
+  ): Promise<boolean> {
     const columns: string[] = [];
     const values: SqlParam[] = [];
 
@@ -162,14 +171,36 @@ export class BackgroundTasksStorageDO extends BackgroundTasksStorage {
       columns.push('completedAt');
       values.push(update.completedAt?.toISOString() ?? null);
     }
+    if ('ownerId' in update) {
+      columns.push('ownerId');
+      values.push(update.ownerId ?? null);
+    }
+    if ('leaseExpiresAt' in update) {
+      columns.push('leaseExpiresAt');
+      values.push(update.leaseExpiresAt?.toISOString() ?? null);
+    }
 
-    if (columns.length === 0) return;
+    if (columns.length === 0) return false;
 
     try {
       const fullTableName = this.#db.getTableName(TABLE_BACKGROUND_TASKS);
-      const query = createSqlBuilder().update(fullTableName, columns, values).where('id = ?', taskId);
+      let query = createSqlBuilder().update(fullTableName, columns, values).where('id = ?', taskId);
+      if (options?.expectedStatus) query = query.whereAnd('status = ?', options.expectedStatus);
+      if (options?.expectedOwnerId !== undefined) {
+        query =
+          options.expectedOwnerId === null
+            ? query.whereAnd('ownerId IS NULL')
+            : query.whereAnd('ownerId = ?', options.expectedOwnerId);
+      }
+      if (options?.expectedLeaseExpiresAt !== undefined) {
+        query =
+          options.expectedLeaseExpiresAt === null
+            ? query.whereAnd('leaseExpiresAt IS NULL')
+            : query.whereAnd('leaseExpiresAt = ?', options.expectedLeaseExpiresAt.toISOString());
+      }
       const { sql, params } = query.build();
-      await this.#db.executeQuery({ sql, params });
+      const result = await this.#db.executeQuery({ sql: `${sql} RETURNING id`, params });
+      return Array.isArray(result) && result.length > 0;
     } catch (error) {
       throw new MastraError(
         {
@@ -181,7 +212,6 @@ export class BackgroundTasksStorageDO extends BackgroundTasksStorage {
       );
     }
   }
-
   async getTask(taskId: string): Promise<BackgroundTask | null> {
     try {
       const fullTableName = this.#db.getTableName(TABLE_BACKGROUND_TASKS);

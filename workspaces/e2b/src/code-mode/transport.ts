@@ -18,8 +18,7 @@
  * `@mastra/core/tools`.
  */
 
-import { randomBytes } from 'node:crypto';
-import { buildProgramModule, buildRunner, FRAME_PREFIX } from '@mastra/core/tools';
+import { buildProgramModule, buildRunner, FRAME_PREFIX, sanitizeToolId } from '@mastra/core/tools';
 import type { CodeModeRunnerFrame, CodeModeToolResult, CodeModeTransport } from '@mastra/core/tools';
 import type { ProcessHandle } from '@mastra/core/workspace';
 import { transformSync } from 'esbuild';
@@ -27,12 +26,6 @@ import { E2BSandbox } from '../sandbox';
 
 /** Base directory inside the E2B sandbox where Code Mode programs are written. */
 const SANDBOX_TMP = '/home/user/mastra-code-mode';
-
-/** Mirrors the external-name sanitizer used by the core Code Mode runner. */
-function sanitize(id: string): string {
-  const cleaned = id.replace(/[^A-Za-z0-9_$]/g, '_');
-  return /^[A-Za-z_$]/.test(cleaned) ? cleaned : `_${cleaned}`;
-}
 
 /**
  * Code Mode transport for {@link E2BSandbox}.
@@ -69,11 +62,11 @@ export class E2BCodeModeTransport implements CodeModeTransport {
       await sandbox.start();
     }
 
-    const e2b = sandbox.e2b;
-    const externals = toolIds.map(toolId => ({ toolId, externalName: sanitize(toolId) }));
+    let e2b = sandbox.e2b;
+    const externals = toolIds.map(toolId => ({ toolId, externalName: sanitizeToolId(toolId) }));
     const allowList = new Set(toolIds);
 
-    const suffix = randomBytes(4).toString('hex');
+    const suffix = Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(4))).toString('hex');
     const dir = `${SANDBOX_TMP}/${suffix}`;
     const programPath = `${dir}/program-${suffix}.mjs`;
     const runnerPath = `${dir}/runner-${suffix}.mjs`;
@@ -112,9 +105,16 @@ export class E2BCodeModeTransport implements CodeModeTransport {
     };
 
     try {
-      await e2b.files.makeDir(dir);
-      await e2b.files.write(programPath, programSource);
-      await e2b.files.write(runnerPath, runnerSource);
+      // `status` is a local field: E2B may have auto-paused the sandbox
+      // server-side while it still reads 'running'. Retry the setup on a dead
+      // sandbox (resume + reconnect). Only setup is retried so host tools are
+      // never dispatched twice; `spawn()` below has its own retry.
+      await sandbox.retryOnDead(async () => {
+        e2b = sandbox.e2b;
+        await e2b.files.makeDir(dir);
+        await e2b.files.write(programPath, programSource);
+        await e2b.files.write(runnerPath, runnerSource);
+      });
 
       let handle: ProcessHandle;
 

@@ -9,9 +9,16 @@ import { consumeStream } from './base/consume-stream';
 import { ChunkFrom } from './types';
 import type { StepTripwireData, WorkflowStreamEvent } from './types';
 
-type AggregatedLanguageModelUsage = Required<LanguageModelUsage> & {
-  cacheCreationInputTokens: number;
+type AggregatedLanguageModelUsage = Omit<LanguageModelUsage, 'inputTokens' | 'outputTokens' | 'totalTokens'> & {
+  inputTokens: number | undefined;
+  outputTokens: number | undefined;
+  totalTokens: number | undefined;
+  reasoningTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
 };
+
+const primaryUsageKeys = ['inputTokens', 'outputTokens', 'totalTokens'] as const;
 
 export class WorkflowRunOutput<
   TResult extends WorkflowResult<any, any, any, any> = WorkflowResult<any, any, any, any>,
@@ -19,13 +26,11 @@ export class WorkflowRunOutput<
   #status: WorkflowRunStatus = 'running';
   #tripwireData: StepTripwireData | undefined;
   #usageCount: AggregatedLanguageModelUsage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    totalTokens: 0,
-    cachedInputTokens: 0,
-    cacheCreationInputTokens: 0,
-    reasoningTokens: 0,
+    inputTokens: undefined,
+    outputTokens: undefined,
+    totalTokens: undefined,
   };
+  #usageCountMissing = new Set<(typeof primaryUsageKeys)[number]>();
   #consumptionStarted = false;
   #baseStream: ReadableStream<WorkflowStreamEvent>;
   #emitter = new EventEmitter();
@@ -34,6 +39,8 @@ export class WorkflowRunOutput<
   #streamFinished = false;
 
   #streamError: Error | undefined;
+
+  #finalWorkflowResult: unknown;
 
   #delayedPromises = {
     usage: new DelayedPromise<LanguageModelUsage>(),
@@ -135,6 +142,9 @@ export class WorkflowRunOutput<
                 output: {
                   usage: self.#usageCount,
                 },
+                ...(self.#status === 'success' && self.#finalWorkflowResult !== undefined
+                  ? { finalWorkflowResult: self.#finalWorkflowResult }
+                  : {}),
                 // Include tripwire data when status is 'tripwire'
                 ...(self.#status === 'tripwire' && self.#tripwireData ? { tripwire: self.#tripwireData } : {}),
               },
@@ -154,8 +164,7 @@ export class WorkflowRunOutput<
         }),
       )
       .catch(reason => {
-        // eslint-disable-next-line no-console
-        console.log(' something went wrong', reason);
+        self.#finalizeWithError(reason);
       });
   }
 
@@ -185,34 +194,91 @@ export class WorkflowRunOutput<
           cacheCreationInputTokens?: `${number}` | number;
         },
   ) {
-    let totalUsage = {
-      inputTokens: this.#usageCount.inputTokens ?? 0,
-      outputTokens: this.#usageCount.outputTokens ?? 0,
-      totalTokens: this.#usageCount.totalTokens ?? 0,
-      reasoningTokens: this.#usageCount.reasoningTokens ?? 0,
-      cachedInputTokens: this.#usageCount.cachedInputTokens ?? 0,
-      cacheCreationInputTokens: this.#usageCount.cacheCreationInputTokens ?? 0,
+    const primaryUsage = {
+      inputTokens:
+        'inputTokens' in usage ? usage.inputTokens : 'promptTokens' in usage ? usage.promptTokens : undefined,
+      outputTokens:
+        'outputTokens' in usage ? usage.outputTokens : 'completionTokens' in usage ? usage.completionTokens : undefined,
+      totalTokens: usage.totalTokens,
     };
-    if ('inputTokens' in usage) {
-      totalUsage.inputTokens += parseInt(usage?.inputTokens?.toString() ?? '0', 10);
-      totalUsage.outputTokens += parseInt(usage?.outputTokens?.toString() ?? '0', 10);
-      // we need to handle both formats because you can use a V1 model inside a stream workflow
-    } else if ('promptTokens' in usage) {
-      totalUsage.inputTokens += parseInt(usage?.promptTokens?.toString() ?? '0', 10);
-      totalUsage.outputTokens += parseInt(usage?.completionTokens?.toString() ?? '0', 10);
-    }
-    totalUsage.totalTokens += parseInt(usage?.totalTokens?.toString() ?? '0', 10);
 
-    totalUsage.reasoningTokens += parseInt(usage?.reasoningTokens?.toString() ?? '0', 10);
-    totalUsage.cachedInputTokens += parseInt(usage?.cachedInputTokens?.toString() ?? '0', 10);
-    totalUsage.cacheCreationInputTokens += parseInt(usage?.cacheCreationInputTokens?.toString() ?? '0', 10);
-    this.#usageCount = totalUsage;
+    for (const key of primaryUsageKeys) {
+      const value = primaryUsage[key] === undefined ? undefined : Number(primaryUsage[key]);
+      if (value === undefined) {
+        this.#usageCountMissing.add(key);
+        this.#usageCount[key] = undefined;
+      } else if (!this.#usageCountMissing.has(key)) {
+        this.#usageCount[key] = (this.#usageCount[key] ?? 0) + value;
+      }
+    }
+
+    for (const key of ['reasoningTokens', 'cachedInputTokens', 'cacheCreationInputTokens'] as const) {
+      const value = usage[key] === undefined ? undefined : Number(usage[key]);
+      if (value !== undefined) {
+        this.#usageCount[key] = (this.#usageCount[key] ?? 0) + value;
+      }
+    }
+  }
+
+  /**
+   * Finalize the run when the underlying stream pipeline rejects.
+   *
+   * When `pipeTo` rejects, the WritableStream's `close()` never runs, so without
+   * this the terminal `workflow-finish` event would never fire, the delayed
+   * `result`/`usage` promises would never settle, and every `fullStream` consumer
+   * would hang forever. Mirror the `close()` path but mark the run as failed.
+   */
+  #finalizeWithError(reason: unknown) {
+    // A clean close already finalized the run; nothing to do.
+    if (this.#streamFinished) {
+      return;
+    }
+
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    this.#streamError = error;
+    // The run terminated because the stream pipeline rejected, so it failed —
+    // overwrite any earlier non-terminal status (paused/suspended/canceled/tripwire)
+    // so downstream consumers always see a failed terminal status.
+    this.#status = 'failed';
+
+    // Emit a terminal finish so fullStream consumers stop waiting and close.
+    this.#emitter.emit('chunk', {
+      type: 'workflow-finish',
+      runId: this.runId,
+      from: ChunkFrom.WORKFLOW,
+      payload: {
+        workflowStatus: this.#status,
+        metadata: {
+          error: this.#streamError,
+          errorMessage: this.#streamError.message,
+        },
+        output: {
+          usage: this.#usageCount,
+        },
+      },
+    });
+
+    // Reject any still-pending delayed promises so result/usage callers see the
+    // error instead of awaiting forever.
+    Object.entries(this.#delayedPromises).forEach(([_key, promise]) => {
+      if (promise.status.type === 'pending') {
+        promise.reject(error);
+      }
+    });
+
+    this.#streamFinished = true;
+    this.#emitter.emit('finish');
+
+    console.error('[WorkflowRunOutput] workflow stream pipeline error', error);
   }
 
   /**
    * @internal
    */
   updateResults(results: TResult) {
+    if (results.status === 'success') {
+      this.#finalWorkflowResult = results.result;
+    }
     this.#delayedPromises.result.resolve(results);
   }
 
@@ -311,6 +377,9 @@ export class WorkflowRunOutput<
                 output: {
                   usage: self.#usageCount,
                 },
+                ...(self.#status === 'success' && self.#finalWorkflowResult !== undefined
+                  ? { finalWorkflowResult: self.#finalWorkflowResult }
+                  : {}),
                 // Include tripwire data when status is 'tripwire'
                 ...(self.#status === 'tripwire' && self.#tripwireData ? { tripwire: self.#tripwireData } : {}),
               },
@@ -322,8 +391,7 @@ export class WorkflowRunOutput<
         }),
       )
       .catch(reason => {
-        // eslint-disable-next-line no-console
-        console.log(' something went wrong', reason);
+        self.#finalizeWithError(reason);
       });
   }
 
@@ -346,6 +414,12 @@ export class WorkflowRunOutput<
 
   get fullStream(): ReadableStream<WorkflowStreamEvent> {
     const self = this;
+    // Holds this subscriber's own detach function once start() registers its
+    // listeners. cancel() must only remove this subscriber's handlers — the
+    // emitter is shared across every concurrent fullStream/observe consumer of
+    // the same run, so removeAllListeners() here would silently kill every
+    // other subscriber (see #19743).
+    let detach: (() => void) | undefined;
     return new ReadableStream<WorkflowStreamEvent>({
       start(controller) {
         // Replay existing buffered chunks
@@ -372,6 +446,11 @@ export class WorkflowRunOutput<
 
         self.#emitter.on('chunk', chunkHandler);
         self.#emitter.on('finish', finishHandler);
+
+        detach = () => {
+          self.#emitter.off('chunk', chunkHandler);
+          self.#emitter.off('finish', finishHandler);
+        };
       },
 
       pull(_controller) {
@@ -382,8 +461,8 @@ export class WorkflowRunOutput<
       },
 
       cancel() {
-        // Stream was cancelled, clean up
-        self.#emitter.removeAllListeners();
+        // Only detach this subscriber's own listeners — never the whole emitter.
+        detach?.();
       },
     });
   }

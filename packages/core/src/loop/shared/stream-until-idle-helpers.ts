@@ -75,7 +75,7 @@ export async function resolveScope(
 // ---------------------------------------------------------------------------
 
 /**
- * Build the ephemeral user-prompt text that tells the LLM which tool-call
+ * Build the ephemeral system-context text that tells the LLM which tool-call
  * IDs just completed / failed / canceled. The directive stops the LLM from (a) re-processing
  * results already handled on a prior continuation and (b) mimicking the
  * prior assistant ack text ("I'm running it in the background") and
@@ -87,6 +87,7 @@ export function buildContinuationDirective(batch: Array<Record<string, unknown>>
       const payload = (chunk as { payload?: Record<string, unknown> }).payload ?? {};
       return {
         type: (chunk as { type?: string }).type,
+        taskId: payload.taskId as string | undefined,
         toolCallId: payload.toolCallId as string | undefined,
         toolName: payload.toolName as string | undefined,
         isSuspended: !!payload.suspendedAt,
@@ -97,7 +98,11 @@ export function buildContinuationDirective(batch: Array<Record<string, unknown>>
   // Suspend payloads are tool-controlled and may carry secrets, PII, or
   // large opaque blobs — never serialize them into the continuation
   // prompt. Just name the suspended tool-call IDs.
-  const formatEntry = (e: (typeof entries)[number]) => (e.toolName ? `${e.toolCallId} (${e.toolName})` : e.toolCallId!);
+  const formatEntry = (e: (typeof entries)[number]) => {
+    const tool = e.toolName ? ` (${e.toolName})` : '';
+    const task = e.taskId ? `, background task ${e.taskId}` : ', background task';
+    return `${e.toolCallId}${tool}${task}`;
+  };
 
   const completedIdList = entries
     .filter(e => e.type === 'background-task-completed' && !e.isSuspended)
@@ -120,6 +125,11 @@ export function buildContinuationDirective(batch: Array<Record<string, unknown>>
     .join(', ');
 
   let directive = '';
+
+  if (entries.length > 0) {
+    directive +=
+      ' IMPORTANT: These tool calls ran as background tasks. Their authoritative results may now look like ordinary tool results after reconciliation; do not reinterpret them as foreground calls.';
+  }
 
   if (completedIdList) {
     directive +=
@@ -165,7 +175,7 @@ export function buildContinuationOpts(
   const directive = buildContinuationDirective(batch);
   return {
     ...baseContinuationOpts,
-    context: [...(callerContext ?? []), { role: 'user' as const, content: directive }],
+    context: [...(callerContext ?? []), { role: 'system' as const, content: directive }],
   };
 }
 
@@ -173,10 +183,25 @@ export function buildContinuationOpts(
 // Active-stream slot management
 // ---------------------------------------------------------------------------
 
-/**
- * Register `closer` as the active wrapper for `scopeKey`, aborting any
- * prior registered closer first. No-op for null scopes.
- */
+const runStreamSlotKey = (runId: string) => `run:${runId}`;
+
+/** Return the active untilIdle wrapper registered for a caller-visible run ID. */
+export function getRunStreamSlot(activeStreams: Map<string, () => void>, runId: string): (() => void) | undefined {
+  return activeStreams.get(runStreamSlotKey(runId));
+}
+
+/** Return the active scope wrapper when it still belongs to the expected caller-visible run. */
+export function getScopeStreamSlot(
+  activeStreams: Map<string, () => void>,
+  scopeKey: string,
+  expectedRunId?: string,
+): (() => void) | undefined {
+  const closer = activeStreams.get(scopeKey);
+  if (expectedRunId === undefined || closer === getRunStreamSlot(activeStreams, expectedRunId)) return closer;
+  return undefined;
+}
+
+/** Register the active wrapper for a memory scope, aborting the prior wrapper for that scope. */
 export function acquireStreamSlot(
   activeStreams: Map<string, () => void>,
   scopeKey: string | null,
@@ -188,19 +213,35 @@ export function acquireStreamSlot(
   activeStreams.set(scopeKey, closer);
 }
 
+/** Register the active wrapper under its caller-visible run ID, replacing an older wrapper for that ID. */
+export function acquireRunStreamSlot(
+  activeStreams: Map<string, () => void>,
+  runId: string | undefined,
+  closer: () => void,
+): void {
+  if (!runId) return;
+  const key = runStreamSlotKey(runId);
+  const priorClose = activeStreams.get(key);
+  priorClose?.();
+  activeStreams.set(key, closer);
+}
+
 /**
- * Remove `closer` from the active streams map iff it's still the entry for
- * `scopeKey`. A later call that took over (and replaced the entry) will not
- * get accidentally unregistered.
+ * Remove `closer` from its scope and caller-visible run slots iff it is still
+ * the registered wrapper. A later wrapper that took over either slot is left intact.
  */
 export function releaseStreamSlot(
   activeStreams: Map<string, () => void>,
   scopeKey: string | null,
+  runId: string | undefined,
   closer: () => void,
 ): void {
-  if (!scopeKey) return;
-  if (activeStreams.get(scopeKey) === closer) {
+  if (scopeKey && activeStreams.get(scopeKey) === closer) {
     activeStreams.delete(scopeKey);
+  }
+  if (runId) {
+    const key = runStreamSlotKey(runId);
+    if (activeStreams.get(key) === closer) activeStreams.delete(key);
   }
 }
 
@@ -220,6 +261,8 @@ export interface IdleLoopDeps {
 export interface PostPipeHooks {
   /** Called with each inner result after `firstTurn` or continuation. */
   onInnerResult?: (inner: any) => void;
+  /** Abort the currently active inner stream before the wrapper closes. */
+  onAbortActive?: () => void;
   /** Extra teardown to run inside `forceClose`. */
   onForceClose?: () => void;
 }
@@ -259,15 +302,16 @@ export async function runIdleLoop<
     id: string;
     getDefaultOptions: (opts?: any) => any | Promise<any>;
     getMemory: (opts?: any) => Promise<MastraMemory | undefined>;
+    abortRunStream?: (runId: string) => boolean;
   },
-  TFirstResult extends { fullStream: any },
+  TFirstResult extends { fullStream: any; runId?: string },
   TReturn,
 >(
   agent: TAgent,
   streamOptions: (Record<string, any> & { maxIdleMs?: number }) | undefined,
   deps: IdleLoopDeps,
   firstTurn: (opts: Record<string, any>) => Promise<TFirstResult>,
-  streamForContinuation: (opts: Record<string, any>) => Promise<{ fullStream: ReadableStream<any> }>,
+  streamForContinuation: (opts: Record<string, any>) => Promise<{ fullStream: ReadableStream<any>; runId?: string }>,
   buildResult: (first: TFirstResult, ctx: IdleLoopContext) => TReturn,
   hooks?: PostPipeHooks,
 ): Promise<TReturn> {
@@ -292,17 +336,21 @@ export async function runIdleLoop<
   const { threadId, resourceId, scopeKey } = scope;
   const maxIdleMs = _maxIdleMs ?? 5 * 60_000;
 
-  // Continuation calls reuse the memory thread but drop one-shot hooks.
-  // `_skipBgTaskWait` prevents the inner loop from redundantly waiting for
-  // running bg tasks — this outer method already handles that.
+  // Continuation calls reuse the memory thread but drop segment-scoped options.
+  // Omitting runId lets durable agents start a fresh stream segment instead of
+  // replaying cached history from the caller's initial run.
+  const { runId: _runId, ...continuationStreamOptions } = restStreamOptions as Record<string, any>;
   const baseContinuationOpts = {
-    ...(restStreamOptions ?? {}),
+    ...continuationStreamOptions,
     onFinish: undefined,
     _skipBgTaskWait: true,
   } as Record<string, any>;
 
+  const initialAbort = new AbortController();
+  const callerAbortSignal = restStreamOptions.abortSignal as AbortSignal | undefined;
   const initialStreamOpts = {
     ...(restStreamOptions ?? {}),
+    abortSignal: callerAbortSignal ? AbortSignal.any([callerAbortSignal, initialAbort.signal]) : initialAbort.signal,
     _skipBgTaskWait: true,
   } as Record<string, any>;
 
@@ -314,6 +362,10 @@ export async function runIdleLoop<
   let closed = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let outerController!: ReadableStreamDefaultController<any>;
+  let wrapperRunId = restStreamOptions.runId as string | undefined;
+  let activeInnerRunId: string | undefined;
+  let continuationAbort: AbortController | undefined;
+  let aborting = false;
   const outerAbort = new AbortController();
 
   // --- Close / idle timer ---
@@ -324,6 +376,7 @@ export async function runIdleLoop<
       clearTimeout(idleTimer);
       idleTimer = undefined;
     }
+    releaseStreamSlot(deps.activeStreams, scopeKey, wrapperRunId, abortWrapper);
     outerAbort.abort();
     try {
       outerController.close();
@@ -331,7 +384,17 @@ export async function runIdleLoop<
       // already closed
     }
     hooks?.onForceClose?.();
-    releaseStreamSlot(deps.activeStreams, scopeKey, forceClose);
+  };
+
+  const abortWrapper = () => {
+    if (closed || aborting) return;
+    aborting = true;
+    releaseStreamSlot(deps.activeStreams, scopeKey, wrapperRunId, abortWrapper);
+    initialAbort.abort();
+    continuationAbort?.abort();
+    hooks?.onAbortActive?.();
+    if (activeInnerRunId) agent.abortRunStream?.(activeInnerRunId);
+    forceClose();
   };
 
   const tryClose = () => {
@@ -359,7 +422,6 @@ export async function runIdleLoop<
     clearIdleTimer();
     if (isProcessing) return;
     if (runningTaskIds.size === 0) return;
-    if (pendingCompletions.length > 0) return;
     idleTimer = setTimeout(forceClose, maxIdleMs);
   };
 
@@ -379,7 +441,9 @@ export async function runIdleLoop<
         }
         if (value && typeof value === 'object' && (value as any).type === 'background-task-started') {
           const taskId = (value as any).payload?.taskId;
-          if (taskId) runningTaskIds.add(taskId);
+          if (taskId) {
+            runningTaskIds.add(taskId);
+          }
         }
       }
     } finally {
@@ -388,7 +452,7 @@ export async function runIdleLoop<
   };
 
   const processIfIdle = async () => {
-    if (isProcessing || closed || pendingCompletions.length === 0) return;
+    if (isProcessing || closed || runningTaskIds.size > 0 || pendingCompletions.length === 0) return;
     isProcessing = true;
     try {
       const batch = pendingCompletions.splice(0, pendingCompletions.length);
@@ -398,9 +462,23 @@ export async function runIdleLoop<
         if (tid && ctype) processedTerminalKeys.add(`${tid}:${ctype}`);
       }
       const continuationOpts = buildContinuationOpts(baseContinuationOpts, restStreamOptions?.context as any[], batch);
+      const segmentAbort = new AbortController();
+      continuationAbort = segmentAbort;
+      activeInnerRunId = undefined;
+      const existingAbortSignal = continuationOpts.abortSignal as AbortSignal | undefined;
+      continuationOpts.abortSignal = existingAbortSignal
+        ? AbortSignal.any([existingAbortSignal, segmentAbort.signal])
+        : segmentAbort.signal;
       const inner = await streamForContinuation(continuationOpts);
+      activeInnerRunId = inner.runId;
       hooks?.onInnerResult?.(inner);
+      if (closed) {
+        hooks?.onAbortActive?.();
+        if (activeInnerRunId) agent.abortRunStream?.(activeInnerRunId);
+        return;
+      }
       await pipeInner(inner.fullStream);
+      if (continuationAbort === segmentAbort) continuationAbort = undefined;
     } catch (err) {
       try {
         outerController.error(err);
@@ -411,7 +489,7 @@ export async function runIdleLoop<
       return;
     } finally {
       isProcessing = false;
-      if (pendingCompletions.length > 0) {
+      if (runningTaskIds.size === 0 && pendingCompletions.length > 0) {
         void processIfIdle();
       } else {
         tryClose();
@@ -421,16 +499,17 @@ export async function runIdleLoop<
   };
 
   // --- Setup ---
-  acquireStreamSlot(deps.activeStreams, scopeKey, forceClose);
+  acquireStreamSlot(deps.activeStreams, scopeKey, abortWrapper);
+  acquireRunStreamSlot(deps.activeStreams, wrapperRunId, abortWrapper);
 
-  streamOptions?.abortSignal?.addEventListener('abort', forceClose);
+  streamOptions?.abortSignal?.addEventListener('abort', abortWrapper, { once: true });
 
   const combinedStream = new ReadableStream<any>({
     start(controller) {
       outerController = controller;
     },
     cancel() {
-      forceClose();
+      abortWrapper();
     },
   });
 
@@ -440,6 +519,7 @@ export async function runIdleLoop<
     threadId,
     resourceId,
     abortSignal: outerAbort.signal,
+    includeExisting: false,
   });
   const bgReader = bgStream.getReader();
   void (async () => {
@@ -472,7 +552,7 @@ export async function runIdleLoop<
         } else if (TERMINAL_BG_CHUNKS.has(chunk.type)) {
           runningTaskIds.delete(taskId);
           pendingCompletions.push(chunk);
-          void processIfIdle();
+          if (runningTaskIds.size === 0) void processIfIdle();
         }
       }
     } catch {
@@ -492,6 +572,11 @@ export async function runIdleLoop<
     forceClose();
     throw err;
   }
+  activeInnerRunId = first.runId;
+  if (!wrapperRunId && first.runId) {
+    wrapperRunId = first.runId;
+    acquireRunStreamSlot(deps.activeStreams, wrapperRunId, abortWrapper);
+  }
   hooks?.onInnerResult?.(first);
 
   void (async () => {
@@ -505,7 +590,7 @@ export async function runIdleLoop<
       }
     }
     isProcessing = false;
-    if (pendingCompletions.length > 0) {
+    if (runningTaskIds.size === 0 && pendingCompletions.length > 0) {
       void processIfIdle();
     } else {
       tryClose();

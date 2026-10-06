@@ -12,6 +12,7 @@ import {
   QUEUE_AGENT_MESSAGE_ROUTE,
   SEND_AGENT_SIGNAL_ROUTE,
   ABORT_AGENT_THREAD_ROUTE,
+  CANCEL_AGENT_PENDING_SIGNALS_ROUTE,
   SUBSCRIBE_AGENT_THREAD_ROUTE,
   GET_PROVIDERS_ROUTE,
   APPROVE_TOOL_CALL_ROUTE,
@@ -37,6 +38,7 @@ import {
   STREAM_UNTIL_IDLE_GENERATE_ROUTE,
   RESUME_STREAM_UNTIL_IDLE_ROUTE,
 } from '../../handlers/agents';
+import { READ_AGENT_PLAN_ROUTE } from '../../handlers/plans';
 import { GET_AGENT_TOOL_ROUTE, EXECUTE_AGENT_TOOL_ROUTE } from '../../handlers/tools';
 import {
   GET_SPEAKERS_ROUTE,
@@ -81,6 +83,7 @@ export const AGENTS_ROUTES: readonly ServerRoute[] = [
   QUEUE_AGENT_MESSAGE_ROUTE,
   SEND_AGENT_SIGNAL_ROUTE,
   ABORT_AGENT_THREAD_ROUTE,
+  CANCEL_AGENT_PENDING_SIGNALS_ROUTE,
   SUBSCRIBE_AGENT_THREAD_ROUTE,
 
   // ============================================================================
@@ -121,6 +124,7 @@ export const AGENTS_ROUTES: readonly ServerRoute[] = [
   // Agent Tool Routes
   // ============================================================================
   GET_AGENT_TOOL_ROUTE,
+  READ_AGENT_PLAN_ROUTE,
 
   // ============================================================================
   // Agent Skill Routes
@@ -164,6 +168,7 @@ export type AgentRoutes = readonly [
   typeof QUEUE_AGENT_MESSAGE_ROUTE,
   typeof SEND_AGENT_SIGNAL_ROUTE,
   typeof ABORT_AGENT_THREAD_ROUTE,
+  typeof CANCEL_AGENT_PENDING_SIGNALS_ROUTE,
   typeof SUBSCRIBE_AGENT_THREAD_ROUTE,
   typeof EXECUTE_AGENT_TOOL_ROUTE,
   typeof APPROVE_TOOL_CALL_ROUTE,
@@ -184,6 +189,7 @@ export type AgentRoutes = readonly [
   typeof UPDATE_AGENT_MODEL_IN_MODEL_LIST_ROUTE,
   typeof ENHANCE_INSTRUCTIONS_ROUTE,
   typeof GET_AGENT_TOOL_ROUTE,
+  typeof READ_AGENT_PLAN_ROUTE,
   typeof GET_AGENT_SKILL_ROUTE,
   typeof GENERATE_SPEECH_ROUTE,
   typeof GENERATE_SPEECH_DEPRECATED_ROUTE,

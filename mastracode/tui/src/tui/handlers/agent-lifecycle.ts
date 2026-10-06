@@ -5,18 +5,20 @@
 import { getCurrentGitBranchAsync } from '@mastra/code-sdk/utils/project';
 import type { GoalEvaluationPayload } from '@mastra/core/stream';
 
+import { finalizeStreamingAssistant } from '../assistant-render-registry.js';
 import { insertChatComponentWithBoundarySpacing } from '../chat-boundary-reconciliation.js';
 import { JudgeDisplayComponent } from '../components/judge-display.js';
 import { GradientAnimator } from '../components/obi-loader.js';
+import { renderStatusAnimationFrame } from '../footer-animation-renderer.js';
+import { switchModeWithPack } from '../model-packs/apply.js';
 import { pruneChatContainer } from '../prune-chat.js';
 import { clearPendingUserMessages, removePendingUserMessage } from '../render-messages.js';
-import { flushRender, requestRender } from '../render-scheduler.js';
+import { flushRender } from '../render-scheduler.js';
 
 import type { EventHandlerContext } from './types.js';
 
 export function handleAgentStart(ctx: EventHandlerContext): void {
   const { state } = ctx;
-  state.goalManager.startActiveTimer();
 
   // Refresh git branch async to avoid blocking the event loop
   getCurrentGitBranchAsync(state.projectInfo.rootPath).then(freshBranch => {
@@ -28,8 +30,7 @@ export function handleAgentStart(ctx: EventHandlerContext): void {
 
   if (!state.gradientAnimator) {
     state.gradientAnimator = new GradientAnimator(() => {
-      ctx.updateStatusLine();
-      requestRender(state);
+      renderStatusAnimationFrame(state, ctx.updateStatusLine);
     });
   }
   state.gradientAnimator.start();
@@ -37,9 +38,6 @@ export function handleAgentStart(ctx: EventHandlerContext): void {
 
 export function handleAgentEnd(ctx: EventHandlerContext): void {
   const { state } = ctx;
-  // Stop the goal active-timer on normal completion too (not just abort/error),
-  // otherwise the elapsed-time display keeps counting while idle between turns.
-  state.goalManager.stopActiveTimer();
   if (state.gradientAnimator) {
     state.gradientAnimator.fadeOut();
   }
@@ -53,8 +51,7 @@ export function handleAgentEnd(ctx: EventHandlerContext): void {
   });
 
   if (state.streamingComponent) {
-    state.streamingComponent = undefined;
-    state.streamingMessage = undefined;
+    finalizeStreamingAssistant(state);
   }
   // Drop the live judge reference so that a continuation turn creates a fresh
   // JudgeDisplayComponent *after* the new streaming text. Without this the
@@ -62,13 +59,13 @@ export function handleAgentEnd(ctx: EventHandlerContext): void {
   // causing the new turn's text to visually overwrite the old text + judge.
   state.activeGoalJudge = undefined;
   state.followUpComponents = [];
+  for (const tool of state.pendingTools.values()) tool.stopLiveUpdates?.();
+  state.idleCounter?.setThinking(false);
   state.pendingTools.clear();
   state.pendingTaskToolIds?.clear();
   pruneChatContainer(state);
   ctx.updateStatusLine();
   flushRender(state);
-
-  ctx.notify('agent_done');
 
   drainQueuedAction(ctx);
 }
@@ -79,7 +76,7 @@ function drainQueuedAction(ctx: EventHandlerContext): boolean {
   // Drain queued follow-up actions once all controller-level follow-ups are done.
   // Each queued action that starts a new agent operation will eventually trigger
   // handleAgentEnd again, which drains the next FIFO item.
-  if (state.session.followUps.count() > 0) {
+  if (state.session.displayState.get().queuedFollowUps > 0) {
     return true;
   }
 
@@ -142,7 +139,6 @@ function drainQueuedAction(ctx: EventHandlerContext): boolean {
 
 export function handleAgentAborted(ctx: EventHandlerContext): void {
   const { state } = ctx;
-  state.goalManager.stopActiveTimer();
   if (state.gradientAnimator) {
     state.gradientAnimator.fadeOut();
   }
@@ -151,19 +147,23 @@ export function handleAgentAborted(ctx: EventHandlerContext): void {
   // The timing line already says "canceled after x", so don't also render a
   // redundant "Error: Interrupted" message in the transcript.
   if (state.planRejectionAbort || state.userInitiatedAbort) {
-    state.streamingComponent = undefined;
-    state.streamingMessage = undefined;
+    finalizeStreamingAssistant(state);
   } else if (state.streamingComponent && state.streamingMessage) {
-    // Update streaming message to show it was interrupted. Terminal status
-    // lives in content.metadata under the DB-native contract.
+    const terminalStatus = { stopReason: 'aborted' as const, errorMessage: 'Interrupted' };
+    const queuedTerminalStatus = state.assistantRenderRegistry.queueActiveTerminalStatus(
+      state.streamingMessage.id,
+      terminalStatus,
+    );
+
+    // Keep the canonical streaming message consistent with the rendered terminal status.
     state.streamingMessage.content.metadata = {
       ...state.streamingMessage.content.metadata,
-      stopReason: 'aborted',
-      errorMessage: 'Interrupted',
+      ...terminalStatus,
     };
-    state.streamingComponent.updateContent(state.streamingMessage);
-    state.streamingComponent = undefined;
-    state.streamingMessage = undefined;
+    if (!queuedTerminalStatus) {
+      state.streamingComponent.updateContent(state.streamingMessage);
+    }
+    finalizeStreamingAssistant(state);
   }
   state.userInitiatedAbort = false;
   state.planRejectionAbort = false;
@@ -178,6 +178,8 @@ export function handleAgentAborted(ctx: EventHandlerContext): void {
   state.pendingSlashCommands = [];
   state.pendingSlashCommandMessageIds = [];
   clearPendingUserMessages(state);
+  for (const tool of state.pendingTools.values()) tool.stopLiveUpdates?.();
+  state.idleCounter?.setThinking(false);
   state.pendingTools.clear();
   state.pendingTaskToolIds?.clear();
   pruneChatContainer(state);
@@ -187,14 +189,12 @@ export function handleAgentAborted(ctx: EventHandlerContext): void {
 
 export function handleAgentError(ctx: EventHandlerContext): void {
   const { state } = ctx;
-  state.goalManager.stopActiveTimer();
   if (state.gradientAnimator) {
     state.gradientAnimator.fadeOut();
   }
 
   if (state.streamingComponent) {
-    state.streamingComponent = undefined;
-    state.streamingMessage = undefined;
+    finalizeStreamingAssistant(state);
   }
   if (state.activeGoalJudge) {
     removeJudgeComponent(state, state.activeGoalJudge.component);
@@ -207,6 +207,8 @@ export function handleAgentError(ctx: EventHandlerContext): void {
   state.pendingSlashCommands = [];
   state.pendingSlashCommandMessageIds = [];
   clearPendingUserMessages(state);
+  for (const tool of state.pendingTools.values()) tool.stopLiveUpdates?.();
+  state.idleCounter?.setThinking(false);
   state.pendingTools.clear();
   state.pendingTaskToolIds?.clear();
   pruneChatContainer(state);
@@ -282,7 +284,11 @@ export function handleGoalEvaluation(ctx: EventHandlerContext, payload: GoalEval
 
   // Mirror the loop's progress into the synchronous adapter view so the status
   // line and modal reflect the latest run count and lifecycle status.
-  state.goalManager.applyEvaluation({ runsUsed: payload.iteration, status: payload.status });
+  state.goalManager.applyEvaluation({
+    runsUsed: payload.iteration,
+    status: payload.status,
+    ...(payload.pausedReason ? { pausedReason: payload.pausedReason } : {}),
+  });
 
   ctx.updateStatusLine();
   flushRender(state);
@@ -298,7 +304,7 @@ export function handleGoalEvaluation(ctx: EventHandlerContext, payload: GoalEval
     if (goal && goal.id === state.planStartedGoalId) {
       const goalId = state.planStartedGoalId;
       state.planStartedGoalId = undefined;
-      state.session.mode.switch({ modeId: 'plan' }).catch(error => {
+      switchModeWithPack(ctx, 'plan').catch(error => {
         ctx.showError(`Failed to switch to Plan mode: ${error instanceof Error ? error.message : String(error)}`);
         state.planStartedGoalId = goalId;
       });

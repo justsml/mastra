@@ -1,4 +1,5 @@
 import { CodeEditor } from '@mastra/playground-ui/components/CodeEditor';
+import { Field, FieldLabel } from '@mastra/playground-ui/components/Field';
 import { Input } from '@mastra/playground-ui/components/Input';
 import { MarkdownRenderer } from '@mastra/playground-ui/components/MarkdownRenderer';
 import { Txt } from '@mastra/playground-ui/components/Txt';
@@ -23,43 +24,36 @@ export function SkillSimpleForm({
   readOnly,
 }: SkillSimpleFormProps) {
   return (
-    <div className="flex flex-col gap-4 h-full">
-      <div className="flex flex-col gap-1.5">
-        <Txt as="label" variant="ui-sm" className="text-neutral3">
-          Name
-        </Txt>
-        <Input value={name} onChange={e => onNameChange(e.target.value)} placeholder="Skill name" disabled={readOnly} />
-      </div>
+    <div className="flex h-full flex-col gap-4">
+      <Field disabled={readOnly}>
+        <FieldLabel>Name</FieldLabel>
+        <Input value={name} onChange={e => onNameChange(e.target.value)} placeholder="Skill name" />
+      </Field>
 
-      <div className="flex flex-col gap-1.5">
-        <Txt as="label" variant="ui-sm" className="text-neutral3">
-          Description
-        </Txt>
+      <Field disabled={readOnly}>
+        <FieldLabel>Description</FieldLabel>
         <Input
           value={description}
           onChange={e => onDescriptionChange(e.target.value)}
           placeholder="Brief description of the skill"
-          disabled={readOnly}
         />
-      </div>
+      </Field>
 
-      <div className="flex flex-col gap-1.5 flex-1 min-h-0">
-        <Txt as="label" variant="ui-sm" className="text-neutral3">
-          Instructions
-        </Txt>
+      <Field className="flex min-h-0 flex-1 flex-col gap-1.5">
+        <FieldLabel>Instructions</FieldLabel>
 
         {readOnly ? (
-          <div className="flex-1 min-h-0 overflow-y-auto rounded-lg border border-border1 bg-surface2 p-4">
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-background p-4">
             {instructions ? (
               <MarkdownRenderer>{instructions}</MarkdownRenderer>
             ) : (
-              <Txt variant="ui-sm" className="text-neutral3 italic">
+              <Txt variant="caption" tone="muted" className="italic">
                 No instructions provided.
               </Txt>
             )}
           </div>
         ) : (
-          <div className="flex-1 min-h-0 flex flex-col">
+          <div className="flex min-h-0 flex-1 flex-col">
             <CodeEditor
               data-testid="skill-instructions-input"
               value={instructions}
@@ -72,7 +66,7 @@ export function SkillSimpleForm({
             />
           </div>
         )}
-      </div>
+      </Field>
     </div>
   );
 }

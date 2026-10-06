@@ -18,10 +18,10 @@ function RecursiveFieldRenderer({
   depth: number;
 }) {
   return (
-    <div className="py-2 ">
+    <div className="py-2">
       <JSONSchemaForm.Field key={field.id} field={field} parentPath={parentPath} depth={depth}>
         <div className="space-y-2 px-2">
-          <div className="flex flex-row gap-4 items-center">
+          <div className="flex flex-row items-center gap-4">
             <JSONSchemaForm.FieldName placeholder="Variable name" className="w-64" />
             <JSONSchemaForm.FieldType placeholder="Type" />
             <JSONSchemaForm.FieldOptional />
@@ -42,7 +42,7 @@ function RecursiveFieldRenderer({
             )}
           </JSONSchemaForm.FieldList>
           <JSONSchemaForm.AddField variant="ghost" size="sm" className="mt-2">
-            <PlusIcon className="w-3 h-3 mr-1" />
+            <PlusIcon className="mr-1 h-3 w-3" />
             Add nested variable
           </JSONSchemaForm.AddField>
         </JSONSchemaForm.NestedFields>
@@ -68,7 +68,7 @@ export function VariablesPage() {
 
   return (
     <ScrollArea className="h-full">
-      <section className="flex flex-col gap-6">
+      <section className="flex flex-col gap-4">
         <div className={readOnly ? 'pointer-events-none opacity-60' : ''}>
           <JSONSchemaForm.Root onChange={handleVariablesChange} defaultValue={initialFields} maxDepth={5}>
             <JSONSchemaForm.FieldList>

@@ -6,11 +6,11 @@ import type { ScorerRunInputForAgent, ScorerRunOutputForAgent } from '../../eval
 import type { ScoringData } from '../../llm/model/base.types';
 import type { VersionOverrides } from '../../mastra/types';
 import { resolveObservabilityContext } from '../../observability';
-import { RequestContext } from '../../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import type { TargetType } from '../../storage/types';
 import type { ToolHooks } from '../../tools/types';
 import type { StepResult, Workflow } from '../../workflows';
-import type { ItemToolMock, ToolMockReport } from './tool-mocks';
+import type { ItemToolMock, ToolMockReport, UnmockedToolPolicy } from './tool-mocks';
 import { ToolMockMatcher } from './tool-mocks';
 
 /**
@@ -45,7 +45,7 @@ export interface ExecutionResult {
   output: unknown;
   /** Structured error if execution failed */
   error: { message: string; stack?: string; code?: string } | null;
-  /** Trace ID from agent/workflow execution (null for scorers or errors) */
+  /** Trace ID from agent/workflow execution (null when execution has no trace identity) */
   traceId: string | null;
   /** Root span ID from agent/workflow execution (null when not traced) */
   spanId?: string | null;
@@ -86,6 +86,7 @@ async function executeScorer(
       output: {
         score,
         reason: typeof result.reason === 'string' ? result.reason : null,
+        ...(result.notScorable ? { notScorable: result.notScorable } : {}),
       },
       error: null,
       traceId: null, // Scorers don't produce traces
@@ -113,6 +114,7 @@ export async function executeTarget(
   target: Target,
   targetType: TargetType,
   item: {
+    id?: string;
     input: unknown;
     groundTruth?: unknown;
     metadata?: Record<string, unknown>;
@@ -126,8 +128,12 @@ export async function executeTarget(
     versions?: VersionOverrides;
     /** Item-level static tool mocks (agent targets only). */
     toolMocks?: ItemToolMock[];
+    /** Handling for agent tool calls not declared in `toolMocks`. */
+    unmockedToolPolicy?: UnmockedToolPolicy;
   },
 ): Promise<ExecutionResult> {
+  let traceId: string | null = null;
+
   try {
     const signal = options?.signal;
 
@@ -147,6 +153,10 @@ export async function executeTarget(
           options?.experimentId,
           options?.versions,
           options?.toolMocks,
+          options?.unmockedToolPolicy,
+          assignedTraceId => {
+            traceId = assignedTraceId;
+          },
         );
         break;
       case 'workflow':
@@ -175,7 +185,7 @@ export async function executeTarget(
         message: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined,
       },
-      traceId: null,
+      traceId,
     };
   }
 }
@@ -214,42 +224,89 @@ function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T>
  */
 async function executeAgent(
   agent: Agent,
-  item: { input: unknown; groundTruth?: unknown },
+  item: { id?: string; input: unknown; groundTruth?: unknown },
   signal?: AbortSignal,
   requestContext?: Record<string, unknown>,
   experimentId?: string,
   versions?: VersionOverrides,
   toolMocks?: ItemToolMock[],
+  unmockedToolPolicy?: UnmockedToolPolicy,
+  onTraceIdAssigned?: (traceId: string) => void,
 ): Promise<ExecutionResult> {
-  const model = await agent.getModel();
+  const reqCtx: RequestContext | undefined = requestContext
+    ? new RequestContext(Object.entries(requestContext))
+    : undefined;
+  const model = await agent.getModel({ requestContext: reqCtx });
 
   // Both generate() and generateLegacy() return different types (FullOutput vs GenerateTextResult)
   // but share the fields we extract. Cast input to MessageListInput at the boundary.
   const input = item.input as MessageListInput;
 
-  const reqCtx: RequestContext | undefined = requestContext
-    ? new RequestContext(Object.entries(requestContext))
+  // Memory-enabled experiment runs need a thread even when the caller provides no
+  // memory identifiers. Use the caller's resource when present; otherwise isolate
+  // every item under an experiment-owned resource so resource-scoped memory cannot
+  // leak context between concurrently evaluated items. Explicit empty/null resource
+  // values retain their previous opt-out behavior, and explicit threads still win.
+  const contextResourceId = requestContext?.[MASTRA_RESOURCE_ID_KEY];
+  const shouldInjectThread =
+    (Boolean(contextResourceId) || contextResourceId === undefined) &&
+    !requestContext?.[MASTRA_THREAD_ID_KEY] &&
+    typeof agent.hasOwnMemory === 'function' &&
+    agent.hasOwnMemory();
+  const injectedThreadId = shouldInjectThread ? globalThis.crypto.randomUUID() : undefined;
+  const memoryOption = injectedThreadId
+    ? {
+        memory: {
+          thread: {
+            id: injectedThreadId,
+            // Tag experimentId (and the item id when known) so a large run's threads
+            // map back to their items without matching transcripts.
+            ...(experimentId || item.id
+              ? {
+                  metadata: {
+                    ...(experimentId ? { experimentId } : {}),
+                    ...(item.id ? { experimentItemId: item.id } : {}),
+                  },
+                }
+              : {}),
+          },
+          resource: contextResourceId
+            ? String(contextResourceId)
+            : `dataset-experiment:${experimentId ?? globalThis.crypto.randomUUID()}:thread:${injectedThreadId}`,
+          // Suppress title generation: these threads are runner bookkeeping, so an
+          // extra title LLM call per item (and per retry) is pure waste (precedent:
+          // ephemeral subagent-delegation threads, issue #18738). lastMessages is
+          // deliberately NOT disabled — it also gates the MessageHistory output
+          // processor, and disabling it would persist every injected thread empty.
+          options: { generateTitle: false },
+        },
+      }
     : undefined;
-
-  // Pass experimentId as tracing metadata so it appears on the AGENT_RUN span
-  const tracingOptions = experimentId ? { metadata: { experimentId } } : undefined;
 
   // Build a fresh matcher per item run so ordered consumption is deterministic and
   // not leaked across retries. Compose with the agent's configured hooks.
-  const matcher = new ToolMockMatcher(toolMocks);
+  const matcher = new ToolMockMatcher(toolMocks, unmockedToolPolicy);
+  const shouldInterceptTools = matcher.hasMocks || matcher.unmockedToolPolicy === 'deny';
 
-  // When the item declares mocks, abort the whole run the instant a mocked tool is
+  // When tool calls are intercepted, abort the whole run the instant a tool is
   // mis-called so the model cannot go on to invoke later (possibly side-effecting,
   // unmocked) tools live. The mock-abort signal is combined with the outer signal.
-  const mockAbort = matcher.hasMocks ? new AbortController() : undefined;
-  const mockHooks = matcher.hasMocks ? buildToolMockHooks(agent, matcher, mockAbort!) : undefined;
+  const mockAbort = shouldInterceptTools ? new AbortController() : undefined;
+  const mockHooks = shouldInterceptTools ? buildToolMockHooks(agent, matcher, mockAbort!) : undefined;
   const generateSignal =
     mockAbort && signal ? AbortSignal.any([signal, mockAbort.signal]) : (mockAbort?.signal ?? signal);
 
   // Force sequential tool execution when mocks exist so the provider's tool-call
   // order equals the execution (and consumption) order — deterministic ordered
   // consumption of repeated (toolName, args) mocks. No cost for mock-free runs.
-  const mockConcurrency = matcher.hasMocks ? { toolCallConcurrency: 1 } : undefined;
+  const mockConcurrency = shouldInterceptTools ? { toolCallConcurrency: 1 } : undefined;
+
+  const assignedTraceId = globalThis.crypto.randomUUID().replaceAll('-', '');
+  onTraceIdAssigned?.(assignedTraceId);
+  const tracingOptions = {
+    traceId: assignedTraceId,
+    ...(experimentId ? { metadata: { experimentId } } : {}),
+  };
 
   let rawResult: unknown;
   try {
@@ -258,8 +315,9 @@ async function executeAgent(
           scorers: {},
           returnScorerData: true,
           abortSignal: generateSignal,
+          ...memoryOption,
           ...(reqCtx ? { requestContext: reqCtx } : {}),
-          ...(tracingOptions ? { tracingOptions } : {}),
+          tracingOptions,
           ...(versions ? { versions } : {}),
           ...(mockHooks ? { hooks: mockHooks } : {}),
           ...(mockConcurrency ?? {}),
@@ -268,17 +326,18 @@ async function executeAgent(
           scorers: {},
           returnScorerData: true,
           abortSignal: generateSignal,
+          ...memoryOption,
           ...(reqCtx ? { requestContext: reqCtx } : {}),
-          ...(tracingOptions ? { tracingOptions } : {}),
+          tracingOptions,
           ...(mockHooks ? { hooks: mockHooks } : {}),
           ...(mockConcurrency ?? {}),
         });
   } catch (error) {
     // A mock failure aborts the run mid-flight: surface the deterministic coded
     // error instead of the raw abort. Any other error rethrows unchanged.
-    const mockReport = matcher.hasMocks ? matcher.report() : undefined;
+    const mockReport = shouldInterceptTools ? matcher.report() : undefined;
     if (mockReport?.failure) {
-      return toolMockFailureResult(mockReport, null);
+      return toolMockFailureResult(mockReport, assignedTraceId);
     }
     throw error;
   }
@@ -289,13 +348,13 @@ async function executeAgent(
   const traceId = result.traceId ?? null;
   const scoringData = result.scoringData;
 
-  const toolMockReport = matcher.hasMocks ? matcher.report() : undefined;
+  const toolMockReport = shouldInterceptTools ? matcher.report() : undefined;
 
   // Fallback for the race where the model finishes a step before the abort
   // propagates: the matcher still recorded the first failure, so fail the item
   // deterministically with the coded error. The mis-called tool never ran live.
   if (toolMockReport?.failure) {
-    return toolMockFailureResult(toolMockReport, traceId);
+    return toolMockFailureResult(toolMockReport, traceId ?? assignedTraceId);
   }
 
   // Only persist fields relevant to experiment evaluation — drop provider metadata,
@@ -329,7 +388,10 @@ function toolMockFailureResult(report: ToolMockReport, traceId: string | null): 
   return {
     output: null,
     error: {
-      message: `Mocked tool "${failure.toolName}" was called with arguments that did not match an available mock (${failure.code}).`,
+      message:
+        failure.code === 'TOOL_MOCK_NOT_DECLARED'
+          ? `Tool "${failure.toolName}" was called without a declared mock (${failure.code}).`
+          : `Mocked tool "${failure.toolName}" was called with arguments that did not match an available mock (${failure.code}).`,
       code: failure.code,
     },
     traceId,
@@ -471,19 +533,27 @@ async function executeWorkflow(
       const suspendedPaths: string[][] = result.suspended ?? [];
       if (suspendedPaths.length === 0) break;
 
-      // For each suspended step, look up resume data
-      const firstSuspendedStep = suspendedPaths[0]?.[0];
-      if (!firstSuspendedStep) break;
+      // An earlier branch without data must not block a later branch with data.
+      // Prefer per-step data over the flat fallback, preserving falsy payloads.
+      let stepToResume: string | undefined;
+      let stepResumeData: unknown;
+      for (const suspendedPath of suspendedPaths) {
+        const suspendedStep = suspendedPath?.[0];
+        if (!suspendedStep) continue;
 
-      // Resolve resume data: per-step map takes precedence, then flat fallback.
-      // Use explicit undefined check so falsy values (null, false, 0) are forwarded.
-      const perStepValue = perStep?.[firstSuspendedStep];
-      const stepResumeData = perStepValue !== undefined ? perStepValue : flat;
-      if (stepResumeData === undefined) break; // No data for this step, stop resuming
+        const perStepValue = perStep?.[suspendedStep];
+        const candidate = perStepValue !== undefined ? perStepValue : flat;
+        if (candidate === undefined) continue;
+
+        stepToResume = suspendedStep;
+        stepResumeData = candidate;
+        break;
+      }
+      if (stepToResume === undefined) break; // No data for any suspended step, stop resuming
 
       result = await run.resume({
         resumeData: stepResumeData,
-        step: firstSuspendedStep,
+        step: stepToResume,
         ...(reqCtx ? { requestContext: reqCtx } : {}),
         ...observabilityContext,
       });

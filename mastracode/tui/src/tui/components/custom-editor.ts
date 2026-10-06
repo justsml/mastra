@@ -67,6 +67,8 @@ export type AppAction =
   | 'undo'
   | 'toggleThinking'
   | 'expandTools'
+  | 'openBackgroundActivityCenter'
+  | 'clearFinishedBackgroundActivities'
   | 'followUp'
   | 'queueFollowUp'
   | 'cycleMode'
@@ -223,9 +225,10 @@ export class CustomEditor extends Editor {
     const text = this.getText().trimStart();
     const isSlash = text.startsWith('/');
     const isAt = text.startsWith('@');
+    const isBang = text.startsWith('!');
     const color = this.getModeColor?.() || mastra.green;
     const promptAnimator = this.getPromptAnimator?.();
-    const shouldAnimatePrompt = !isSlash && !isAt;
+    const shouldAnimatePrompt = !isSlash && !isAt && !isBang;
     const isPromptAnimated = shouldAnimatePrompt && Boolean(promptAnimator?.isRunning());
     const fadeProgress = isPromptAnimated ? promptAnimator!.getFadeProgress() : 1;
     const isTransitioningIn = isPromptAnimated && promptAnimator!.isFadingIn();
@@ -274,11 +277,13 @@ export class CustomEditor extends Editor {
       ? '/'
       : isAt
         ? '@'
-        : chevronBrightness > 0.05
-          ? '›'
-          : dotBrightness > 0.05
-            ? this.promptIcon
-            : ' ';
+        : isBang
+          ? '!'
+          : chevronBrightness > 0.05
+            ? '›'
+            : dotBrightness > 0.05
+              ? this.promptIcon
+              : ' ';
     const promptBrightness = isPromptAnimated ? Math.max(chevronBrightness, dotBrightness) : 1;
 
     // Cache colorFn and prompt — only recreate when color changes
@@ -314,14 +319,14 @@ export class CustomEditor extends Editor {
     // Left: "│ > " (4) or "│   " (4), Right: " │" (2) = 6 chars total
     const promptWidth = 4; // "│ > " or "│   "
     const contentWidth = width - 6;
-    // Slash and mention markers are rendered in the prompt chrome, so remove them
+    // Slash, mention and shell markers are rendered in the prompt chrome, so remove them
     // from the editor's layout state before wrapping and restore the state after.
     const editorState = (
       this as unknown as {
         state: { lines: string[]; cursorLine: number; cursorCol: number };
       }
     ).state;
-    const decorativePrompt = isSlash ? '/' : isAt ? '@' : undefined;
+    const decorativePrompt = isSlash ? '/' : isAt ? '@' : isBang ? '!' : undefined;
     const firstLine = editorState.lines[0];
     const markerIndex = firstLine?.search(/\S/) ?? -1;
     const shouldHideDecorativePrompt =
@@ -390,7 +395,8 @@ export class CustomEditor extends Editor {
     const fullText = this.getText();
     let greyRemaining =
       this.voiceTranscriptText.length > 0 && fullText.endsWith(this.voiceTranscriptText)
-        ? this.voiceTranscriptText.length
+        ? // Count code points to match greyifyTrailing, which consumes per code point.
+          [...this.voiceTranscriptText].length
         : 0;
     const greyOpen = `\x1b[38;2;${parseHex(theme.getTheme().muted).join(';')}m`;
 
@@ -611,7 +617,11 @@ export class CustomEditor extends Editor {
     return true;
   }
 
-  private completeAutocompleteSelection(): boolean {
+  /**
+   * Accept the highlighted autocomplete item, repairing the leading slash that
+   * pi-tui's applyCompletion drops for namespaced commands like `skill/<name>`.
+   */
+  private completeAutocompleteSelection({ appendTrailingSpace = false } = {}): boolean {
     if (!this.isShowingAutocomplete()) {
       return false;
     }
@@ -620,7 +630,12 @@ export class CustomEditor extends Editor {
     super.handleInput('\t');
     const completedText = this.getText();
     if (wasSlashCommand && !completedText.trimStart().startsWith('/')) {
-      this.setText(`/${completedText.trimStart()}`);
+      const repaired = completedText.trimStart();
+      // pi-tui's slash-command branch inserts "<command> " with a trailing space,
+      // but the file-path branch that namespaced commands fall into does not.
+      // Only the Tab path leaves the text in the editor for further typing.
+      const suffix = appendTrailingSpace && !repaired.includes(' ') ? ' ' : '';
+      this.setText(`/${repaired}${suffix}`);
     }
     return wasSlashCommand;
   }
@@ -961,6 +976,22 @@ export class CustomEditor extends Editor {
       }
     }
 
+    if (matchesKey(data, 'ctrl+g')) {
+      const handler = this.actionHandlers.get('openBackgroundActivityCenter');
+      if (handler) {
+        handler();
+        return;
+      }
+    }
+
+    if (matchesKey(data, 'alt+g')) {
+      const handler = this.actionHandlers.get('clearFinishedBackgroundActivities');
+      if (handler) {
+        handler();
+        return;
+      }
+    }
+
     if (matchesKey(data, 'ctrl+f')) {
       const handler = this.actionHandlers.get('queueFollowUp');
       if (handler) {
@@ -999,6 +1030,11 @@ export class CustomEditor extends Editor {
         handler();
         return;
       }
+    }
+
+    if (matchesKey(data, 'tab') && this.isShowingAutocomplete()) {
+      this.completeAutocompleteSelection({ appendTrailingSpace: true });
+      return;
     }
 
     if (matchesKey(data, 'ctrl+y')) {

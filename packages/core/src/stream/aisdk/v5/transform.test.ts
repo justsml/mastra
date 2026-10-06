@@ -458,6 +458,33 @@ describe('convertFullStreamChunkToMastra', () => {
       expect(errorSpy).not.toHaveBeenCalled();
       errorSpy.mockRestore();
     });
+
+    it('does not log the raw input when JSON cannot be repaired', () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const marker = 'SENSITIVE_REPORT_CONTENT';
+      const input = `{"content":"${marker}" garbage ]]`;
+      const chunk: StreamPart = {
+        type: 'tool-call',
+        toolCallId: 'call-7',
+        toolName: 'large_payload_tool',
+        input,
+        providerExecuted: false,
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+      expect(result?.type).toBe('tool-call');
+      if (result?.type === 'tool-call') {
+        expect(result.payload.args).toBeUndefined();
+      }
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(marker);
+      expect(errorSpy.mock.calls[0]?.[1]).toEqual({
+        toolCallId: 'call-7',
+        toolName: 'large_payload_tool',
+        inputLength: input.length,
+      });
+      errorSpy.mockRestore();
+    });
   });
 
   describe('sanitizeToolCallInput', () => {
@@ -613,6 +640,42 @@ describe('convertFullStreamChunkToMastra', () => {
       });
     });
 
+    it('should forward text-delta chunks that only carry providerMetadata', () => {
+      const chunk: StreamPart = {
+        type: 'text-delta',
+        id: 'text-1',
+        delta: '',
+        providerMetadata: {
+          google: { thoughtSignature: 'sig-abc' },
+        },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'text-delta',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: {
+          id: 'text-1',
+          providerMetadata: {
+            google: { thoughtSignature: 'sig-abc' },
+          },
+          text: '',
+        },
+      });
+    });
+
+    it('should drop empty text-delta chunks with no providerMetadata', () => {
+      const chunk: StreamPart = {
+        type: 'text-delta',
+        id: 'text-1',
+        delta: '',
+      };
+
+      expect(convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' })).toBeUndefined();
+    });
+
     it('should handle finish chunks correctly', () => {
       const chunk: StreamPart = {
         type: 'finish',
@@ -642,11 +705,142 @@ describe('convertFullStreamChunkToMastra', () => {
       }
     });
 
+    it('keeps a derived V3 total unknown when input usage is missing', () => {
+      const chunk = {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'end_turn' },
+        usage: {
+          inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 5, text: 5, reasoning: undefined },
+        },
+        messages: { all: [], user: [], nonUser: [] },
+      } as unknown as StreamPart;
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage).toMatchObject({
+          inputTokens: undefined,
+          outputTokens: 5,
+          totalTokens: undefined,
+        });
+      }
+    });
+
+    it('derives a measured V3 total from explicit zero usage', () => {
+      const chunk: StreamPart = {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'end_turn' },
+        usage: {
+          inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 0, text: 0, reasoning: 0 },
+        },
+        messages: { all: [], user: [], nonUser: [] },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.totalTokens).toBe(0);
+      }
+    });
+
+    it('keeps a derived V2 total unknown when output usage is missing', () => {
+      const chunk = {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: undefined, totalTokens: undefined },
+        messages: { all: [], user: [], nonUser: [] },
+      } as unknown as StreamPart;
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.totalTokens).toBeUndefined();
+      }
+    });
+
+    it('preserves an explicit V2 total when an individual count is missing', () => {
+      const chunk = {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: undefined, totalTokens: 12 },
+        messages: { all: [], user: [], nonUser: [] },
+      } as unknown as StreamPart;
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage).toMatchObject({
+          inputTokens: 10,
+          outputTokens: undefined,
+          totalTokens: 12,
+        });
+      }
+    });
+
+    it('should read Anthropic cache creation TTL buckets from the raw API usage', () => {
+      // @ai-sdk/anthropic exposes the split as `cache_creation` on providerMetadata.anthropic.usage
+      // and on usage.raw, never as `cacheCreation`.
+      const cache_creation = { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 6 };
+      const chunk: StreamPart = {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'end_turn' },
+        usage: {
+          inputTokens: { total: 100, noCache: 94, cacheRead: 0, cacheWrite: 6 },
+          outputTokens: { total: 20, text: 20, reasoning: undefined },
+          raw: { input_tokens: 94, output_tokens: 20, cache_creation_input_tokens: 6, cache_creation },
+        },
+        providerMetadata: {
+          anthropic: { cacheCreationInputTokens: 6, usage: { cache_creation_input_tokens: 6, cache_creation } },
+        },
+        messages: { all: [], user: [], nonUser: [] },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.cacheCreationInputTokens).toBe(6);
+        expect(result.payload.output.usage.cacheCreationInputTokens5m).toBe(0);
+        expect(result.payload.output.usage.cacheCreationInputTokens1h).toBe(6);
+      }
+    });
+
+    it('should read Anthropic cache creation TTL buckets from usage.raw without provider metadata', () => {
+      const chunk: StreamPart = {
+        type: 'finish',
+        finishReason: { unified: 'stop', raw: 'end_turn' },
+        usage: {
+          inputTokens: { total: 100, noCache: 94, cacheRead: 0, cacheWrite: 6 },
+          outputTokens: { total: 20, text: 20, reasoning: undefined },
+          raw: { cache_creation: { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 4 } },
+        },
+        messages: { all: [], user: [], nonUser: [] },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.cacheCreationInputTokens5m).toBe(2);
+        expect(result.payload.output.usage.cacheCreationInputTokens1h).toBe(4);
+      }
+    });
+
     it('should preserve providerMetadata for AI SDK v6 finish chunks', () => {
       const providerMetadata = {
         anthropic: {
           cacheReadInputTokens: 94,
           cacheCreationInputTokens: 6,
+          cacheCreation: {
+            ephemeral_5m_input_tokens: 4,
+            ephemeral_1h_input_tokens: 2,
+          },
         },
       };
       const chunk: StreamPart = {
@@ -671,8 +865,46 @@ describe('convertFullStreamChunkToMastra', () => {
         expect(result.payload.stepResult.reason).toBe('stop');
         expect(result.payload.output.usage.cachedInputTokens).toBe(94);
         expect(result.payload.output.usage.cacheCreationInputTokens).toBe(6);
+        expect(result.payload.output.usage.cacheCreationInputTokens5m).toBe(4);
+        expect(result.payload.output.usage.cacheCreationInputTokens1h).toBe(2);
         expect(result.payload.providerMetadata).toEqual(providerMetadata);
         expect(result.payload.metadata.providerMetadata).toEqual(providerMetadata);
+      }
+    });
+
+    it('should unwrap usage and finish reason re-nested by the AI SDK v2 compatibility shim', () => {
+      // Shape produced when ai@7 `wrapLanguageModel` wraps a model that advertises
+      // 'v2' but already emits V3/V4 chunks (e.g. Mastra's model router).
+      const chunk = {
+        type: 'finish',
+        finishReason: { unified: { unified: 'stop', raw: 'STOP' }, raw: undefined },
+        usage: {
+          inputTokens: {
+            total: { total: 17754, noCache: 5950, cacheRead: 12088, cacheWrite: 3 },
+            noCache: undefined,
+            cacheRead: undefined,
+            cacheWrite: undefined,
+          },
+          outputTokens: { total: { total: 20, text: 15, reasoning: 5 }, text: undefined, reasoning: undefined },
+        },
+        providerMetadata: {},
+        messages: { all: [], user: [], nonUser: [] },
+      } as unknown as StreamPart;
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.stepResult.reason).toBe('stop');
+        expect(result.payload.stepResult.rawReason).toBe('STOP');
+        expect(result.payload.output.usage).toMatchObject({
+          inputTokens: 17754,
+          outputTokens: 20,
+          totalTokens: 17774,
+          reasoningTokens: 5,
+          cachedInputTokens: 12088,
+          cacheCreationInputTokens: 3,
+        });
       }
     });
 
@@ -713,6 +945,101 @@ describe('convertFullStreamChunkToMastra', () => {
         expect(result.payload.providerMetadata).toEqual(providerMetadata);
         expect(result.payload.metadata.providerMetadata).toEqual(providerMetadata);
       }
+    });
+  });
+
+  describe('newer AI SDK content types', () => {
+    it('should convert reasoning-file parts instead of dropping them', () => {
+      const chunk: StreamPart = {
+        type: 'reasoning-file',
+        data: 'reasoning-file-data',
+        mediaType: 'application/pdf',
+        providerMetadata: { anthropic: { some: 'meta' } },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'reasoning-file',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: {
+          data: 'reasoning-file-data',
+          base64: 'reasoning-file-data',
+          mimeType: 'application/pdf',
+          providerMetadata: { anthropic: { some: 'meta' } },
+        },
+      });
+    });
+
+    it('should not treat URL-backed reasoning-file data as base64', () => {
+      const chunk: StreamPart = {
+        type: 'reasoning-file',
+        data: 'https://example.com/thoughts.pdf',
+        mediaType: 'application/pdf',
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'reasoning-file',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: {
+          data: 'https://example.com/thoughts.pdf',
+          base64: undefined,
+          mimeType: 'application/pdf',
+        },
+      });
+    });
+
+    it('should convert custom parts instead of dropping them', () => {
+      const chunk: StreamPart = {
+        type: 'custom',
+        kind: 'anthropic.container_upload',
+        providerMetadata: { anthropic: { fileId: 'file_1' } },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'custom',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: {
+          kind: 'anthropic.container_upload',
+          providerMetadata: { anthropic: { fileId: 'file_1' } },
+        },
+      });
+    });
+
+    it('should surface unknown stream part types as raw chunks instead of dropping them', () => {
+      const chunk = { type: 'some-future-part', value: 'do-not-drop-me' } as unknown as StreamPart;
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'raw',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: { type: 'some-future-part', value: 'do-not-drop-me' },
+      });
+    });
+
+    it('should convert raw parts emitted by the generate-to-stream fallback', () => {
+      const chunk: StreamPart = {
+        type: 'raw',
+        rawValue: { type: 'some-future-part', value: 'do-not-drop-me' },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result).toEqual({
+        type: 'raw',
+        runId: 'test-run-123',
+        from: ChunkFrom.AGENT,
+        payload: { type: 'some-future-part', value: 'do-not-drop-me' },
+      });
     });
   });
 });

@@ -1,23 +1,59 @@
 import type { CreatedAgentSignal } from '../agent/signals';
 import { agentThreadStreamRuntime } from '../agent/thread-stream-runtime';
-import type { SendAgentSignalOptions, SendAgentSignalResult } from '../agent/types';
+import type { AgentSignalIfIdleOptions, SendAgentSignalOptions, SendAgentSignalResult } from '../agent/types';
 import type { PubSub } from '../events';
 import type { Mastra } from '../mastra';
+import type { NotificationDeliveryPolicyInput } from './delivery-policy';
+import { resolveDeliveryFailureUpdate } from './delivery-policy';
 import { createNotificationSignal, createNotificationSummarySignal, summarizeNotifications } from './signals';
 import type { NotificationsStorage } from './storage';
-import type { NotificationDeliveryThreadState, NotificationRecord } from './types';
+import type { NotificationDeliveryDecision, NotificationDeliveryThreadState, NotificationRecord } from './types';
 
 type NotificationDispatchAgent = {
   id?: string;
   getPubSub?: () => PubSub | undefined;
   sendSignal: (signal: CreatedAgentSignal, target: SendAgentSignalOptions) => SendAgentSignalResult;
+  resolveNotificationDeliveryDecision?: (
+    input: NotificationDeliveryPolicyInput,
+  ) => Promise<NotificationDeliveryDecision> | NotificationDeliveryDecision;
 };
+
+/**
+ * Deferred deliveries happen long after the originating send, so any stream
+ * options attached to the original signal are gone. Re-run the agent's
+ * delivery policy at delivery time and take the decision's `streamOptions`,
+ * so a woken idle thread carries the request context (e.g. model selection)
+ * it needs to start a run. Only `streamOptions` and `hold` are honored here —
+ * the record's persisted schedule already fixed WHEN and HOW it is delivered.
+ * `hold` leaves the record for another process's dispatcher.
+ * Best-effort: a throwing policy must not turn into a permanent delivery
+ * failure, so fall back to a bare wake.
+ */
+async function resolveDeliveryTimeDecision(
+  mastra: Mastra,
+  agent: NotificationDispatchAgent,
+  input: NotificationDeliveryPolicyInput,
+): Promise<{ streamOptions?: AgentSignalIfIdleOptions['streamOptions']; hold: boolean }> {
+  try {
+    const decision = await agent.resolveNotificationDeliveryDecision?.(input);
+    return { streamOptions: decision?.streamOptions, hold: decision?.hold === true };
+  } catch (error) {
+    mastra
+      .getLogger()
+      ?.warn(
+        `Notification delivery policy failed for thread ${input.record.threadId}; delivering with a bare wake: ${errorMessage(error)}`,
+      );
+    return { hold: false };
+  }
+}
 
 export type DispatchDueNotificationsInput = {
   mastra: Mastra;
   storage: NotificationsStorage;
   now?: Date;
   limit?: number;
+  /** Only dispatch notifications for this resource's threads. */
+  resourceId?: string;
 };
 
 export type DispatchDueNotificationsResult = {
@@ -85,7 +121,7 @@ async function recordDeliveryFailure({
   await storage.updateNotification({
     id: record.id,
     threadId: record.threadId,
-    deliveryAttempts: (record.deliveryAttempts ?? 0) + 1,
+    ...resolveDeliveryFailureUpdate(record),
     lastDeliveryAttemptAt: now,
     lastDeliveryError: errorMessage(error),
   });
@@ -110,15 +146,13 @@ async function sendNotificationRecord({
   if (!current.resourceId) throw new Error(`Notification ${current.id} is missing resourceId`);
 
   const agent = (await mastra.getAgentById(current.agentId as never)) as NotificationDispatchAgent;
-  if (current.priority === 'high' && current.summarySignalId) {
-    const threadState =
-      batchThreadState ??
-      agentThreadStreamRuntime.getThreadState(
-        { resourceId: current.resourceId, threadId: current.threadId },
-        agent.getPubSub?.(),
-      );
-    if (threadState === 'active') return null;
-  }
+  const threadState =
+    batchThreadState ??
+    agentThreadStreamRuntime.getThreadState(
+      { resourceId: current.resourceId, threadId: current.threadId },
+      agent.getPubSub?.(),
+    );
+  if (current.priority === 'high' && current.summarySignalId && threadState === 'active') return null;
 
   const signal = createNotificationSignal({
     ...current,
@@ -126,7 +160,17 @@ async function sendNotificationRecord({
     deliveredAt: now,
     lastDeliveryAttemptAt: now,
   });
-  const target: SendAgentSignalOptions = { resourceId: current.resourceId, threadId: current.threadId };
+  const { streamOptions, hold } = await resolveDeliveryTimeDecision(mastra, agent, {
+    record: current,
+    threadState,
+    now,
+  });
+  if (hold) return null;
+  const target: SendAgentSignalOptions = {
+    resourceId: current.resourceId,
+    threadId: current.threadId,
+    ...(streamOptions ? { ifIdle: { streamOptions } } : {}),
+  };
   const result = agent.sendSignal(signal, target);
   // `accepted` rejects when the signal could not be routed/started (e.g. a
   // misconfigured agent). Let that propagate so the caller records the
@@ -153,18 +197,35 @@ async function sendNotificationSummary({
   storage: NotificationsStorage;
   records: NotificationRecord[];
   now: Date;
-}): Promise<{ records: NotificationRecord[]; signal: CreatedAgentSignal }> {
+}): Promise<{ records: NotificationRecord[]; signal: CreatedAgentSignal } | null> {
   const first = records[0];
   if (!first?.agentId) throw new Error('Notification summary is missing agentId');
   if (!first.resourceId) throw new Error('Notification summary is missing resourceId');
 
-  const agent = await mastra.getAgentById(first.agentId as never);
+  const agent = (await mastra.getAgentById(first.agentId as never)) as NotificationDispatchAgent;
+  const decision = await resolveDeliveryTimeDecision(mastra, agent, {
+    record: first,
+    threadState: agentThreadStreamRuntime.getThreadState(
+      { resourceId: first.resourceId, threadId: first.threadId },
+      agent.getPubSub?.(),
+    ),
+    now,
+  });
+  if (decision.hold) return null;
+  // The all-low-priority batch persists without waking, so it never starts a
+  // run and needs no stream options.
+  const allLowPriority = records.every(record => record.priority === 'low');
+  const streamOptions = allLowPriority ? undefined : decision.streamOptions;
   const summary = summarizeNotifications(records);
   const signal = createNotificationSummarySignal(summary);
-  const target: SendAgentSignalOptions = records.every(record => record.priority === 'low')
+  const target: SendAgentSignalOptions = allLowPriority
     ? { resourceId: first.resourceId, threadId: first.threadId, ifIdle: { behavior: 'persist' } }
-    : { resourceId: first.resourceId, threadId: first.threadId };
-  const result = (agent as NotificationDispatchAgent).sendSignal(signal, target);
+    : {
+        resourceId: first.resourceId,
+        threadId: first.threadId,
+        ...(streamOptions ? { ifIdle: { streamOptions } } : {}),
+      };
+  const result = agent.sendSignal(signal, target);
   // `accepted` rejects when the signal could not be routed/started; let it
   // propagate so the caller records the notifications as failed deliveries.
   await result.accepted;
@@ -204,8 +265,9 @@ export async function dispatchDueNotifications({
   storage,
   now = new Date(),
   limit = 100,
+  resourceId,
 }: DispatchDueNotificationsInput): Promise<DispatchDueNotificationsResult> {
-  const due = await storage.listDueNotifications({ now, limit });
+  const due = await storage.listDueNotifications({ now, limit, ...(resourceId ? { resourceId } : {}) });
   const delivered: NotificationRecord[] = [];
   const failed: Array<{ record: NotificationRecord; error: string }> = [];
   const signals: CreatedAgentSignal[] = [];
@@ -276,6 +338,7 @@ export async function dispatchDueNotifications({
       if (item.type === 'summary') {
         try {
           const result = await sendNotificationSummary({ mastra, storage, records: item.records, now });
+          if (!result) continue;
           delivered.push(...result.records);
           signals.push(result.signal);
         } catch (error) {

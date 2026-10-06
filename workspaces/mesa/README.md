@@ -1,11 +1,11 @@
 # @mastra/mesa
 
-Mesa filesystem provider for Mastra workspaces.
+Store versioned Mastra workspace files in Mesa repositories with standard file operations, commits, branches, diffs, history, and repository status.
 
 ## Installation
 
 ```bash
-npm install @mastra/core @mastra/mesa
+npm install @mastra/mesa
 ```
 
 ## Usage
@@ -13,29 +13,33 @@ npm install @mastra/core @mastra/mesa
 ```typescript
 import { Agent } from '@mastra/core/agent';
 import { Workspace } from '@mastra/core/workspace';
-import { MesaFilesystem } from '@mastra/mesa';
+import { MesaFilesystem, repo } from '@mastra/mesa';
 
 const workspace = new Workspace({
   filesystem: new MesaFilesystem({
-    apiKey: process.env.MESA_API_KEY,
-    org: 'acme',
-    repos: [{ name: 'docs', bookmark: 'main' }],
+    privateKey: process.env.MESA_PRIVATE_KEY,
+    authors: [{ name: 'My Agent', email: 'agent@example.com' }],
+    layout: {
+      '/docs': repo('docs', { mode: 'rw', at: { bookmark: 'main' } }),
+    },
   }),
 });
 
 const agent = new Agent({
   name: 'my-agent',
-  model: '__GATEWAY_ANTHROPIC_MODEL_OPUS__',
+  model: 'anthropic/claude-opus-4-7',
   workspace,
 });
 ```
 
-Filesystem methods expect absolute paths rooted at the Mesa mount. Include the org slug and repo name:
+## Documentation
 
-```typescript
-await workspace.filesystem.readFile('/acme/docs/README.md');
-```
+- [Mesa](https://mastra.ai/integrations/file-storage/mesa)
 
-## License
+## Changelog
 
-Apache-2.0
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/workspaces/mesa/CHANGELOG.md) for version history and release notes.
+
+## Support
+
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

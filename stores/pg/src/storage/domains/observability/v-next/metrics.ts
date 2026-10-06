@@ -25,6 +25,7 @@ import type {
 } from '@mastra/core/storage';
 
 import type { DbClient } from '../../../client';
+import { toPgJson } from '../../../db/sanitize-json';
 import { qualifiedTable, TABLE_METRIC_EVENTS } from './ddl';
 import { applyCommonFilters, applySingleOrArrayFilter, newFilterAccumulator, whereOrEmpty } from './filters';
 import { metricRecordToRow, rowToMetricRecord } from './helpers';
@@ -60,13 +61,14 @@ function applyMetricFilters(
   filters: Record<string, any> | undefined,
 ): void {
   applyCommonFilters(acc, filters);
+  applySingleOrArrayFilter(acc, 'traceId', filters?.traceIds);
   applySingleOrArrayFilter(acc, 'name', filters?.name);
   applySingleOrArrayFilter(acc, 'provider', filters?.provider);
   applySingleOrArrayFilter(acc, 'model', filters?.model);
   applySingleOrArrayFilter(acc, 'costUnit', filters?.costUnit);
   if (filters?.labels) {
     acc.conditions.push(`"labels" @> $${acc.next++}::jsonb`);
-    acc.params.push(JSON.stringify(filters.labels));
+    acc.params.push(toPgJson(filters.labels));
   }
 }
 

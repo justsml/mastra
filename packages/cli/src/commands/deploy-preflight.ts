@@ -4,19 +4,37 @@ import { join } from 'node:path';
 
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
+import type { DatabaseKind } from './db/platform-api.js';
 import { DB_ENV_VAR_NAMES } from './db/platform-api.js';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
 /* ------------------------------------------------------------------ */
 
-export type PreflightIssueCode = 'MISSING_ENV_VAR' | 'LOCAL_STORAGE_PATH';
+export type PreflightIssueCode = 'MISSING_ENV_VAR' | 'LOCALHOST_ENV_VAR' | 'LOCAL_STORAGE_PATH';
+
+/**
+ * Structured hint describing how deploy can offer to auto-fix an issue
+ * before it becomes a blocking error. Consumed by
+ * `deploy/auto-provision-database.ts` when running in an interactive TTY.
+ */
+export type PreflightAutofix = {
+  kind: 'create-managed-database';
+  provider: DatabaseKind;
+  envVarName: string;
+};
 
 export interface PreflightIssue {
   code: PreflightIssueCode;
   severity: 'error' | 'warning';
   message: string;
-  fix: string;
+  /**
+   * Remediation. A single string renders as one arrow line; an array renders
+   * as one arrow line per entry so multi-step fixes (run this command, OR set
+   * this env var) stay legible instead of collapsing into a wall of text.
+   */
+  fix: string | string[];
+  autofix?: PreflightAutofix;
 }
 
 /* ------------------------------------------------------------------ */
@@ -104,6 +122,14 @@ const LOCAL_PATHS_METADATA_FILE = 'preflight-local-paths.json';
 /** Unified metadata file emitted by newer deployers. */
 const PREFLIGHT_METADATA_FILE = 'preflight-metadata.json';
 
+/**
+ * Statically-extracted `backgroundTasks` manifest emitted by newer deployers.
+ * When present with `enabled: true`, the deployed API needs a `REDIS_URL`
+ * so the platform can spin up a worker service alongside it — the worker
+ * shares the API's `REDIS_URL` for job coordination.
+ */
+const WORKERS_MANIFEST_FILE = 'workers.json';
+
 /* ------------------------------------------------------------------ */
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
@@ -141,9 +167,29 @@ export async function preflightBuildOutput(
      *   severity falls back to `hasEnvFile`.
      */
     managedEnvVarNames?: string[] | null;
+    /**
+     * User-facing name of the environment being deployed to (`production`,
+     * `staging`, etc.) — threaded into remediation text so the printed
+     * `mastra env db create <env> --kind ...` reads like a command a human
+     * would type. NOT the slug: on some platforms the production env's slug
+     * is derived from the project name (e.g. `my-app-xyz-1234`), which the
+     * platform's env-resolver accepts but is jarring to see printed back.
+     * The env-resolver accepts id, name, or slug, so name is safe.
+     * Omit for lint / studio contexts.
+     */
+    environmentName?: string;
+    /**
+     * Whether this deploy path can provision a dedicated worker service from
+     * the build's `workers.json` manifest. Only the unified `mastra deploy`
+     * (environment) flow passes true — legacy `studio deploy`/`server deploy`
+     * strip the manifest from their artifacts and run workers in-process, so
+     * surfacing a workers-need-REDIS_URL issue there would be noise.
+     * Defaults to false.
+     */
+    checkWorkers?: boolean;
   } = {},
 ): Promise<PreflightIssue[]> {
-  const { hasEnvFile = true, managedEnvVarNames } = options;
+  const { hasEnvFile = true, managedEnvVarNames, environmentName, checkWorkers = false } = options;
   const outputDir = join(targetDir, '.mastra', 'output');
   const entryPath = join(outputDir, 'index.mjs');
 
@@ -175,7 +221,18 @@ export async function preflightBuildOutput(
   // plugin `mastra-local-storage-detector` runs during bundling and only
   // reports paths from user modules (not node_modules) that survived
   // tree-shaking, so library examples are structurally excluded.
-  issues.push(...(await checkLocalStoragePaths(outputDir, metadata, envVars, hasEnvFile, managedEnvVarNames)));
+  issues.push(
+    ...(await checkLocalStoragePaths(outputDir, metadata, envVars, hasEnvFile, managedEnvVarNames, environmentName)),
+  );
+
+  // Background workers need a REDIS_URL to coordinate with the API service.
+  // If the extracted manifest says workers are enabled but no REDIS_URL is
+  // in scope, surface a missing-env-var issue with the same `redis` autofix
+  // used elsewhere so `maybeAutoProvisionDatabases` can offer inline attach.
+  // Opt-in: only the unified deploy flow provisions workers.
+  if (checkWorkers) {
+    issues.push(...(await checkWorkersNeedRedis(outputDir, envVars, managedEnvVarNames)));
+  }
 
   return issues;
 }
@@ -219,12 +276,17 @@ export async function printPreflightIssues(
   const errors = issues.filter(i => i.severity === 'error');
   const warnings = issues.filter(i => i.severity === 'warning');
 
+  const renderFix = (fix: string | string[]): string => {
+    const steps = Array.isArray(fix) ? fix : [fix];
+    return steps.map(step => `  ${pc.dim('→')} ${step}`).join('\n');
+  };
+
   for (const issue of warnings) {
-    p.log.warn(`${pc.yellow(`[${issue.code}]`)} ${issue.message}\n  ${pc.dim('→')} ${issue.fix}`);
+    p.log.warn(`${pc.yellow(`[${issue.code}]`)} ${issue.message}\n${renderFix(issue.fix)}`);
   }
 
   for (const issue of errors) {
-    p.log.error(`${pc.red(`[${issue.code}]`)} ${issue.message}\n  ${pc.dim('→')} ${issue.fix}`);
+    p.log.error(`${pc.red(`[${issue.code}]`)} ${issue.message}\n${renderFix(issue.fix)}`);
   }
 
   if (errors.length > 0) {
@@ -315,31 +377,215 @@ function isPlatformProvidedEnvVar(name: string): boolean {
   return ENV_VAR_ALLOWLIST_EXACT.has(name) || ENV_VAR_ALLOWLIST_PREFIXES.some(prefix => name.startsWith(prefix));
 }
 
+/**
+ * True when a connection-string value points at the local machine
+ * (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`). Such values work in local dev
+ * but can never be reached from the deployed server, so preflight treats a
+ * provider-known env var carrying one as effectively unusable. Values that
+ * don't parse as URLs are left alone — we only flag what we can read.
+ */
+export function isLocalhostUrl(value: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(value).hostname;
+  } catch {
+    return false;
+  }
+  // URL wraps IPv6 hostnames in brackets ("[::1]").
+  const host = hostname.replace(/^\[|\]$/g, '');
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === '::1' ||
+    host === '0.0.0.0' ||
+    host.startsWith('127.')
+  );
+}
+
+/**
+ * The host (hostname + port) of a localhost URL, safe to echo in warnings.
+ * Never returns credentials — connection strings can carry passwords and
+ * preflight output lands in CI logs. Only called on values that already
+ * passed {@link isLocalhostUrl}, so the URL parse cannot fail.
+ */
+function localhostHostOf(value: string): string {
+  return new URL(value).host;
+}
+
+function isUsableEnvVarValue(name: string, value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return false;
+  if (!dbAutofixFor(name)) return true;
+
+  try {
+    new URL(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function checkEnvVarNames(
   referenced: Iterable<string>,
   envVars: Record<string, string>,
   managedEnvVarNames?: string[] | null,
 ): PreflightIssue[] {
-  const provided = new Set(Object.keys(envVars));
+  const provided = new Set(
+    Object.entries(envVars)
+      .filter(([name, value]) => isUsableEnvVarValue(name, value))
+      .map(([name]) => name),
+  );
   const managed = new Set(managedEnvVarNames ?? []);
   const missing: string[] = [];
+  const issues: PreflightIssue[] = [];
 
   for (const name of new Set(referenced)) {
-    if (provided.has(name)) continue;
+    if (provided.has(name)) {
+      // Present but pointing at the local machine: the value works in dev
+      // but can't be reached from the deployed server. Only flagged for
+      // provider-known vars (where we can offer a managed replacement) and
+      // only when no managed database already injects the var at deploy
+      // time (managed values win the platform's env merge, so a localhost
+      // value in the env file is then harmless).
+      const autofix = dbAutofixFor(name);
+      if (autofix && !managed.has(name) && isLocalhostUrl(envVars[name]!)) {
+        issues.push({
+          code: 'LOCALHOST_ENV_VAR',
+          severity: 'warning',
+          // Only the host is echoed — connection URLs can carry credentials,
+          // and preflight warnings end up in CI logs.
+          message: `${name} in the env file being deployed points at localhost (${localhostHostOf(envVars[name]!)}) — the deployed server won't be able to reach it.`,
+          fix: SELF_SERVE_DB_KINDS.has(autofix.provider)
+            ? `Point ${name} at a hosted ${autofix.provider} instance, or let \`mastra deploy\` provision a managed ${autofix.provider} for this environment.`
+            : `Point ${name} at a hosted ${autofix.provider} instance.`,
+          autofix,
+        });
+      }
+      continue;
+    }
     if (managed.has(name)) continue;
     if (isPlatformProvidedEnvVar(name)) continue;
     missing.push(name);
   }
 
-  if (missing.length === 0) return [];
+  if (missing.length === 0) return issues;
 
   missing.sort();
+
+  // Split provider-known env vars into their own MISSING_ENV_VAR issues so we
+  // can attach an autofix hint (`create-managed-database`) — the deploy command
+  // then offers inline provisioning. Everything else stays in the single
+  // aggregated text warning.
+  const unprovisioned: string[] = [];
+  for (const name of missing) {
+    const autofix = dbAutofixFor(name);
+    if (autofix) {
+      issues.push({
+        code: 'MISSING_ENV_VAR',
+        severity: 'warning',
+        message: `Build references ${name} but the env file being deployed does not provide it.`,
+        fix: SELF_SERVE_DB_KINDS.has(autofix.provider)
+          ? `Add ${name} to your env file, or let \`mastra deploy\` provision a managed ${autofix.provider} for this environment.`
+          : `Add ${name} to your env file.`,
+        autofix,
+      });
+    } else {
+      unprovisioned.push(name);
+    }
+  }
+
+  if (unprovisioned.length > 0) {
+    issues.push({
+      code: 'MISSING_ENV_VAR',
+      severity: 'warning',
+      message: `Build references ${unprovisioned.length} env var(s) not in the env file being deployed: ${unprovisioned.join(', ')}`,
+      fix: `Add them to your env file, or confirm your code provides a fallback (e.g. \`process.env.X ?? 'default'\`).`,
+    });
+  }
+
+  return issues;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Check 3 — workers need REDIS_URL                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Whether the deploy env satisfies the Redis requirement for a dedicated
+ * workers service: the platform needs Redis (pub/sub) to coordinate the
+ * worker service with the API. Met when a usable `REDIS_URL` is in the
+ * deploy env or provided by a platform-managed database.
+ */
+export function hasWorkersRedisRequirement(
+  envVars: Record<string, string>,
+  managedEnvVarNames?: string[] | null,
+): boolean {
+  const redisUrl = envVars.REDIS_URL;
+  const managed = new Set(managedEnvVarNames ?? []);
+  return (redisUrl !== undefined && isUsableEnvVarValue('REDIS_URL', redisUrl)) || managed.has('REDIS_URL');
+}
+
+/**
+ * If the build extracted a workers manifest with `enabled: true` but the
+ * deploy env doesn't provide `REDIS_URL` (locally or via a platform-managed
+ * database), surface a missing-env-var warning with the standard `redis`
+ * autofix. `maybeAutoProvisionDatabases` then offers inline attach so the
+ * managed Redis exists before the platform tries to spin up a worker
+ * service against the environment.
+ *
+ * Best-effort: the manifest file is absent for stale builds or older
+ * deployers, in which case the check is skipped (falls through to the
+ * existing `MISSING_ENV_VAR` path if user code references `REDIS_URL`).
+ */
+async function checkWorkersNeedRedis(
+  outputDir: string,
+  envVars: Record<string, string>,
+  managedEnvVarNames?: string[] | null,
+): Promise<PreflightIssue[]> {
+  let raw: string;
+  try {
+    raw = await readFile(join(outputDir, WORKERS_MANIFEST_FILE), 'utf-8');
+  } catch {
+    return [];
+  }
+
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  if (!manifest || typeof manifest !== 'object') return [];
+
+  const workerManifest = manifest as {
+    version?: unknown;
+    enabled?: unknown;
+    orchestration?: { enabled?: unknown };
+    scheduler?: { enabled?: unknown };
+    backgroundTasks?: { enabled?: unknown };
+    custom?: unknown;
+  };
+  const workersEnabled =
+    workerManifest.version === 1
+      ? workerManifest.orchestration?.enabled === true ||
+        workerManifest.scheduler?.enabled === true ||
+        workerManifest.backgroundTasks?.enabled === true ||
+        (Array.isArray(workerManifest.custom) && workerManifest.custom.length > 0)
+      : workerManifest.enabled === true;
+  if (!workersEnabled) return [];
+
+  if (hasWorkersRedisRequirement(envVars, managedEnvVarNames)) return [];
+
+  const autofix = dbAutofixFor('REDIS_URL');
   return [
     {
       code: 'MISSING_ENV_VAR',
       severity: 'warning',
-      message: `Build references ${missing.length} env var(s) not in the env file being deployed: ${missing.join(', ')}`,
-      fix: `Add them to your env file, or confirm your code provides a fallback (e.g. \`process.env.X ?? 'default'\`).`,
+      message:
+        'Background tasks are enabled in this project, but the deploy env has no REDIS_URL — the platform needs Redis to coordinate the worker service with the API.',
+      fix: 'Add REDIS_URL to your env file.',
+      autofix,
     },
   ];
 }
@@ -377,11 +623,48 @@ async function readPreflightMetadata(outputDir: string): Promise<PreflightMetada
  * when the guarded var maps to a known provider (issue 35-B: the remediation
  * previously said "attach a managed database" without ever naming the command).
  */
-export function dbCreateCommandFor(envVarName: string): string {
+export function dbCreateCommandFor(envVarName: string, environmentName?: string): string {
+  // env name goes BEFORE flags because it's a positional argument on
+  // `mastra env db create`, not a flag. Scoping to the target environment
+  // matters after 8816f47: `mastra env db create` with no arg errors in
+  // non-interactive shells when multiple environments exist, which is
+  // exactly where preflight failures land (CI).
+  //
+  // We use the environment NAME (`production`, `staging`), not the platform
+  // slug. On some platforms the production env's slug is derived from the
+  // project name (e.g. `my-app-xyz-1234`) — technically accepted by the
+  // env-resolver (which matches id | name | slug), but jarring to see
+  // printed back and awkward to type. The name is what the user thinks of
+  // as the environment identifier, so that's what we print.
+  const envArg = environmentName ? ` ${environmentName}` : '';
   for (const [kind, names] of Object.entries(DB_ENV_VAR_NAMES)) {
-    if (names.includes(envVarName)) return `mastra env db create --kind ${kind}`;
+    if (names.includes(envVarName)) return `mastra env db create${envArg} --kind ${kind}`;
   }
-  return 'mastra env db create';
+  return `mastra env db create${envArg}`;
+}
+
+/**
+ * If `envVarName` is injected by a known managed database provider, return
+ * the structured autofix hint deploy uses to offer inline provisioning.
+ * Returns undefined for env vars that don't map to a provider — those still
+ * get a text-only fix.
+ */
+/**
+ * Kinds users can self-serve today via `mastra env db create`. Managed redis
+ * exists behind a platform feature flag but isn't released yet, so printed
+ * remediation text must not advertise it. The structured `redis` autofix is
+ * still emitted: `maybeAutoProvisionDatabases` consults the platform's
+ * per-org provider catalog before offering it, so gated orgs never see it.
+ */
+export const SELF_SERVE_DB_KINDS: ReadonlySet<DatabaseKind> = new Set(['turso', 'neon', 'postgres']);
+
+export function dbAutofixFor(envVarName: string): PreflightAutofix | undefined {
+  for (const [kind, names] of Object.entries(DB_ENV_VAR_NAMES) as [DatabaseKind, string[]][]) {
+    if (names.includes(envVarName)) {
+      return { kind: 'create-managed-database', provider: kind, envVarName };
+    }
+  }
+  return undefined;
 }
 
 async function checkLocalStoragePaths(
@@ -390,6 +673,7 @@ async function checkLocalStoragePaths(
   envVars: Record<string, string>,
   hasEnvFile: boolean,
   managedEnvVarNames?: string[] | null,
+  environmentName?: string,
 ): Promise<PreflightIssue[]> {
   let detections: LocalStorageDetection[];
   if (metadata) {
@@ -451,19 +735,43 @@ async function checkLocalStoragePaths(
         // Full env picture: local env file + stored vars + managed names.
         // The guard var is genuinely absent, so the local fallback WILL be
         // used at runtime — trustworthy hard error.
+        const autofix = dbAutofixFor(d.guardedBy);
+        // Only recommend `mastra env db create` when we recognize the guard
+        // var as belonging to a managed provider we can actually provision.
+        // Suggesting the command for arbitrary vars (e.g. MY_CUSTOM_DB_URL)
+        // would tell users to spin up infra that can't inject their var.
+        const envVarFix = `Set ${d.guardedBy} in your env file or the environment's stored vars`;
         issues.push({
           code: 'LOCAL_STORAGE_PATH',
           severity: 'error',
           message: `${truncate(d.value, 80)} will be used at runtime because ${d.guardedBy} is not set (${d.hint})`,
-          fix: `Set ${d.guardedBy} in your env file or the environment's stored vars, or create a managed database that provides it: ${dbCreateCommandFor(d.guardedBy)}`,
+          fix:
+            autofix && SELF_SERVE_DB_KINDS.has(autofix.provider)
+              ? [
+                  `Run \`${dbCreateCommandFor(d.guardedBy, environmentName)}\` to attach a managed database`,
+                  `Or ${envVarFix.charAt(0).toLowerCase()}${envVarFix.slice(1)}`,
+                ]
+              : envVarFix,
+          autofix,
         });
       }
     } else if (hasEnvFile) {
+      const autofix = dbAutofixFor(d.guardedBy);
+      const envVarFix = `Set ${d.guardedBy} in your env file`;
+      const platformFix = `If the platform already injects it, re-run with --skip-preflight`;
       issues.push({
         code: 'LOCAL_STORAGE_PATH',
         severity: 'error',
         message: `${truncate(d.value, 80)} will be used at runtime because ${d.guardedBy} is not set (${d.hint})`,
-        fix: `Set ${d.guardedBy} in your env file, or create a managed database that provides it: ${dbCreateCommandFor(d.guardedBy)}. If the platform already injects it, re-run with --skip-preflight.`,
+        fix:
+          autofix && SELF_SERVE_DB_KINDS.has(autofix.provider)
+            ? [
+                `Run \`${dbCreateCommandFor(d.guardedBy, environmentName)}\` to attach a managed database`,
+                `Or ${envVarFix.charAt(0).toLowerCase()}${envVarFix.slice(1)}`,
+                platformFix,
+              ]
+            : [envVarFix, platformFix],
+        autofix,
       });
     } else {
       issues.push({

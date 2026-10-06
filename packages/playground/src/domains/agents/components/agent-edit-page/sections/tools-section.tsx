@@ -1,6 +1,8 @@
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@mastra/playground-ui/components/Collapsible';
 import { Combobox } from '@mastra/playground-ui/components/Combobox';
+import { Field, FieldError } from '@mastra/playground-ui/components/Field';
 import { ToolsIcon } from '@mastra/playground-ui/icons/ToolsIcon';
+import { useTools } from '@mastra/react/hooks/tools';
 import { ChevronRight } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { Control } from 'react-hook-form';
@@ -9,7 +11,6 @@ import { Controller, useWatch } from 'react-hook-form';
 import type { AgentFormValues, EntityConfig } from '../utils/form-validation';
 import { EntityAccordionItem } from '@/domains/cms';
 import { SectionTitle } from '@/domains/cms/components/section/section-title';
-import { useTools } from '@/domains/tools/hooks/use-all-tools';
 
 interface ToolsSectionProps {
   control: Control<AgentFormValues>;
@@ -38,16 +39,16 @@ export function ToolsSection({ control, error, readOnly = false }: ToolsSectionP
   };
 
   return (
-    <div className="rounded-md border border-border1 bg-surface2">
+    <div className="rounded-md border border-border bg-background">
       <Collapsible open={isOpen} onOpenChange={setIsOpen}>
-        <CollapsibleTrigger className="flex items-center gap-1 w-full p-3 bg-surface3">
-          <ChevronRight className="h-4 w-4 text-neutral3" />
-          <SectionTitle icon={<ToolsIcon className="text-accent6" />}>
-            Tools{count > 0 && <span className="text-neutral3 font-normal">({count})</span>}
+        <CollapsibleTrigger className="flex w-full items-center gap-1 bg-card p-3">
+          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+          <SectionTitle icon={<ToolsIcon className="text-span-tool" />}>
+            Tools{count > 0 && <span className="text-muted-foreground">({count})</span>}
           </SectionTitle>
         </CollapsibleTrigger>
         <CollapsibleContent>
-          <div className="p-3 border-t border-border1">
+          <div className="border-t border-border p-3">
             <Controller
               name="tools"
               control={control}
@@ -83,25 +84,28 @@ export function ToolsSection({ control, error, readOnly = false }: ToolsSectionP
 
                 return (
                   <div className="flex flex-col gap-2">
-                    <Combobox
-                      multiple
-                      options={options}
-                      value={selectedIds}
-                      onValueChange={handleValueChange}
-                      placeholder="Select tools..."
-                      searchPlaceholder="Search tools..."
-                      emptyText="No tools available"
-                      disabled={isLoading || readOnly}
-                      error={error}
-                    />
+                    <Field invalid={Boolean(error)}>
+                      <Combobox
+                        multiple
+                        aria-label="Tools"
+                        options={options}
+                        value={selectedIds}
+                        onValueChange={handleValueChange}
+                        placeholder="Select tools..."
+                        searchPlaceholder="Search tools..."
+                        emptyText="No tools available"
+                        disabled={isLoading || readOnly}
+                      />
+                      <FieldError>{error}</FieldError>
+                    </Field>
                     {selectedOptions.length > 0 && (
-                      <div className="flex flex-col gap-3 mt-2">
+                      <div className="mt-2 flex flex-col gap-3">
                         {selectedOptions.map(tool => (
                           <EntityAccordionItem
                             key={tool.value}
                             id={tool.value}
                             name={tool.label}
-                            icon={<ToolsIcon className="text-accent6" />}
+                            icon={<ToolsIcon className="text-span-tool" />}
                             description={field.value?.[tool.value]?.description || ''}
                             onDescriptionChange={
                               readOnly ? undefined : desc => handleDescriptionChange(tool.value, desc)

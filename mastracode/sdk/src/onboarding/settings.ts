@@ -4,14 +4,30 @@
  * so they carry across threads and restarts.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { MastraBrowser } from '@mastra/core/browser';
 import type { LSPConfig } from '@mastra/core/workspace';
-import { AuthStorage } from '../auth/storage.js';
+import { AuthStorage, PROVIDER_DEFAULT_MODELS } from '../auth/storage.js';
+import {
+  ANTHROPIC_PREFIX,
+  normalizeAnthropicModelId,
+  OPENAI_PREFIX,
+  remapOpenAIModelForCodexOAuth,
+  stripMastraGatewayPrefix,
+} from '../providers/model-ids.js';
 import { buildCodexStagehandFetch, createCodexMiddleware } from '../providers/openai-codex.js';
+import {
+  isThinkingLevelSetting,
+  resolveDefaultThinkingLevel as resolveThinkingDefault,
+  THINKING_LEVEL_VALUES,
+} from '../thinking.js';
+import type { ThinkingLevelSetting, ThinkingLevelSource } from '../thinking.js';
+export { isThinkingLevelSetting, THINKING_LEVEL_VALUES } from '../thinking.js';
+export type { ThinkingLevelSetting, ThinkingLevelSource } from '../thinking.js';
 import { getAppDataDir } from '../utils/project.js';
 import { DEFAULT_STT_PROVIDER, resolveSTTModel } from '../voice/stt-registry.js';
+import { pruneUnknownModePackFallbacks, pruneUnknownPackAccountPreferences } from './packs.js';
 
 /** A saved custom pack — user-defined model selections for each mode. */
 export interface CustomPack {
@@ -30,6 +46,22 @@ export interface CustomProviderSetting {
 
 /** Storage backend type. */
 export type StorageBackend = 'libsql' | 'pg';
+
+/** Experimental agent implementation used by MastraCode. */
+export type ExperimentalAgent = 'durable' | 'evented';
+
+export class ExperimentalAgentSettingsError extends Error {
+  readonly value: unknown;
+
+  constructor(value: unknown, settingsPath?: string) {
+    super(
+      `Invalid "experimentalAgent" setting${settingsPath ? ` in ${settingsPath}` : ''}: ${JSON.stringify(value)}. ` +
+        `Remove the "experimentalAgent" key or set it to "durable", "evented", or null.`,
+    );
+    this.name = 'ExperimentalAgentSettingsError';
+    this.value = value;
+  }
+}
 
 /** LibSQL-specific storage settings. */
 export interface LibSQLStorageSettings {
@@ -72,8 +104,8 @@ export const MEMORY_GATEWAY_PROVIDER = MASTRA_GATEWAY_PROVIDER;
 /** @deprecated Renamed to {@link MASTRA_GATEWAY_DEFAULT_URL}. */
 export const MEMORY_GATEWAY_DEFAULT_URL = MASTRA_GATEWAY_DEFAULT_URL;
 
-/** Valid persisted thinking level values. */
-export type ThinkingLevelSetting = 'off' | 'low' | 'medium' | 'high' | 'xhigh';
+/** Preferred model-independent web search/extract provider. */
+export type WebSearchProviderSetting = 'auto' | 'tavily' | 'parallel';
 
 /** Browser provider type. */
 export type BrowserProvider = 'stagehand' | 'agent-browser';
@@ -109,11 +141,63 @@ export interface VoiceSettings {
 /** Stagehand environment type. */
 export type StagehandEnv = 'LOCAL' | 'BROWSERBASE';
 
+/**
+ * Browser viewport: explicit dimensions, or `'window'` to follow the real
+ * browser window instead of emulating a fixed size.
+ */
+export type BrowserViewport = { width: number; height: number } | 'window';
+
+/** Named viewport sizes offered by `/browser set viewport`. */
+export const VIEWPORT_PRESETS = {
+  desktop: { width: 1280, height: 720 },
+  'desktop-hd': { width: 1920, height: 1080 },
+  laptop: { width: 1440, height: 900 },
+  tablet: { width: 768, height: 1024 },
+  mobile: { width: 390, height: 844 },
+} as const satisfies Record<string, { width: number; height: number }>;
+
+export type ViewportPreset = keyof typeof VIEWPORT_PRESETS;
+
+/**
+ * Largest viewport dimension accepted. Guards against typos that would launch a
+ * browser far larger than any display.
+ */
+const MAX_VIEWPORT_DIMENSION = 10000;
+
+function isValidDimension(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= MAX_VIEWPORT_DIMENSION;
+}
+
+/**
+ * Parse a `WIDTHxHEIGHT` string (e.g. `1280x720`), a preset name, or `window`.
+ * Returns undefined when the input is not a usable viewport.
+ */
+export function parseViewportInput(input: string): BrowserViewport | undefined {
+  const value = input.trim().toLowerCase();
+  if (!value) return undefined;
+  if (value === 'window') return 'window';
+  if (value in VIEWPORT_PRESETS) return { ...VIEWPORT_PRESETS[value as ViewportPreset] };
+
+  const match = /^(\d+)\s*[x×]\s*(\d+)$/.exec(value);
+  if (!match) return undefined;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!isValidDimension(width) || !isValidDimension(height)) return undefined;
+  return { width, height };
+}
+
 /** Stagehand-specific browser settings. */
 export interface StagehandSettings {
   env: StagehandEnv;
   apiKey?: string;
   projectId?: string;
+  /**
+   * Model Stagehand uses for its AI operations, as `provider/model`
+   * (for example `anthropic/claude-sonnet-4-5`). Stagehand resolves the
+   * provider's API key from the environment (`ANTHROPIC_API_KEY`,
+   * `OPENAI_API_KEY`, and so on). Defaults to Stagehand's own default.
+   */
+  model?: string;
   /** Whether to preserve the user data directory after the browser closes. */
   preserveUserDataDir?: boolean;
 }
@@ -132,8 +216,11 @@ export interface BrowserSettings {
   provider: BrowserProvider;
   /** Whether to run headless (no visible browser window). */
   headless: boolean;
-  /** Browser viewport dimensions. */
-  viewport?: { width: number; height: number };
+  /**
+   * Browser viewport dimensions, or `'window'` to disable viewport emulation so
+   * the page follows the real browser window.
+   */
+  viewport?: BrowserViewport;
   /** CDP URL for connecting to an existing browser. */
   cdpUrl?: string;
   /** Path to a Chrome/Chromium user data directory (profile). */
@@ -147,6 +234,8 @@ export interface BrowserSettings {
   /** AgentBrowser-specific settings. */
   agentBrowser?: AgentBrowserSettings;
 }
+
+export type PackAccountPreferences = Record<string, Record<string, string>>;
 
 export interface GlobalSettings {
   // Onboarding tracking
@@ -164,12 +253,31 @@ export interface GlobalSettings {
      * Active model pack ID. Built-in packs use their id directly ("anthropic",
      * "openai"). Custom packs use "custom:<name>".
      * When set, models are resolved from the pack at startup so pack updates
-     * (e.g. new model versions) apply automatically.
-     * Cleared when the user manually overrides via /models (falls back to modeDefaults).
+     * (e.g. new model versions) apply automatically. Built-in packs may layer
+     * explicit modePackOverrides over these defaults.
      */
     activeModelPackId: string | null;
-    /** Explicit per-mode overrides — used when no activeModelPackId is set. */
+    /** Per-mode overrides keyed by built-in pack ID. */
+    modePackOverrides: Record<string, Record<string, string>>;
+    /**
+     * Fallback pack per pack ID (packId → packId; builtin ids and
+     * "custom:<name>" both allowed). When every account serving a pack's
+     * provider is exhausted — or the provider is persistently down — the turn
+     * hops to the fallback pack's model. Chains are allowed; a cycle is
+     * capped at one revisit per cascade, then the error surfaces.
+     */
+    packFallbacks: Record<string, string>;
+    /** Preferred OAuth account by pack ID and resolved model ID. */
+    packAccountPreferences: Record<string, Record<string, string>>;
+    /** Explicit per-mode defaults — used when no activeModelPackId is set. */
     modeDefaults: Record<string, string>;
+    /**
+     * Per-mode reasoning-effort defaults (e.g. { build: "high", plan: "xhigh" }).
+     * Resolved at request time; falls back to `preferences.thinkingLevel` for
+     * modes without an entry. Overridden per-session via /think or the session
+     * settings panel.
+     */
+    modeThinkingDefaults: Record<string, ThinkingLevelSetting>;
     /**
      * Active OM pack ID (e.g. "gemini", "anthropic", "custom").
      * When set, the OM model is resolved from the pack at startup so pack
@@ -223,10 +331,18 @@ export interface GlobalSettings {
     theme: 'auto' | 'dark' | 'light';
     /** Default reasoning effort level used for all threads/models unless overridden in-session. */
     thinkingLevel: ThinkingLevelSetting;
+    /** Whether native subagents are enabled for Mastra Code TUI sessions. */
+    subagentsEnabled: boolean;
     /** When true, components like subagent output collapse to compact summaries on completion. */
     quietMode: boolean;
     /** Maximum quiet-mode detail preview lines for compact tool calls. Set to 0 to hide previews. */
     quietModeMaxToolPreviewLines: number;
+    /**
+     * Default web search/extract provider. `auto` picks the first configured
+     * provider key (Tavily, then Parallel). An explicit provider is only
+     * honored while its API key is configured.
+     */
+    webSearchProvider: WebSearchProviderSetting;
   };
   // Storage backend configuration
   storage: StorageSettings;
@@ -240,18 +356,39 @@ export interface GlobalSettings {
   updateDismissedVersion: string | null;
   // Mastra gateway configuration
   memoryGateway: { baseUrl?: string };
-  // LSP configuration forwarded to the workspace
-  lsp?: LSPConfig;
+  // LSP configuration forwarded to the workspace. Disabled unless the user
+  // opts in with `true` or an LSPConfig object.
+  lsp?: boolean | LSPConfig;
   // Browser automation configuration
   browser: BrowserSettings;
   // Direct TUI `!` shell passthrough configuration
   shellPassthrough: ShellPassthroughSettings;
   // Hold-space voice input configuration
   voice: VoiceSettings;
+  // Raw persisted experimental agent value. Resolve through resolveExperimentalAgent() before use.
+  experimentalAgent: unknown;
+  // Internal load diagnostic retained on clones until the user repairs the setting.
+  _experimentalAgentSettingsPath?: string;
+  // Native background execution for eligible Mastra Code tools
+  backgroundTools: BackgroundToolSettings;
   // Signal routing configuration
   signals: SignalSettings;
+  // Read-only discovery of MCP servers configured by other coding agents
+  mcp: McpDiscoverySettings;
   // Cloud observability configuration (per-resource project IDs; tokens stored in auth.json)
   observability: ObservabilitySettings;
+}
+
+export interface McpDiscoverySettings {
+  /** Reuse top-level MCP servers from ~/.claude.json. */
+  claudeCodeGlobal: boolean;
+  /** Reuse MCP servers from $CODEX_HOME/config.toml or ~/.codex/config.toml. */
+  codexGlobal: boolean;
+}
+
+export interface BackgroundToolSettings {
+  /** Allow eligible Mastra Code tools to accept per-call background execution overrides. */
+  enabled: boolean;
 }
 
 export interface SignalSettings {
@@ -259,6 +396,12 @@ export interface SignalSettings {
   unixSocketPubSub: boolean;
   /** Experimental: enable GitHub PR subscription signals backed by gitcrawl. */
   experimentalGithubSignals: boolean;
+  /** Experimental: enable cross-agent communication (thread ownership advertisement, peer discovery, and agent connection tools). */
+  experimentalCrossAgentSignals: boolean;
+  /** Experimental: give the agent tools to create and manage `/schedules` schedules on its thread. */
+  experimentalScheduleTools: boolean;
+  /** Poll interval for GitHub PR subscriptions. */
+  githubPollIntervalMs: number;
 }
 
 export interface ObservabilityResourceConfig {
@@ -277,6 +420,10 @@ export interface ObservabilitySettings {
 
 /** Auth key prefix for observability tokens stored per-resource in auth.json */
 export const OBSERVABILITY_AUTH_PREFIX = 'observability:';
+
+export const GITHUB_POLL_INTERVAL_DEFAULT_MS = 300_000;
+export const GITHUB_POLL_INTERVAL_MIN_MS = 10_000;
+export const GITHUB_POLL_INTERVAL_MAX_MS = 2_147_483_647;
 
 export const STORAGE_DEFAULTS: StorageSettings = {
   backend: 'libsql',
@@ -300,7 +447,11 @@ const DEFAULTS: GlobalSettings = {
   },
   models: {
     activeModelPackId: null,
+    modePackOverrides: {},
+    packFallbacks: {},
+    packAccountPreferences: {},
     modeDefaults: {},
+    modeThinkingDefaults: {},
     activeOmPackId: null,
     omModelOverride: null,
     observerModelOverride: null,
@@ -317,8 +468,10 @@ const DEFAULTS: GlobalSettings = {
     yolo: null,
     theme: 'auto',
     thinkingLevel: 'off',
+    subagentsEnabled: false,
     quietMode: false,
     quietModeMaxToolPreviewLines: 2,
+    webSearchProvider: 'auto',
   },
   storage: { ...STORAGE_DEFAULTS },
   customModelPacks: [],
@@ -326,21 +479,30 @@ const DEFAULTS: GlobalSettings = {
   modelUseCounts: {},
   updateDismissedVersion: null,
   memoryGateway: {},
-  lsp: {},
+  lsp: false,
   browser: {
     enabled: false,
     provider: 'stagehand',
     headless: false,
-    viewport: { width: 1280, height: 720 },
+    viewport: { ...VIEWPORT_PRESETS.desktop },
     stagehand: { env: 'LOCAL' },
   },
   shellPassthrough: { mode: 'default' },
   voice: { enabled: false, engine: defaultVoiceEngine(), provider: DEFAULT_STT_PROVIDER },
-  signals: { unixSocketPubSub: false, experimentalGithubSignals: false },
+  experimentalAgent: null,
+  backgroundTools: { enabled: false },
+  signals: {
+    unixSocketPubSub: false,
+    experimentalGithubSignals: false,
+    experimentalCrossAgentSignals: false,
+    experimentalScheduleTools: false,
+    githubPollIntervalMs: GITHUB_POLL_INTERVAL_DEFAULT_MS,
+  },
+  mcp: { claudeCodeGlobal: false, codexGlobal: false },
   observability: { resources: {}, localTracing: false },
 };
 
-const THINKING_LEVEL_VALUES: ThinkingLevelSetting[] = ['off', 'low', 'medium', 'high', 'xhigh'];
+export const WEB_SEARCH_PROVIDER_VALUES: WebSearchProviderSetting[] = ['auto', 'tavily', 'parallel'];
 const QUIET_MODE_MAX_TOOL_PREVIEW_LINES_MAX = 8;
 const loadedSignalSettings = new WeakMap<GlobalSettings, SignalSettings>();
 
@@ -356,14 +518,114 @@ function rememberLoadedSettings(settings: GlobalSettings): GlobalSettings {
 function signalSettingsEqual(left: SignalSettings, right: SignalSettings): boolean {
   return (
     left.unixSocketPubSub === right.unixSocketPubSub &&
-    left.experimentalGithubSignals === right.experimentalGithubSignals
+    left.experimentalGithubSignals === right.experimentalGithubSignals &&
+    left.experimentalCrossAgentSignals === right.experimentalCrossAgentSignals &&
+    left.experimentalScheduleTools === right.experimentalScheduleTools &&
+    left.githubPollIntervalMs === right.githubPollIntervalMs
   );
 }
 
+function parseWebSearchProvider(value: unknown): WebSearchProviderSetting {
+  return typeof value === 'string' && WEB_SEARCH_PROVIDER_VALUES.includes(value as WebSearchProviderSetting)
+    ? (value as WebSearchProviderSetting)
+    : DEFAULTS.preferences.webSearchProvider;
+}
+
 function parseThinkingLevel(value: unknown): ThinkingLevelSetting {
-  return typeof value === 'string' && THINKING_LEVEL_VALUES.includes(value as ThinkingLevelSetting)
-    ? (value as ThinkingLevelSetting)
-    : DEFAULTS.preferences.thinkingLevel;
+  return isThinkingLevelSetting(value) ? value : DEFAULTS.preferences.thinkingLevel;
+}
+
+function parseModeThinkingDefaults(value: unknown): Record<string, ThinkingLevelSetting> {
+  if (!value || typeof value !== 'object') return {};
+  const result: Record<string, ThinkingLevelSetting> = {};
+  for (const [mode, level] of Object.entries(value as Record<string, unknown>)) {
+    if (isThinkingLevelSetting(level)) {
+      result[mode] = level;
+    }
+  }
+  return result;
+}
+
+function parseModePackOverrides(value: unknown): Record<string, Record<string, string>> {
+  if (!value || typeof value !== 'object') return {};
+  const result: Record<string, Record<string, string>> = {};
+  for (const [packId, overrides] of Object.entries(value as Record<string, unknown>)) {
+    if (!overrides || typeof overrides !== 'object') continue;
+    const parsedOverrides = Object.fromEntries(
+      Object.entries(overrides as Record<string, unknown>).filter(
+        (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0,
+      ),
+    );
+    if (Object.keys(parsedOverrides).length > 0) result[packId] = parsedOverrides;
+  }
+  return result;
+}
+
+function parsePackFallbacks(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object') return {};
+  const result: Record<string, string> = {};
+  for (const [packId, fallbackId] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof fallbackId === 'string' && fallbackId.length > 0) result[packId] = fallbackId;
+  }
+  return result;
+}
+
+/** Shape-parse + drop entries whose source or target pack no longer exists. */
+function loadPackFallbacks(value: unknown, customModelPacks: Array<{ name: string }>): Record<string, string> {
+  return pruneUnknownModePackFallbacks(parsePackFallbacks(value), customModelPacks);
+}
+
+function parsePackAccountPreferences(value: unknown): Record<string, Record<string, string>> {
+  if (!value || typeof value !== 'object') return {};
+  const result: Record<string, Record<string, string>> = {};
+  for (const [packId, modelPreferences] of Object.entries(value as Record<string, unknown>)) {
+    if (!modelPreferences || typeof modelPreferences !== 'object') continue;
+    const parsed = Object.fromEntries(
+      Object.entries(modelPreferences as Record<string, unknown>).filter(
+        (entry): entry is [string, string] =>
+          entry[0].length > 0 && typeof entry[1] === 'string' && entry[1].length > 0,
+      ),
+    );
+    if (Object.keys(parsed).length > 0) result[packId] = parsed;
+  }
+  return result;
+}
+
+function loadPackAccountPreferences(
+  value: unknown,
+  customModelPacks: CustomPack[],
+  modePackOverrides: Record<string, Record<string, string>>,
+): PackAccountPreferences {
+  return pruneUnknownPackAccountPreferences(parsePackAccountPreferences(value), customModelPacks, modePackOverrides);
+}
+
+/** Move persisted routing choices when re-authentication changes an account instance id. */
+export function migrateAccountPreferences(
+  settings: GlobalSettings,
+  previousAccountId: string,
+  nextAccountId: string,
+): void {
+  if (previousAccountId === nextAccountId) return;
+  for (const modelPreferences of Object.values(settings.models.packAccountPreferences ?? {})) {
+    for (const [modelId, accountInstanceId] of Object.entries(modelPreferences)) {
+      if (accountInstanceId === previousAccountId) modelPreferences[modelId] = nextAccountId;
+    }
+  }
+}
+
+/** Remove persisted routing choices that point at deleted OAuth account instances. */
+export function pruneRemovedAccountPreferences(settings: GlobalSettings, removedAccountIds: Iterable<string>): void {
+  const removed = new Set(removedAccountIds);
+  if (removed.size === 0) return;
+
+  const next: PackAccountPreferences = {};
+  for (const [packId, modelPreferences] of Object.entries(settings.models.packAccountPreferences ?? {})) {
+    const retained = Object.fromEntries(
+      Object.entries(modelPreferences).filter(([, accountInstanceId]) => !removed.has(accountInstanceId)),
+    );
+    if (Object.keys(retained).length > 0) next[packId] = retained;
+  }
+  settings.models.packAccountPreferences = next;
 }
 
 function parseQuietModeMaxToolPreviewLines(value: unknown): number {
@@ -379,7 +641,45 @@ function parsePreferences(rawPreferences: unknown): GlobalSettings['preferences'
     ...DEFAULTS.preferences,
     ...raw,
     thinkingLevel: parseThinkingLevel(raw.thinkingLevel),
+    subagentsEnabled:
+      typeof raw.subagentsEnabled === 'boolean' ? raw.subagentsEnabled : DEFAULTS.preferences.subagentsEnabled,
     quietModeMaxToolPreviewLines: parseQuietModeMaxToolPreviewLines(raw.quietModeMaxToolPreviewLines),
+    webSearchProvider: parseWebSearchProvider(raw.webSearchProvider),
+  };
+}
+
+function parseGithubPollIntervalMs(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULTS.signals.githubPollIntervalMs;
+  const intervalMs = Math.floor(value);
+  if (intervalMs < GITHUB_POLL_INTERVAL_MIN_MS) return DEFAULTS.signals.githubPollIntervalMs;
+  return Math.min(intervalMs, GITHUB_POLL_INTERVAL_MAX_MS);
+}
+
+export function parseExperimentalAgentSetting(value: unknown, settingsPath?: string): ExperimentalAgent | null {
+  if (value === undefined || value === null) return null;
+  if (value === 'durable' || value === 'evented') return value;
+  throw new ExperimentalAgentSettingsError(value, settingsPath);
+}
+
+function loadExperimentalAgentSetting(
+  value: unknown,
+  settingsPath: string,
+): { selection: unknown; settingsPath?: string } {
+  try {
+    return { selection: parseExperimentalAgentSetting(value, settingsPath) };
+  } catch (error) {
+    if (error instanceof ExperimentalAgentSettingsError) {
+      return { selection: error.value, settingsPath };
+    }
+    throw error;
+  }
+}
+
+function parseBackgroundToolSettings(rawBackgroundTools: unknown): BackgroundToolSettings {
+  const raw =
+    rawBackgroundTools && typeof rawBackgroundTools === 'object' ? (rawBackgroundTools as Record<string, unknown>) : {};
+  return {
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULTS.backgroundTools.enabled,
   };
 }
 
@@ -392,6 +692,23 @@ function parseSignalSettings(rawSignals: unknown): SignalSettings {
       typeof raw.experimentalGithubSignals === 'boolean'
         ? raw.experimentalGithubSignals
         : DEFAULTS.signals.experimentalGithubSignals,
+    experimentalCrossAgentSignals:
+      typeof raw.experimentalCrossAgentSignals === 'boolean'
+        ? raw.experimentalCrossAgentSignals
+        : DEFAULTS.signals.experimentalCrossAgentSignals,
+    experimentalScheduleTools:
+      typeof raw.experimentalScheduleTools === 'boolean'
+        ? raw.experimentalScheduleTools
+        : DEFAULTS.signals.experimentalScheduleTools,
+    githubPollIntervalMs: parseGithubPollIntervalMs(raw.githubPollIntervalMs),
+  };
+}
+
+function parseMcpDiscoverySettings(rawMcp: unknown): McpDiscoverySettings {
+  const raw = rawMcp && typeof rawMcp === 'object' ? (rawMcp as Record<string, unknown>) : {};
+  return {
+    claudeCodeGlobal: typeof raw.claudeCodeGlobal === 'boolean' ? raw.claudeCodeGlobal : DEFAULTS.mcp.claudeCodeGlobal,
+    codexGlobal: typeof raw.codexGlobal === 'boolean' ? raw.codexGlobal : DEFAULTS.mcp.codexGlobal,
   };
 }
 
@@ -436,6 +753,31 @@ export function toCustomProviderModelId(providerName: string, modelName: string)
     return trimmedModelName;
   }
   return `${providerId}/${trimmedModelName}`;
+}
+
+/**
+ * The shared gateway catalog namespaces provider keys under their owning
+ * gateway id, so a custom provider's models surface in the `/models` catalog
+ * as `mastracode/<providerId>/<model>` instead of the canonical
+ * `<providerId>/<model>` that model resolution expects. Persisting the
+ * gateway-qualified id verbatim breaks lookup later (the provider is parsed
+ * as `mastracode`). Strip the prefix before saving — but only when the
+ * middle segment matches one of the user's configured custom providers, so
+ * legitimate `mastracode/...` gateway-routed ids are left untouched.
+ */
+export function stripMastraCodeCustomProviderPrefix(
+  modelId: string,
+  customProviders: Array<Pick<CustomProviderSetting, 'name'>>,
+): string {
+  const gatewayPrefix = 'mastracode/';
+  if (!modelId.startsWith(gatewayPrefix)) return modelId;
+
+  const rest = modelId.slice(gatewayPrefix.length);
+  const [providerId, ...modelParts] = rest.split('/');
+  if (!providerId || modelParts.length === 0 || modelParts.some(part => part.length === 0)) return modelId;
+
+  const isCustomProvider = customProviders.some(provider => getCustomProviderId(provider.name) === providerId);
+  return isCustomProvider ? rest : modelId;
 }
 
 export function parseCustomProviders(rawProviders: unknown): CustomProviderSetting[] {
@@ -486,14 +828,69 @@ const BROWSER_PROVIDERS = new Set<BrowserProvider>(['stagehand', 'agent-browser'
 const STAGEHAND_ENVS = new Set<StagehandEnv>(['LOCAL', 'BROWSERBASE']);
 
 /**
+ * Normalize a Stagehand model id, which must be provider-qualified.
+ *
+ * Stagehand reads the segment before the first slash as the provider, so a
+ * bare id like `gpt-4.1` is rejected as an unknown provider and a trailing
+ * slash leaves an empty model name that only fails once a request is made.
+ * Neither is usable, so both are dropped here rather than persisted.
+ *
+ * The provider name itself is checked where the command is issued, which can
+ * name the supported providers in an error; this module is on the startup path
+ * and only imports Stagehand lazily.
+ *
+ * @returns the trimmed model id, or undefined when it is unusable.
+ */
+function parseStagehandModel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const model = value.trim();
+  const separator = model.indexOf('/');
+  if (separator <= 0) return undefined;
+  return model.slice(separator + 1).trim() ? model : undefined;
+}
+
+/**
+ * Validate a viewport read from settings.json, falling back to the default when
+ * it is missing or malformed.
+ */
+function parseStoredViewport(raw: unknown): BrowserViewport {
+  if (raw === 'window') return 'window';
+  if (raw && typeof raw === 'object') {
+    const { width, height } = raw as Record<string, unknown>;
+    if (isValidDimension(width) && isValidDimension(height)) return { width, height };
+  }
+  return { ...VIEWPORT_PRESETS.desktop };
+}
+
+/**
+ * Validate the `lsp` setting from JSON. Accepts both the boolean opt-in/opt-out
+ * form and the full LSPConfig object; anything else is treated as unset.
+ */
+function parseLspSettings(raw: unknown): boolean | LSPConfig | undefined {
+  if (typeof raw === 'boolean') return raw;
+  if (raw && typeof raw === 'object') return raw as LSPConfig;
+  return undefined;
+}
+
+/**
+ * Resolve the effective LSP config. LSP is opt-in: `false` and an absent
+ * setting both mean disabled, `true` means enabled with defaults.
+ */
+export function resolveLspSetting(lsp: boolean | LSPConfig | undefined): LSPConfig | false {
+  if (lsp === true) return {};
+  if (!lsp) return false;
+  return lsp;
+}
+
+/**
  * Deep-merge and validate browser settings from JSON.
  * Explicitly validates types to handle malformed settings.json gracefully.
  */
 function parseBrowserSettings(rawBrowser: unknown): BrowserSettings {
   const raw = rawBrowser && typeof rawBrowser === 'object' ? (rawBrowser as Record<string, unknown>) : {};
-  const rawViewport = raw.viewport && typeof raw.viewport === 'object' ? (raw.viewport as Record<string, unknown>) : {};
   const rawStagehand =
     raw.stagehand && typeof raw.stagehand === 'object' ? (raw.stagehand as Record<string, unknown>) : {};
+  const stagehandModel = parseStagehandModel(rawStagehand.model);
   const rawAgentBrowser =
     raw.agentBrowser && typeof raw.agentBrowser === 'object' ? (raw.agentBrowser as Record<string, unknown>) : {};
 
@@ -508,10 +905,7 @@ function parseBrowserSettings(rawBrowser: unknown): BrowserSettings {
     profile: typeof raw.profile === 'string' && raw.profile.trim() ? raw.profile.trim() : undefined,
     executablePath:
       typeof raw.executablePath === 'string' && raw.executablePath.trim() ? raw.executablePath.trim() : undefined,
-    viewport: {
-      width: typeof rawViewport.width === 'number' ? rawViewport.width : DEFAULTS.browser.viewport!.width,
-      height: typeof rawViewport.height === 'number' ? rawViewport.height : DEFAULTS.browser.viewport!.height,
-    },
+    viewport: parseStoredViewport(raw.viewport),
     scope: typeof raw.scope === 'string' && (raw.scope === 'shared' || raw.scope === 'thread') ? raw.scope : undefined,
     stagehand: {
       env:
@@ -524,6 +918,7 @@ function parseBrowserSettings(rawBrowser: unknown): BrowserSettings {
       ...(typeof rawStagehand.projectId === 'string' && rawStagehand.projectId.trim()
         ? { projectId: rawStagehand.projectId.trim() }
         : {}),
+      ...(stagehandModel ? { model: stagehandModel } : {}),
       ...(typeof rawStagehand.preserveUserDataDir === 'boolean'
         ? { preserveUserDataDir: rawStagehand.preserveUserDataDir }
         : {}),
@@ -618,9 +1013,23 @@ function migrateFromAuth(settingsPath: string): boolean {
   if (existsSync(settingsPath)) {
     try {
       const raw = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const rawCustomPacks: CustomPack[] = Array.isArray(raw.customModelPacks) ? raw.customModelPacks : [];
+      const modePackOverrides = parseModePackOverrides(raw.models?.modePackOverrides);
+      const experimentalAgentSetting = loadExperimentalAgentSetting(raw.experimentalAgent, settingsPath);
       settings = {
         onboarding: { ...DEFAULTS.onboarding, ...raw.onboarding },
-        models: { ...DEFAULTS.models, ...raw.models },
+        models: {
+          ...DEFAULTS.models,
+          ...raw.models,
+          modePackOverrides,
+          modeThinkingDefaults: parseModeThinkingDefaults(raw.models?.modeThinkingDefaults),
+          packFallbacks: loadPackFallbacks(raw.models?.packFallbacks, rawCustomPacks),
+          packAccountPreferences: loadPackAccountPreferences(
+            raw.models?.packAccountPreferences,
+            rawCustomPacks,
+            modePackOverrides,
+          ),
+        },
         preferences: parsePreferences(raw.preferences),
         storage: {
           ...STORAGE_DEFAULTS,
@@ -633,11 +1042,15 @@ function migrateFromAuth(settingsPath: string): boolean {
         modelUseCounts: raw.modelUseCounts && typeof raw.modelUseCounts === 'object' ? raw.modelUseCounts : {},
         updateDismissedVersion: typeof raw.updateDismissedVersion === 'string' ? raw.updateDismissedVersion : null,
         memoryGateway: raw.memoryGateway && typeof raw.memoryGateway === 'object' ? raw.memoryGateway : {},
-        lsp: raw.lsp && typeof raw.lsp === 'object' ? (raw.lsp as LSPConfig) : undefined,
+        lsp: parseLspSettings(raw.lsp),
         browser: parseBrowserSettings(raw.browser),
         shellPassthrough: parseShellPassthroughSettings(raw.shellPassthrough),
         voice: parseVoiceSettings(raw.voice),
+        experimentalAgent: experimentalAgentSetting.selection,
+        _experimentalAgentSettingsPath: experimentalAgentSetting.settingsPath,
+        backgroundTools: parseBackgroundToolSettings(raw.backgroundTools),
         signals: parseSignalSettings(raw.signals),
+        mcp: parseMcpDiscoverySettings(raw.mcp),
         observability: parseObservabilitySettings(raw.observability),
       };
       applyQuietModePreferenceRollout(settings, raw.onboarding);
@@ -680,7 +1093,7 @@ function migrateFromAuth(settingsPath: string): boolean {
     delete authData[key];
   }
   try {
-    writeFileSync(authPath, JSON.stringify(authData, null, 2), 'utf-8');
+    writeFileAtomically(authPath, JSON.stringify(authData, null, 2));
   } catch {
     // Non-fatal — settings are saved, auth cleanup can fail
   }
@@ -738,12 +1151,26 @@ export function loadSettings(filePath: string = getSettingsPath()): GlobalSettin
   if (!existsSync(filePath)) return rememberLoadedSettings(getNewInstallDefaults());
   try {
     const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    const rawCustomPacks: CustomPack[] = Array.isArray(raw.customModelPacks) ? raw.customModelPacks : [];
+    const modePackOverrides = parseModePackOverrides(raw.models?.modePackOverrides);
+    const experimentalAgentSetting = loadExperimentalAgentSetting(raw.experimentalAgent, filePath);
     // Spread raw first to preserve unknown top-level keys (forward-compatibility),
     // then overlay with parsed/typed fields so known keys are always correct.
     const settings: GlobalSettings = {
       ...raw,
       onboarding: { ...DEFAULTS.onboarding, ...raw.onboarding },
-      models: { ...DEFAULTS.models, ...raw.models },
+      models: {
+        ...DEFAULTS.models,
+        ...raw.models,
+        modePackOverrides,
+        modeThinkingDefaults: parseModeThinkingDefaults(raw.models?.modeThinkingDefaults),
+        packFallbacks: loadPackFallbacks(raw.models?.packFallbacks, rawCustomPacks),
+        packAccountPreferences: loadPackAccountPreferences(
+          raw.models?.packAccountPreferences,
+          rawCustomPacks,
+          modePackOverrides,
+        ),
+      },
       preferences: parsePreferences(raw.preferences),
       storage: {
         ...STORAGE_DEFAULTS,
@@ -756,11 +1183,15 @@ export function loadSettings(filePath: string = getSettingsPath()): GlobalSettin
       modelUseCounts: raw.modelUseCounts && typeof raw.modelUseCounts === 'object' ? raw.modelUseCounts : {},
       updateDismissedVersion: typeof raw.updateDismissedVersion === 'string' ? raw.updateDismissedVersion : null,
       memoryGateway: raw.memoryGateway && typeof raw.memoryGateway === 'object' ? raw.memoryGateway : {},
-      lsp: raw.lsp && typeof raw.lsp === 'object' ? (raw.lsp as LSPConfig) : undefined,
+      lsp: parseLspSettings(raw.lsp),
       browser: parseBrowserSettings(raw.browser),
       shellPassthrough: parseShellPassthroughSettings(raw.shellPassthrough),
       voice: parseVoiceSettings(raw.voice),
+      experimentalAgent: experimentalAgentSetting.selection,
+      _experimentalAgentSettingsPath: experimentalAgentSetting.settingsPath,
+      backgroundTools: parseBackgroundToolSettings(raw.backgroundTools),
       signals: parseSignalSettings(raw.signals),
+      mcp: parseMcpDiscoverySettings(raw.mcp),
       observability: parseObservabilitySettings(raw.observability),
     };
 
@@ -790,6 +1221,7 @@ export function loadSettings(filePath: string = getSettingsPath()): GlobalSettin
 }
 
 export const THREAD_ACTIVE_MODEL_PACK_ID_KEY = 'activeModelPackId';
+export const THREAD_FALLBACK_STATUS_KEY = 'mastracodeFallbackStatus';
 
 export interface ThreadSettings {
   activeModelPackId: string | null;
@@ -872,6 +1304,30 @@ export function resolveThreadActiveModelPackId(
  * @param builtinPacks  Built-in packs for the current provider access
  *                      (from `getAvailableModePacks`). Pass `[]` if unavailable.
  */
+export function resolveModePackModels(
+  settings: GlobalSettings,
+  pack: { id: string; models: Record<string, string> },
+): Record<string, string> {
+  if (pack.id.startsWith('custom:') || pack.id === 'custom') return pack.models;
+  return { ...pack.models, ...settings.models.modePackOverrides?.[pack.id] };
+}
+
+/**
+ * Resolve a session's explicitly active pack when its mode model still matches.
+ * Model matching alone is not pack identity: multiple packs may intentionally
+ * use the same model, and inference would attach an unrelated fallback chain.
+ */
+export function findModePackForModel(
+  settings: GlobalSettings,
+  packs: Array<{ id: string; models: Record<string, string> }>,
+  modelId: string,
+  modeId: string,
+  activePackId: string | undefined,
+): { id: string; models: Record<string, string> } | undefined {
+  const activePack = packs.find(pack => pack.id === activePackId);
+  return activePack && resolveModePackModels(settings, activePack)[modeId] === modelId ? activePack : undefined;
+}
+
 export function resolveModelDefaults(
   settings: GlobalSettings,
   builtinPacks: Array<{ id: string; models: Record<string, string> }>,
@@ -890,10 +1346,33 @@ export function resolveModelDefaults(
 
   // Built-in pack
   const builtin = builtinPacks.find(p => p.id === activeModelPackId);
-  if (builtin) return builtin.models;
+  if (builtin) return resolveModePackModels(settings, builtin);
 
   // Unknown pack id — fall through
   return modeDefaults;
+}
+
+/**
+ * Resolve the default reasoning-effort level for a mode.
+ *
+ * Lookup order:
+ *   1. `models.modeThinkingDefaults[mode]` when set for the mode.
+ *   2. The global `preferences.thinkingLevel`.
+ *
+ * Session-level overrides (via /think or the session settings panel) take
+ * precedence over both and are handled by the caller.
+ */
+export function resolveDefaultThinkingLevel(
+  settings: GlobalSettings,
+  mode?: string | null,
+): { level: ThinkingLevelSetting; source: ThinkingLevelSource } {
+  return resolveThinkingDefault(
+    {
+      globalDefault: settings.preferences.thinkingLevel,
+      modeDefaults: settings.models.modeThinkingDefaults,
+    },
+    mode,
+  );
 }
 
 /**
@@ -959,6 +1438,19 @@ function getSignalSettingsForSave(settings: GlobalSettings, filePath: string): S
   return settings.signals;
 }
 
+function writeFileAtomically(filePath: string, content: string): void {
+  const tempPath = `${filePath}.${process.pid}.${globalThis.crypto.randomUUID()}.tmp`;
+  try {
+    // Preserve the target's mode across the rename (auth.json keeps its 0600);
+    // new files default to owner-only since these are local app-data files.
+    const mode = existsSync(filePath) ? statSync(filePath).mode & 0o777 : 0o600;
+    writeFileSync(tempPath, content, { encoding: 'utf-8', mode });
+    renameSync(tempPath, filePath);
+  } finally {
+    rmSync(tempPath, { force: true });
+  }
+}
+
 export function saveSettings(settings: GlobalSettings, filePath: string = getSettingsPath()): void {
   const dir = dirname(filePath);
   if (!existsSync(dir)) {
@@ -967,7 +1459,9 @@ export function saveSettings(settings: GlobalSettings, filePath: string = getSet
   const signals = getSignalSettingsForSave(settings, filePath);
   settings.signals = signals;
   loadedSignalSettings.set(settings, cloneSignalSettings(signals));
-  writeFileSync(filePath, JSON.stringify(settings, null, 2), 'utf-8');
+  const settingsToSave: Record<string, unknown> = { ...settings };
+  delete settingsToSave._experimentalAgentSettingsPath;
+  writeFileAtomically(filePath, JSON.stringify(settingsToSave, null, 2));
 }
 
 /** Marker file name to track which provider last used a profile. */
@@ -1028,11 +1522,139 @@ function browserRecordingOptions() {
 }
 
 /**
+ * Snapshot of browser settings safe to store in session state (which session clients can read).
+ * Strips credentials; keeps everything `/browser status` needs for drift detection.
+ */
+export function toActiveBrowserSettings(settings: BrowserSettings): BrowserSettings {
+  if (!settings.stagehand) return { ...settings };
+  const { apiKey: _apiKey, ...stagehand } = settings.stagehand;
+  return { ...settings, stagehand };
+}
+
+export type StagehandModelSource =
+  /** `browser.stagehand.model` in settings. */
+  | 'settings'
+  /** No model configured; reusing the chat model that was active when the browser launched. */
+  | 'chat-model'
+  /** No usable model otherwise; the default model for the user's OpenAI Codex (ChatGPT) login. */
+  | 'codex-oauth'
+  /** Nothing else applies; Stagehand picks its own default from env API keys. */
+  | 'stagehand-default';
+
+export interface ResolvedStagehandModel {
+  /** `provider/model` id, or undefined when Stagehand's own default applies. */
+  modelName: string | undefined;
+  source: StagehandModelSource;
+  /** True when requests go through the user's OpenAI Codex OAuth login instead of an API key. */
+  viaCodexOAuth: boolean;
+}
+
+export interface ResolveStagehandModelOptions {
+  /**
+   * Chat model id at the moment the browser launches (`session.model.get()`).
+   * The Stagehand instance is fixed once created and shared across threads, so
+   * later chat-model switches do not affect it.
+   */
+  chatModelId?: string;
+  authStorage?: AuthStorage;
+}
+
+/**
+ * Env vars Stagehand reads for each provider it can route (mirrors
+ * `STAGEHAND_MODEL_PROVIDERS` in `@mastra/stagehand` and Stagehand's own
+ * `providerEnvVarMap`). `null` means the provider needs no API key.
+ * Kept here instead of importing `@mastra/stagehand`, which would eagerly
+ * load the browser stack into every settings consumer.
+ */
+export const STAGEHAND_PROVIDER_ENV_VARS: Record<string, readonly string[] | null> = {
+  openai: ['OPENAI_API_KEY'],
+  anthropic: ['ANTHROPIC_API_KEY'],
+  google: ['GEMINI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'GOOGLE_API_KEY'],
+  vertex: ['GOOGLE_VERTEX_AI_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  cerebras: ['CEREBRAS_API_KEY'],
+  togetherai: ['TOGETHER_AI_API_KEY'],
+  mistral: ['MISTRAL_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY'],
+  perplexity: ['PERPLEXITY_API_KEY'],
+  azure: ['AZURE_API_KEY'],
+  xai: ['XAI_API_KEY'],
+  gateway: ['AI_GATEWAY_API_KEY'],
+  bedrock: null,
+  ollama: null,
+};
+
+function hasCodexOAuthLogin(authStorage: AuthStorage): boolean {
+  return authStorage.get('openai-codex')?.type === 'oauth';
+}
+
+function isOpenAIModel(modelId: string): boolean {
+  return modelId.startsWith(OPENAI_PREFIX);
+}
+
+/**
+ * Stagehand hands the segment after `provider/` straight to the AI SDK provider,
+ * so apply the same id normalization the chat gateway does before it does.
+ */
+function normalizeForStagehand(modelId: string): string {
+  const bare = stripMastraGatewayPrefix(modelId.trim());
+  return bare.startsWith(ANTHROPIC_PREFIX) ? normalizeAnthropicModelId(bare) : bare;
+}
+
+/** Whether Stagehand could run `provider/model` with the credentials available right now. */
+function stagehandCanRoute(modelId: string, codexOAuth: boolean): boolean {
+  const provider = modelId.split('/', 1)[0];
+  if (!provider || provider === modelId) return false;
+  if (provider === 'openai' && codexOAuth) return true;
+  const envVars = STAGEHAND_PROVIDER_ENV_VARS[provider];
+  if (envVars === undefined) return false;
+  if (envVars === null) return true;
+  return envVars.some(name => Boolean(process.env[name]?.trim()));
+}
+
+/**
+ * Resolve which model Stagehand will use and why, without creating a browser.
+ * Order: configured `browser.stagehand.model` → the launch-time chat model when
+ * Stagehand can route it → the Codex login's default model → Stagehand's own
+ * default. Mirrors the selection in `createBrowserFromSettings` so the UI can
+ * show it.
+ */
+export function resolveStagehandModel(
+  settings: Pick<BrowserSettings, 'provider' | 'stagehand'>,
+  { chatModelId, authStorage = new AuthStorage() }: ResolveStagehandModelOptions = {},
+): ResolvedStagehandModel {
+  if (settings.provider !== 'stagehand') {
+    return { modelName: undefined, source: 'stagehand-default', viaCodexOAuth: false };
+  }
+  const codexOAuth = hasCodexOAuthLogin(authStorage);
+  const configured = settings.stagehand?.model ? normalizeForStagehand(settings.stagehand.model) : undefined;
+  if (configured) {
+    return { modelName: configured, source: 'settings', viaCodexOAuth: codexOAuth && isOpenAIModel(configured) };
+  }
+  const chatModel = chatModelId ? normalizeForStagehand(chatModelId) : undefined;
+  if (chatModel && stagehandCanRoute(chatModel, codexOAuth)) {
+    return { modelName: chatModel, source: 'chat-model', viaCodexOAuth: codexOAuth && isOpenAIModel(chatModel) };
+  }
+  if (codexOAuth) {
+    return { modelName: PROVIDER_DEFAULT_MODELS['openai-codex'], source: 'codex-oauth', viaCodexOAuth: true };
+  }
+  return { modelName: undefined, source: 'stagehand-default', viaCodexOAuth: false };
+}
+
+export interface CreateBrowserOptions {
+  /** Chat model id at launch; see `ResolveStagehandModelOptions.chatModelId`. */
+  chatModelId?: string;
+}
+
+/**
  * Create a browser instance from settings.
  * Shared by startup (main.ts) and live reconfiguration (/browser command).
  * Returns undefined if browser is disabled.
  */
-export async function createBrowserFromSettings(settings: BrowserSettings): Promise<MastraBrowser | undefined> {
+export async function createBrowserFromSettings(
+  settings: BrowserSettings,
+  { chatModelId }: CreateBrowserOptions = {},
+): Promise<MastraBrowser | undefined> {
   if (!settings.enabled) {
     return undefined;
   }
@@ -1056,24 +1678,26 @@ export async function createBrowserFromSettings(settings: BrowserSettings): Prom
       recording: browserRecordingOptions(),
     };
 
-    // When the user has an active OpenAI Codex (ChatGPT) subscription, route
-    // Stagehand through the Codex endpoint. We use the AI SDK provider's
-    // standard hooks (baseURL, headers, fetch, and middleware) instead of a
-    // URL-rewriting fetch:
+    // See resolveStagehandModel() for which model is picked. How it is reached
+    // depends on the user's OpenAI auth, not on where the model came from:
+    // any `openai/*` model goes through the Codex (ChatGPT) endpoint when the
+    // user signed in with Codex OAuth, matching the chat agents. Everything
+    // else is passed as a plain `provider/model` string and Stagehand resolves
+    // the provider's API key from the environment.
+    //
+    // The Codex route uses the AI SDK provider's standard hooks:
     //   - baseURL: target Codex's Responses API directly (no URL rewriting).
     //   - headers: static Codex identifiers (originator, UA, account id).
     //   - fetch: a tiny refresher that injects the live OAuth bearer per call,
     //     since AI SDK takes `apiKey` as a static string.
     //   - middleware: createCodexMiddleware() sets `store: false`, which Codex
     //     requires on every request.
-    // Model is `gpt-5.4-mini`, the current ChatGPT-sign-in Codex whitelist
-    // pick suited to Stagehand's vision + structured-output workload.
     const authStorage = new AuthStorage();
-    const cred = authStorage.get('openai-codex');
-    if (cred?.type === 'oauth') {
-      const accountId = (cred as any).accountId as string | undefined;
+    const resolved = resolveStagehandModel(settings, { chatModelId, authStorage });
+    if (resolved.modelName && resolved.viaCodexOAuth) {
+      const accountId = (authStorage.get('openai-codex') as any)?.accountId as string | undefined;
       stagehandOpts.model = {
-        modelName: 'openai/gpt-5.4-mini',
+        modelName: remapOpenAIModelForCodexOAuth(resolved.modelName),
         apiKey: 'codex-oauth',
         baseURL: 'https://chatgpt.com/backend-api/codex',
         headers: {
@@ -1084,6 +1708,8 @@ export async function createBrowserFromSettings(settings: BrowserSettings): Prom
         fetch: buildCodexStagehandFetch(authStorage),
         middleware: createCodexMiddleware(),
       } as any;
+    } else if (resolved.modelName) {
+      stagehandOpts.model = resolved.modelName;
     }
 
     return cdpUrl

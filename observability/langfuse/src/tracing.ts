@@ -9,13 +9,32 @@
 
 import { LangfuseClient } from '@langfuse/client';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
-import type { TracingEvent, AnyExportedSpan, InitExporterOptions, ScoreEvent } from '@mastra/core/observability';
+import type {
+  TracingEvent,
+  AnyExportedSpan,
+  InitExporterOptions,
+  ModelGenerationAttributes,
+  ScoreEvent,
+} from '@mastra/core/observability';
 import { SpanType, TracingEventType } from '@mastra/core/observability';
 import { BaseExporter } from '@mastra/observability';
 import type { BaseExporterConfig } from '@mastra/observability';
 import { SpanConverter } from '@mastra/otel-exporter';
+import type { OtelExporterConfig } from '@mastra/otel-exporter';
 
 const LOG_PREFIX = '[LangfuseExporter]';
+const MASTRA_METADATA_PREFIX = 'mastra.metadata.';
+/** Metadata keys mapped to dedicated Langfuse fields; never forwarded as trace metadata. */
+const OM_CALLER_THREAD_ID = '__mastraObservationalMemoryCallerThreadId';
+const DEDICATED_METADATA_KEYS = new Set([
+  'userId',
+  'sessionId',
+  'threadId',
+  'traceName',
+  'version',
+  'langfuse',
+  OM_CALLER_THREAD_ID,
+]);
 
 export const LANGFUSE_DEFAULT_BASE_URL = 'https://cloud.langfuse.com';
 
@@ -26,6 +45,8 @@ export interface LangfuseExporterConfig extends BaseExporterConfig {
   secretKey?: string;
   /** Langfuse host URL (defaults to https://cloud.langfuse.com) */
   baseUrl?: string;
+  /** Additional headers sent with requests to Langfuse */
+  additionalHeaders?: Record<string, string>;
   /** Enable realtime mode - flushes after each event for immediate visibility */
   realtime?: boolean;
   /** Maximum number of spans per OTEL export batch */
@@ -36,6 +57,8 @@ export interface LangfuseExporterConfig extends BaseExporterConfig {
   environment?: string;
   /** Langfuse release tag for traces */
   release?: string;
+  /** Override OpenTelemetry resource attributes, including service.version. */
+  resourceAttributes?: OtelExporterConfig['resourceAttributes'];
 }
 
 export class LangfuseExporter extends BaseExporter {
@@ -46,6 +69,7 @@ export class LangfuseExporter extends BaseExporter {
   #realtime: boolean;
   #environment: string | undefined;
   #release: string | undefined;
+  #resourceAttributes: OtelExporterConfig['resourceAttributes'];
 
   constructor(config: LangfuseExporterConfig = {}) {
     super(config);
@@ -54,6 +78,7 @@ export class LangfuseExporter extends BaseExporter {
     const secretKey = config.secretKey ?? process.env.LANGFUSE_SECRET_KEY;
     const baseUrl = stripTrailingSlashes(config.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? LANGFUSE_DEFAULT_BASE_URL);
     this.#realtime = config.realtime ?? false;
+    this.#resourceAttributes = config.resourceAttributes;
 
     if (!publicKey || !secretKey) {
       const publicKeySource = config.publicKey
@@ -77,6 +102,7 @@ export class LangfuseExporter extends BaseExporter {
       publicKey,
       secretKey,
       baseUrl,
+      additionalHeaders: config.additionalHeaders,
       environment: config.environment,
       release: config.release,
       exportMode: this.#realtime ? 'immediate' : 'batched',
@@ -91,6 +117,7 @@ export class LangfuseExporter extends BaseExporter {
       publicKey,
       secretKey,
       baseUrl,
+      additionalHeaders: config.additionalHeaders,
     });
 
     this.#environment = config.environment ?? process.env.LANGFUSE_TRACING_ENVIRONMENT;
@@ -101,6 +128,7 @@ export class LangfuseExporter extends BaseExporter {
     this.#spanConverter = new SpanConverter({
       packageName: '@mastra/langfuse',
       serviceName: options.config?.serviceName,
+      config: { resourceAttributes: this.#resourceAttributes },
       format: 'GenAI_v1_38_0',
     });
   }
@@ -118,6 +146,7 @@ export class LangfuseExporter extends BaseExporter {
       this.#spanConverter = new SpanConverter({
         packageName: '@mastra/langfuse',
         serviceName: 'mastra-service',
+        config: { resourceAttributes: this.#resourceAttributes },
         format: 'GenAI_v1_38_0',
       });
     }
@@ -170,6 +199,7 @@ export class LangfuseExporter extends BaseExporter {
         value,
         ...(comment ? { comment } : {}),
         ...(metadata ? { metadata } : {}),
+        ...(this.#environment ? { environment: this.#environment } : {}),
         dataType: 'NUMERIC' as const,
       });
     } catch (error) {
@@ -246,12 +276,32 @@ export class LangfuseExporter extends BaseExporter {
  * This function mutates the attributes object in place.
  * @see https://langfuse.com/integrations/native/opentelemetry#property-mapping
  */
+/**
+ * Serialize a root span's input/output for the trace-level attributes.
+ * Returns undefined (attribute omitted) for absent values and for values that
+ * cannot be JSON-serialized, so a bad payload never fails the span export.
+ */
+function serializeTraceIo(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function mapMastraToLangfuseAttributes(
   attributes: Record<string, any>,
   span: AnyExportedSpan,
   environment?: string,
   release?: string,
 ): void {
+  if (attributes['gen_ai.usage.reasoning_tokens'] !== undefined) {
+    attributes['gen_ai.usage.reasoning.output_tokens'] = attributes['gen_ai.usage.reasoning_tokens'];
+    delete attributes['gen_ai.usage.reasoning_tokens'];
+  }
+
   // Environment and release: set directly since onStart() is not called
   if (environment) {
     attributes['langfuse.environment'] = environment;
@@ -311,14 +361,39 @@ function mapMastraToLangfuseAttributes(
     delete attributes['mastra.completion_start_time'];
   }
 
+  // Exact provider-reported cost takes precedence over Langfuse's model-price inference.
+  // Estimated costs remain unexported so Langfuse can apply its own pricing model.
+  const costContext =
+    span.type === SpanType.MODEL_GENERATION
+      ? (span.attributes as ModelGenerationAttributes | undefined)?.costContext
+      : undefined;
+  if (
+    costContext?.costMetadata?.source === 'provider_reported' &&
+    costContext.costUnit === 'USD' &&
+    typeof costContext.estimatedCost === 'number' &&
+    Number.isFinite(costContext.estimatedCost) &&
+    costContext.estimatedCost >= 0
+  ) {
+    attributes['langfuse.observation.cost_details'] = JSON.stringify({
+      total: costContext.estimatedCost,
+    });
+  }
+
   // User ID: mastra.metadata.userId → user.id
   if (attributes['mastra.metadata.userId']) {
     attributes['user.id'] = attributes['mastra.metadata.userId'];
     delete attributes['mastra.metadata.userId'];
   }
 
-  // Session ID: mastra.metadata.sessionId or threadId → session.id
-  const sessionId = attributes['mastra.metadata.sessionId'] ?? attributes['mastra.metadata.threadId'];
+  // OM keeps caller identity separate from its isolated execution thread. Read
+  // the raw hint: conversion serializes malformed objects/arrays into strings.
+  const omCallerThreadId = span.metadata?.[OM_CALLER_THREAD_ID];
+  const sessionId =
+    attributes['mastra.metadata.sessionId'] ??
+    (typeof omCallerThreadId === 'string' && omCallerThreadId
+      ? omCallerThreadId
+      : attributes['mastra.metadata.threadId']);
+  delete attributes[`${MASTRA_METADATA_PREFIX}${OM_CALLER_THREAD_ID}`];
   if (sessionId) {
     attributes['session.id'] = sessionId;
     delete attributes['mastra.metadata.sessionId'];
@@ -337,9 +412,9 @@ function mapMastraToLangfuseAttributes(
     delete attributes['mastra.metadata.traceName'];
   }
 
-  // Trace version: mastra.metadata.version → langfuse.trace.version
+  // Version: mastra.metadata.version → langfuse.version
   if (attributes['mastra.metadata.version']) {
-    attributes['langfuse.trace.version'] = attributes['mastra.metadata.version'];
+    attributes['langfuse.version'] = attributes['mastra.metadata.version'];
     delete attributes['mastra.metadata.version'];
   }
 
@@ -350,6 +425,20 @@ function mapMastraToLangfuseAttributes(
   // filters. User-provided traceName (set via mastra.metadata.traceName) takes
   // precedence and is preserved.
   if (span.isRootSpan) {
+    // Trace input/output: mirror the root span's input/output onto the trace.
+    // Without this, Langfuse traces have empty trace-level input/output (the
+    // span data only reaches the root OBSERVATION), which breaks LLM-as-a-judge
+    // evaluators mapped to Trace input/output and leaves the trace view without
+    // the top-level request/response. Serialization failures (circular refs,
+    // bigint) skip the attribute rather than failing the span export.
+    const traceInput = serializeTraceIo(span.input);
+    if (traceInput !== undefined) {
+      attributes['langfuse.trace.input'] = traceInput;
+    }
+    const traceOutput = serializeTraceIo(span.output);
+    if (traceOutput !== undefined) {
+      attributes['langfuse.trace.output'] = traceOutput;
+    }
     if (span.type === SpanType.AGENT_RUN) {
       if (!attributes['langfuse.trace.name'] && (span.entityName || span.entityId)) {
         attributes['langfuse.trace.name'] = span.entityName ?? span.entityId;
@@ -369,6 +458,30 @@ function mapMastraToLangfuseAttributes(
       }
       if (span.entityName) {
         attributes['langfuse.trace.metadata.workflowName'] = span.entityName;
+      }
+    }
+
+    // Root-span metadata: forward the remaining mastra.metadata.* keys (runId,
+    // resourceId, user-supplied keys) to langfuse.trace.metadata.* so they are
+    // filterable trace metadata; Langfuse nests unmapped attributes under
+    // metadata.attributes. Dedicated keys, explicit metadata.langfuse.* values,
+    // and the identity keys above take precedence. Root only: Langfuse applies
+    // langfuse.trace.* from any span, so a child span could overwrite the trace.
+    for (const [key, value] of Object.entries(attributes)) {
+      if (!key.startsWith(MASTRA_METADATA_PREFIX)) {
+        continue;
+      }
+      const metadataKey = key.slice(MASTRA_METADATA_PREFIX.length);
+      if (DEDICATED_METADATA_KEYS.has(metadataKey) || value === null || value === undefined) {
+        continue;
+      }
+      const traceKey = `langfuse.trace.metadata.${metadataKey}`;
+      if (attributes[traceKey] !== undefined) {
+        continue;
+      }
+      const serialized = serializeTraceIo(value);
+      if (serialized !== undefined) {
+        attributes[traceKey] = serialized;
       }
     }
   }
@@ -396,6 +509,7 @@ function mapMastraToLangfuseAttributes(
     for (const key of Object.keys(attributes)) {
       if (key.startsWith('mastra.') && key.endsWith('.input')) {
         attributes['langfuse.observation.input'] = attributes[key];
+        delete attributes[key];
         break;
       }
     }
@@ -404,6 +518,7 @@ function mapMastraToLangfuseAttributes(
     for (const key of Object.keys(attributes)) {
       if (key.startsWith('mastra.') && key.endsWith('.output')) {
         attributes['langfuse.observation.output'] = attributes[key];
+        delete attributes[key];
         break;
       }
     }

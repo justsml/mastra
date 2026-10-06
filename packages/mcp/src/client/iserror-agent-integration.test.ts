@@ -8,11 +8,11 @@ import { Agent } from '@mastra/core/agent';
 import { MockMemory } from '@mastra/core/memory';
 import { SpanType, TracingEventType } from '@mastra/core/observability';
 import { Observability } from '@mastra/observability';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { z } from 'zod/v3';
+import { z } from 'zod';
 import { MCPClient } from './configuration.js';
 
 /**
@@ -47,10 +47,12 @@ describe('MCP isError - agent integration (four surfaces)', () => {
     mcpServer = new McpServer({ name: 'failing-mcp-server', version: '1.0.0' }, { capabilities: { tools: {} } });
 
     // A spec-compliant in-band failure: isError + the reason in `content`.
-    mcpServer.tool(
+    mcpServer.registerTool(
       TOOL_NAME,
-      'A tool that always fails in-band',
-      { reason: z.string().describe('Why the caller wants to run it').default('go') },
+      {
+        description: 'A tool that always fails in-band',
+        inputSchema: { reason: z.string().describe('Why the caller wants to run it').default('go') },
+      },
       async (): Promise<CallToolResult> => {
         return {
           isError: true,
@@ -59,13 +61,8 @@ describe('MCP isError - agent integration (four surfaces)', () => {
       },
     );
 
-    // Stateless mode: SDK requires a fresh transport per request.
-    httpServer.on('request', async (req, res) => {
-      await mcpServer.close().catch(() => {});
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      await mcpServer.connect(transport);
-      await transport.handleRequest(req, res);
-    });
+    const handler = toNodeHandler(createMcpHandler(() => mcpServer.server, { legacy: 'reject' }));
+    httpServer.on('request', (req, res) => handler(req, res));
 
     baseUrl = await new Promise<URL>(resolve => {
       httpServer.listen(0, '127.0.0.1', () => {

@@ -132,6 +132,7 @@ describe('MessageRow dynamic-tool rendering', () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   it('renders persisted signal user text as a user message', () => {
@@ -230,6 +231,44 @@ describe('MessageRow dynamic-tool rendering', () => {
     expect(container.querySelector('strong')?.textContent).toBe('bold');
   });
 
+  describe('when assistant text contains an external authorization link', () => {
+    it('requests a separate browser window', () => {
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(window);
+      const part: MastraMessagePart = {
+        type: 'text',
+        text: '[Authorize Gmail](https://connect.composio.dev/link)',
+      };
+
+      const { getByRole } = renderMessage(buildMessage([part]));
+      fireEvent.click(getByRole('link', { name: 'Authorize Gmail' }));
+
+      expect(openSpy).toHaveBeenCalledWith(
+        'https://connect.composio.dev/link',
+        '_blank',
+        expect.stringContaining('popup=yes'),
+      );
+    });
+  });
+
+  describe('when system text contains an external link', () => {
+    it('keeps the default new-tab target', () => {
+      const { getByRole } = renderMessage({
+        id: 'system-link-1',
+        role: 'system',
+        createdAt: new Date(),
+        content: {
+          format: 2,
+          parts: [{ type: 'text', text: '[System reference](https://example.com/reference)' }],
+        },
+      } as unknown as MastraDBMessage);
+
+      const link = getByRole('link', { name: 'System reference' });
+
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+    });
+  });
+
   it('routes assistant text through the shared MessageText error-prefix handling', () => {
     const { container } = renderMessage(buildMessage([{ type: 'text', text: 'Error: it broke' } as ToolPart]));
 
@@ -280,33 +319,27 @@ describe('MessageRow dynamic-tool rendering', () => {
       }),
     ]);
 
-    // Unknown dynamic tools render as a GenericTool ToolCard showing "Executing <toolName>".
-    expect(container.textContent).toContain('Executing');
-    expect(container.textContent).toContain('some-other-tool');
+    expect(container.textContent).toContain('Some other tool');
     expect(container.textContent).not.toContain('Web Search');
 
-    fireEvent.click(getByRole('button'));
+    fireEvent.click(getByRole('button', { name: /some other tool/i }));
 
-    expect(container.textContent).toContain('Input');
     expect(container.textContent).toContain('"web-search"');
-    expect(container.textContent).toContain('Output');
     expect(container.textContent).toContain('"success": true');
   });
 
-  it('omits the generic fallback output panel when there is no output', () => {
-    const { container, getByRole } = renderRow([
+  it('offers nothing to open when the generic fallback has neither arguments nor output', () => {
+    const { container, queryByRole } = renderRow([
       builderToolPart({
         toolCallId: 'call-5',
         toolName: 'some-other-tool',
-        input: { a: 1 },
+        input: {},
         output: undefined,
       }),
     ]);
 
-    fireEvent.click(getByRole('button'));
-
-    expect(container.textContent).toContain('Input');
-    expect(container.textContent).not.toContain('Output');
+    expect(container.textContent).toContain('Some other tool');
+    expect(queryByRole('button', { name: /some other tool/i })).toBeNull();
   });
 
   it('renders signal data parts in agent-builder chat messages', () => {

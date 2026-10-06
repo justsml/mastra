@@ -174,10 +174,10 @@ const textThemeKeys: (keyof ThemeColors)[] = [
 // Comfortable minimum contrast for TUI body text — above WCAG AA (4.5:1) for better readability
 export const TUI_MIN_CONTRAST = 5.5;
 
-/** Terminal width buffer applied at the framework level to prevent wrapping in nested terminals */
-export const TERM_WIDTH_BUFFER = 3;
-/** Get the effective terminal width (matching the framework's reduced width) */
-export const getTermWidth = () => (process.stdout.columns || 80) - TERM_WIDTH_BUFFER;
+/** Smallest width the full TUI layout renders safely at; narrower reports (e.g. while a display sleeps) are floored to this */
+export const MIN_TERM_WIDTH = 40;
+/** Get the terminal width used for rendering */
+export const getTermWidth = () => Math.max(MIN_TERM_WIDTH, process.stdout.columns || 80);
 
 /** Left indent (in spaces) applied to assistant text (Markdown body) */
 export const CHAT_INDENT = 2;
@@ -428,6 +428,18 @@ function getTheme(): ThemeColors {
  */
 function setTheme(colors: ThemeColors): void {
   currentTheme = colors;
+  themeGeneration++;
+}
+
+/**
+ * Monotonic counter bumped on every theme change. Components that cache
+ * rendered lines key their cache on this so a `/theme` switch invalidates
+ * styled output built under the previous palette.
+ */
+let themeGeneration = 0;
+
+export function getThemeGeneration(): number {
+  return themeGeneration;
 }
 
 /**
@@ -437,6 +449,7 @@ export function applyThemeMode(mode: ThemeMode, terminalBgHex?: string): void {
   currentThemeMode = mode;
   currentTheme = mode === 'light' ? lightTheme : darkTheme;
   detectedTerminalBg = terminalBgHex;
+  themeGeneration++;
   computeAdaptedColors();
   // Set terminal default foreground via OSC 10 so unstyled text (e.g. editor input)
   // adapts to the theme. Convert hex to rgb/ format for OSC.

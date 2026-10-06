@@ -29,28 +29,27 @@ test.describe('Dataset items list', () => {
       // can't accidentally match a datetime elsewhere on the page.
       const itemMetadata = page.locator('dl').filter({ hasText: 'Dataset Id' });
       await expect(itemMetadata).toBeVisible({ timeout: 5000 });
-      // The "Created" timestamp renders as "MMM d, yyyy h:mm aaa", e.g. "May 29, 2026 1:08 pm".
-      await expect(itemMetadata.getByText(/[A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} (am|pm)/).first()).toBeVisible();
+      // The shared dateTime preset includes the date, year, and time, e.g. "May 29, 2026, 1:08 PM".
+      await expect(
+        itemMetadata.getByText(/[A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2}\s(AM|PM)/).first(),
+      ).toBeVisible();
     });
   });
 
-  test.describe('when Delete Items is selected from the actions menu', () => {
-    test('enables selection mode with checkboxes', async ({ page }) => {
+  test.describe('when an item checkbox is checked', () => {
+    test('shows the contextual selection menu with a Delete Items entry', async ({ page }) => {
       const { id: datasetId } = await seedDatasetWithItems(3);
 
       await page.goto(`/datasets/${datasetId}`);
       await expect(page.getByText('Test input 1')).toBeVisible();
 
-      await page.getByRole('button', { name: 'Actions menu', exact: true }).click();
-      await page.getByRole('menuitem', { name: /Delete Items/i }).click();
-
-      await expect(page.getByRole('checkbox').first()).toBeVisible();
-
-      const checkbox1 = page.getByRole('checkbox').first();
+      // Checkboxes are always visible on the current version — no selection mode.
+      const checkbox1 = page.getByRole('checkbox', { name: /Select item/i }).first();
+      await expect(checkbox1).toBeVisible();
       await checkbox1.click();
 
-      await expect(page.getByText(/selected/i)).toBeVisible();
-      await expect(page.getByRole('button', { name: /Delete Items/i })).toBeEnabled();
+      await page.getByRole('button', { name: /1 selected/i }).click();
+      await expect(page.getByRole('menuitem', { name: /Delete Items/i })).toBeVisible();
     });
   });
 
@@ -64,13 +63,10 @@ test.describe('Dataset items list', () => {
       await expect(page.getByText('Test input 2')).toBeVisible();
       await expect(page.getByText('Test input 3')).toBeVisible();
 
-      await page.getByRole('button', { name: 'Actions menu', exact: true }).click();
+      await page.getByRole('checkbox', { name: /Select all items/i }).click();
+
+      await page.getByRole('button', { name: /3 selected/i }).click();
       await page.getByRole('menuitem', { name: /Delete Items/i }).click();
-
-      const selectAllCheckbox = page.getByRole('checkbox', { name: /Select all/i });
-      await selectAllCheckbox.click();
-
-      await page.getByRole('button', { name: /Delete Items/i }).click();
 
       const confirmButton = page.getByRole('button', { name: /^Delete$/i });
       await confirmButton.click();
@@ -110,46 +106,38 @@ test.describe('Dataset items list', () => {
       await page.goto(`/datasets/${dataset.id}`);
 
       await expect(page.getByText('No items yet')).toBeVisible();
-      await expect(page.getByRole('button', { name: /Add Single Item/i })).toBeVisible();
+      await expect(page.getByRole('button', { name: /New item/i })).toBeVisible();
       await expect(page.getByRole('button', { name: /Import CSV/i })).toBeVisible();
     });
   });
 
-  test.describe('when the select-all checkbox is clicked in selection mode', () => {
+  test.describe('when the select-all checkbox is clicked', () => {
     test('selects all visible items', async ({ page }) => {
       const { id: datasetId } = await seedDatasetWithItems(3);
 
       await page.goto(`/datasets/${datasetId}`);
       await expect(page.getByText('Test input 1')).toBeVisible();
 
-      await page.getByRole('button', { name: 'Actions menu', exact: true }).click();
-      await page.getByRole('menuitem', { name: /Delete Items/i }).click();
+      await page.getByRole('checkbox', { name: /Select all items/i }).click();
 
-      const selectAllCheckbox = page.getByRole('checkbox', { name: /Select all/i });
-      await selectAllCheckbox.click();
-
-      await expect(page.getByText('items selected')).toBeVisible();
+      await expect(page.getByRole('button', { name: /3 selected/i })).toBeVisible();
     });
   });
 
-  test.describe('when Cancel is clicked in selection mode', () => {
-    test('clears the selection and exits selection mode', async ({ page }) => {
+  test.describe('when a selected item is unchecked', () => {
+    test('clears the selection', async ({ page }) => {
       const { id: datasetId } = await seedDatasetWithItems(3);
 
       await page.goto(`/datasets/${datasetId}`);
       await expect(page.getByText('Test input 1')).toBeVisible();
 
-      await page.getByRole('button', { name: 'Actions menu', exact: true }).click();
-      await page.getByRole('menuitem', { name: /Delete Items/i }).click();
-
-      const checkbox = page.getByRole('checkbox').nth(1);
+      const checkbox = page.getByRole('checkbox', { name: /Select item/i }).first();
       await checkbox.click();
-      await expect(page.getByText(/selected/i)).toBeVisible();
+      await expect(page.getByRole('button', { name: /1 selected/i })).toBeVisible();
 
-      await page.getByRole('button', { name: /Cancel/i }).click();
+      await checkbox.click();
 
-      await expect(page.getByText(/selected/i)).not.toBeVisible();
-      await expect(page.getByRole('checkbox')).toHaveCount(0);
+      await expect(page.getByRole('button', { name: /selected/i })).not.toBeVisible();
     });
   });
 });

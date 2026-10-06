@@ -1,10 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import type { MastraDBMessage } from '@mastra/core/agent';
-import imageSize from 'image-size';
+import type { MastraToolInvocation } from '@mastra/core/agent/message-list';
 import { estimateTokenCount } from 'tokenx';
 
-import { formatToolResultForObserver, resolveToolResultValue } from './tool-result-helpers';
+import { measureImageBuffer } from './measure-image-buffer';
+import { resolveToolResultValue, serializeToolResultForTokenCounting } from './tool-result-helpers';
 
 type TokenEstimateCacheEntry = {
   v: number;
@@ -349,6 +350,11 @@ function isValidCacheEntry(
   );
 }
 
+// Shared across all TokenCounter instances on purpose: on async_hooks-based ALS (Node < 24), every
+// AsyncLocalStorage that has run() is registered process-wide forever and taxes every async resource
+// creation. A per-instance ALS therefore degrades CPU linearly when Memory/OM is constructed per request.
+const modelContextStorage = new AsyncLocalStorage<ReadonlyMap<TokenCounter, TokenCounterModelContext | undefined>>();
+
 function parseModelContext(model?: string | TokenCounterModelContext): TokenCounterModelContext | undefined {
   if (!model) return undefined;
   if (typeof model === 'object') {
@@ -416,7 +422,7 @@ function getFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-function isHttpUrlString(value: unknown): boolean {
+export function isHttpUrlString(value: unknown): boolean {
   return typeof value === 'string' && /^https?:\/\//i.test(value);
 }
 
@@ -439,7 +445,11 @@ function isLikelyBase64Content(value: string): boolean {
   return /^[A-Za-z0-9+/]+={0,2}$/.test(value);
 }
 
-function decodeImageBuffer(value: unknown): Buffer | undefined {
+/**
+ * Decodes a stored attachment payload (data URI, raw base64, Buffer, or typed array) into bytes.
+ * Returns undefined for remote URLs, filesystem paths, and anything that isn't a decodable payload.
+ */
+export function decodeImageBuffer(value: unknown): Buffer | undefined {
   if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
     return value;
   }
@@ -561,25 +571,25 @@ function resolveImageDimensions(part: CacheablePart): { width?: number; height?:
     return { width, height };
   }
 
-  try {
-    const measured = imageSize(buffer);
-    const measuredWidth = getFiniteNumber(measured.width);
-    const measuredHeight = getFiniteNumber(measured.height);
-
-    if (!measuredWidth || !measuredHeight) {
-      return { width, height };
-    }
-
-    const resolved = {
-      width: width ?? measuredWidth,
-      height: height ?? measuredHeight,
-    };
-
-    persistImageDimensions(part, resolved as { width: number; height: number });
-    return resolved;
-  } catch {
+  const measured = measureImageBuffer(buffer);
+  if (!measured) {
     return { width, height };
   }
+
+  const measuredWidth = getFiniteNumber(measured.width);
+  const measuredHeight = getFiniteNumber(measured.height);
+
+  if (!measuredWidth || !measuredHeight) {
+    return { width, height };
+  }
+
+  const resolved = {
+    width: width ?? measuredWidth,
+    height: height ?? measuredHeight,
+  };
+
+  persistImageDimensions(part, resolved as { width: number; height: number });
+  return resolved;
 }
 
 function getBase64Size(base64: string): number {
@@ -1218,8 +1228,8 @@ async function fetchGoogleAttachmentTokenEstimate(modelId: string, part: Cacheab
 export class TokenCounter {
   private readonly cacheSource: string;
   private readonly defaultModelContext?: TokenCounterModelContext;
-  private readonly modelContextStorage = new AsyncLocalStorage<TokenCounterModelContext | undefined>();
   private readonly inFlightAttachmentCounts = new Map<string, Promise<number | undefined>>();
+  private readonly multimodalToolResultCounts = new WeakMap<object, { resultKey: string; tokens: number }>();
 
   // Per-message overhead: accounts for role tokens, message framing, and separators.
   // 3.8 remains a practical average across providers for OM thresholding.
@@ -1233,11 +1243,13 @@ export class TokenCounter {
   }
 
   runWithModelContext<T>(model: string | TokenCounterModelContext | undefined, fn: () => T): T {
-    return this.modelContextStorage.run(parseModelContext(model), fn);
+    const contexts = new Map(modelContextStorage.getStore());
+    contexts.set(this, parseModelContext(model));
+    return modelContextStorage.run(contexts, fn);
   }
 
   private getModelContext(): TokenCounterModelContext | undefined {
-    return this.modelContextStorage.getStore() ?? this.defaultModelContext;
+    return modelContextStorage.getStore()?.get(this) ?? this.defaultModelContext;
   }
 
   /**
@@ -1313,6 +1325,12 @@ export class TokenCounter {
       return undefined;
     }
 
+    const resultKey = buildEstimateKey('tool-result-multimodal-content-source', JSON.stringify(toolResult));
+    const cached = this.multimodalToolResultCounts.get(part);
+    if (cached?.resultKey === resultKey) {
+      return cached.tokens;
+    }
+
     const output = toolResult as Record<string, unknown>;
     const content = output.type === 'content' && Array.isArray(output.value) ? output.value : output.content;
     if (!Array.isArray(content)) {
@@ -1323,7 +1341,7 @@ export class TokenCounter {
     let tokens = 0;
     const cacheParts: unknown[] = [];
     const countJsonContentPart = (contentPart: Record<string, unknown>) => {
-      const formatted = formatToolResultForObserver(contentPart);
+      const formatted = serializeToolResultForTokenCounting(contentPart);
       tokens += this.countString(formatted);
       cacheParts.push({ type: 'json', valueHash: createHash('sha256').update(formatted).digest('hex') });
     };
@@ -1430,12 +1448,14 @@ export class TokenCounter {
       return undefined;
     }
 
-    return this.readOrPersistFixedPartEstimate(
+    const estimate = this.readOrPersistFixedPartEstimate(
       part,
       'tool-result-multimodal-content',
       JSON.stringify({ type: 'content', value: cacheParts }),
       tokens,
     );
+    this.multimodalToolResultCounts.set(part, { resultKey, tokens: estimate });
+    return estimate;
   }
 
   private estimateImageAssetTokens(part: CacheablePart, asset: unknown, kind: 'image' | 'file'): ImageTokenEstimate {
@@ -1697,53 +1717,96 @@ export class TokenCounter {
     return localTokens;
   }
 
+  /**
+   * Count the name and the arguments of a tool call. Every state before the tool produces an
+   * output holds the same call signature in the context window, so all of those states share
+   * these cache kinds. `buildEstimateKey` hashes the text, so a shared kind stays correct and
+   * keeps the estimate warm while the invocation moves from one state to the next.
+   */
+  private countToolCallSignature(
+    part: CacheablePart,
+    invocation: MastraToolInvocation,
+  ): { tokens: number; overheadDelta: number } {
+    let tokens = 0;
+    let overheadDelta = 0;
+
+    if (invocation.toolName) {
+      tokens += this.readOrPersistPartEstimate(part, 'tool-call-name', invocation.toolName);
+    }
+    if (invocation.args !== undefined) {
+      if (typeof invocation.args === 'string') {
+        tokens += this.readOrPersistPartEstimate(part, 'tool-call-args', invocation.args);
+      } else {
+        const argsJson = JSON.stringify(invocation.args);
+        tokens += this.readOrPersistPartEstimate(part, 'tool-call-args-json', argsJson);
+        overheadDelta -= 12;
+      }
+    }
+
+    return { tokens, overheadDelta };
+  }
+
   private countNonAttachmentPart(part: CacheablePart): {
     tokens: number;
     overheadDelta: number;
-    toolResultDelta: number;
+    /** Number of extra messages this part costs, each charged one `TOKENS_PER_MESSAGE`. */
+    extraMessageDelta: number;
   } {
     let overheadDelta = 0;
-    let toolResultDelta = 0;
+    let extraMessageDelta = 0;
 
     if (part.type === 'text') {
-      return { tokens: this.readOrPersistPartEstimate(part, 'text', part.text), overheadDelta, toolResultDelta };
+      return { tokens: this.readOrPersistPartEstimate(part, 'text', part.text), overheadDelta, extraMessageDelta };
     }
 
     if (part.type === 'tool-invocation') {
-      const invocation = part.toolInvocation;
+      // Typed alias of the untyped part so the branches below narrow the state union down to
+      // `never`. A state added to the core type then breaks the build here.
+      const invocation: MastraToolInvocation = part.toolInvocation;
+      const state = invocation.state;
       let tokens = 0;
 
-      if (invocation.state === 'call' || invocation.state === 'partial-call') {
-        if (invocation.toolName) {
-          tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-name`, invocation.toolName);
-        }
-        if (invocation.args) {
-          if (typeof invocation.args === 'string') {
-            tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-args`, invocation.args);
-          } else {
-            const argsJson = JSON.stringify(invocation.args);
-            tokens += this.readOrPersistPartEstimate(part, `tool-${invocation.state}-args-json`, argsJson);
-            overheadDelta -= 12;
-          }
-        }
-
-        return { tokens, overheadDelta, toolResultDelta };
+      if (state === 'call' || state === 'partial-call' || state === 'approval-requested') {
+        // A call that waits for approval still holds its name and args in the context window
+        // exactly like a plain call, so it costs the same until the tool produces an output.
+        const signature = this.countToolCallSignature(part, invocation);
+        return { tokens: signature.tokens, overheadDelta: overheadDelta + signature.overheadDelta, extraMessageDelta };
       }
 
-      if (invocation.state === 'result') {
-        toolResultDelta++;
+      if (state === 'approval-responded') {
+        // The approval reply travels as its own tool message, so charge one more message of
+        // overhead on top of the call signature, plus the reason the user gave with the decision.
+        extraMessageDelta++;
+        const signature = this.countToolCallSignature(part, invocation);
+        tokens += signature.tokens;
+        overheadDelta += signature.overheadDelta;
+        const reason = invocation.approval?.reason;
+        if (reason) {
+          tokens += this.readOrPersistPartEstimate(part, 'tool-approval-reason', reason);
+        }
+        return { tokens, overheadDelta, extraMessageDelta };
+      }
+
+      if (state === 'result') {
+        extraMessageDelta++;
+        const signature = this.countToolCallSignature(part, invocation);
+        tokens += signature.tokens;
+        overheadDelta += signature.overheadDelta;
         const { value: resultForCounting, usingStoredModelOutput } = this.resolveToolResultForTokenCounting(
           part,
           invocation.result,
         );
 
-        if (resultForCounting !== undefined) {
+        const hasResult =
+          resultForCounting !== undefined &&
+          (typeof resultForCounting !== 'string' || resultForCounting.trim().length > 0);
+        if (hasResult) {
           const contentTokens = this.countMultimodalToolResultContent(part, resultForCounting);
 
           if (contentTokens !== undefined) {
             tokens += contentTokens;
           } else {
-            const formattedResult = formatToolResultForObserver(resultForCounting);
+            const formattedResult = serializeToolResultForTokenCounting(resultForCounting);
             tokens += this.readOrPersistPartEstimate(
               part,
               usingStoredModelOutput ? 'tool-result-model-output-json' : 'tool-result-json',
@@ -1754,50 +1817,81 @@ export class TokenCounter {
           if (typeof resultForCounting !== 'string') {
             overheadDelta -= 12;
           }
+        } else {
+          const fallback = invocation.isError
+            ? invocation.errorText?.trim()
+              ? invocation.errorText
+              : 'Tool execution failed'
+            : '[empty result]';
+          tokens += this.readOrPersistPartEstimate(
+            part,
+            invocation.isError ? 'tool-result-error' : 'tool-result-json',
+            fallback,
+          );
         }
 
-        return { tokens, overheadDelta, toolResultDelta };
+        return { tokens, overheadDelta, extraMessageDelta };
       }
 
-      if (invocation.state === 'output-denied') {
+      if (state === 'output-denied') {
         // A declined approval carries no tool result; count its denial reason like a small result
-        // so token accounting stays consistent (and doesn't throw on the new state).
-        toolResultDelta++;
-        const reason =
-          (invocation as { approval?: { reason?: string } }).approval?.reason ??
-          'Tool call was not approved by the user';
+        // so token accounting stays consistent.
+        extraMessageDelta++;
+        const signature = this.countToolCallSignature(part, invocation);
+        tokens += signature.tokens;
+        overheadDelta += signature.overheadDelta;
+        const reason = invocation.approval?.reason?.trim()
+          ? invocation.approval.reason
+          : 'Tool call was not approved by the user';
         tokens += this.readOrPersistPartEstimate(part, 'tool-result-denied', reason);
-        return { tokens, overheadDelta, toolResultDelta };
+        return { tokens, overheadDelta, extraMessageDelta };
       }
 
-      throw new Error(
-        `Unhandled tool-invocation state '${(part as any).toolInvocation?.state}' in token counting for part type '${part.type}'`,
-      );
+      if (state === 'output-error') {
+        extraMessageDelta++;
+        const signature = this.countToolCallSignature(part, invocation);
+        tokens += signature.tokens;
+        overheadDelta += signature.overheadDelta;
+        const errorMessage = invocation.errorText?.trim() ? invocation.errorText : 'Tool execution failed';
+        tokens += this.readOrPersistPartEstimate(part, 'tool-result-error', errorMessage);
+        return { tokens, overheadDelta, extraMessageDelta };
+      }
+
+      // Compile-time exhaustiveness check only. This counter reads rows that another
+      // @mastra/core version may have written, so an unknown state must not stop the count.
+      // It falls through to the generic serializer below and yields an over-estimate instead.
+      const exhaustiveStateCheck: never = state;
+      void exhaustiveStateCheck;
     }
 
     if (typeof part.type === 'string' && part.type.startsWith('data-')) {
-      return { tokens: 0, overheadDelta, toolResultDelta };
+      return { tokens: 0, overheadDelta, extraMessageDelta };
     }
 
     if (part.type === 'reasoning') {
-      return { tokens: 0, overheadDelta, toolResultDelta };
+      return { tokens: 0, overheadDelta, extraMessageDelta };
     }
 
     const serialized = serializePartForTokenCounting(part);
     return {
       tokens: this.readOrPersistPartEstimate(part, `part-${part.type}`, serialized),
       overheadDelta,
-      toolResultDelta,
+      extraMessageDelta,
     };
   }
 
   /**
-   * Count tokens in a single message
+   * Count tokens in a single message.
+   *
+   * Canonical terminal invocations carry their call signature and outcome in one part. Legacy or
+   * foreign histories may instead repeat the same signature across separate call and result
+   * messages; those signatures are intentionally counted once per message because this API has no
+   * sequence context. The conservative overcount can activate observation earlier, never later.
    */
   countMessage(message: MastraDBMessage): number {
     let payloadTokens = this.countString(message.role);
     let overhead = TokenCounter.TOKENS_PER_MESSAGE;
-    let toolResultCount = 0;
+    let extraMessageCount = 0;
 
     if (typeof message.content === 'string') {
       payloadTokens += this.readOrPersistMessageEstimate(message, 'message-content', message.content);
@@ -1815,13 +1909,13 @@ export class TokenCounter {
           const result = this.countNonAttachmentPart(part);
           payloadTokens += result.tokens;
           overhead += result.overheadDelta;
-          toolResultCount += result.toolResultDelta;
+          extraMessageCount += result.extraMessageDelta;
         }
       }
     }
 
-    if (toolResultCount > 0) {
-      overhead += toolResultCount * TokenCounter.TOKENS_PER_MESSAGE;
+    if (extraMessageCount > 0) {
+      overhead += extraMessageCount * TokenCounter.TOKENS_PER_MESSAGE;
     }
 
     return Math.round(payloadTokens + overhead);
@@ -1830,7 +1924,7 @@ export class TokenCounter {
   async countMessageAsync(message: MastraDBMessage): Promise<number> {
     let payloadTokens = this.countString(message.role);
     let overhead = TokenCounter.TOKENS_PER_MESSAGE;
-    let toolResultCount = 0;
+    let extraMessageCount = 0;
 
     if (typeof message.content === 'string') {
       payloadTokens += this.readOrPersistMessageEstimate(message, 'message-content', message.content);
@@ -1848,13 +1942,13 @@ export class TokenCounter {
           const result = this.countNonAttachmentPart(part);
           payloadTokens += result.tokens;
           overhead += result.overheadDelta;
-          toolResultCount += result.toolResultDelta;
+          extraMessageCount += result.extraMessageDelta;
         }
       }
     }
 
-    if (toolResultCount > 0) {
-      overhead += toolResultCount * TokenCounter.TOKENS_PER_MESSAGE;
+    if (extraMessageCount > 0) {
+      overhead += extraMessageCount * TokenCounter.TOKENS_PER_MESSAGE;
     }
 
     return Math.round(payloadTokens + overhead);

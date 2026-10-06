@@ -41,13 +41,13 @@ describe('extractSuspendedToolsFromMessages', () => {
   it('reads suspendedTools metadata when present', () => {
     const suspended = { fooTool: { toolName: 'fooTool', resumeSchema: {} } };
     const messages = [makeAssistantMessage({ metadata: { suspendedTools: suspended } })];
-    expect(extractSuspendedToolsFromMessages(messages)).toEqual([suspended.fooTool]);
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([{ toolCallId: 'fooTool', ...suspended.fooTool }]);
   });
 
   it('reads pendingToolApprovals metadata as a fallback', () => {
     const pending = { approveMe: { toolName: 'approveMe', type: 'approval' } };
     const messages = [makeAssistantMessage({ metadata: { pendingToolApprovals: pending } })];
-    expect(extractSuspendedToolsFromMessages(messages)).toEqual([pending.approveMe]);
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([{ toolCallId: 'approveMe', ...pending.approveMe }]);
   });
 
   it('falls back to data-tool-call-suspended parts when metadata is absent', () => {
@@ -64,13 +64,78 @@ describe('extractSuspendedToolsFromMessages', () => {
     expect((result[0] as { toolName: string }).toolName).toBe('fooTool');
   });
 
+  it('preserves the original toolCallId and surfaces delegatedRunId for diagnostics', () => {
+    // Persisted metadata stores the OUTER resumable runId (for refresh/restart
+    // resume) with the inner suspended run as `delegatedRunId`. Auto-resume uses
+    // the original toolCallId for correlation while keeping the inner run visible.
+    const pending = {
+      'tc-1': { toolCallId: 'tc-1', toolName: 'agent-subAgent', runId: 'outer-run', delegatedRunId: 'inner-run' },
+    };
+    const messages = [makeAssistantMessage({ metadata: { pendingToolApprovals: pending } })];
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([
+      { toolCallId: 'tc-1', toolName: 'agent-subAgent', runId: 'inner-run' },
+    ]);
+  });
+
+  it('uses the parent delegation identity for auto-resume while preserving inner approval details', () => {
+    const pending = {
+      'tc-1': {
+        toolCallId: 'tc-1',
+        toolName: 'charge-card',
+        args: { amountCents: 500 },
+        parentToolName: 'agent-billing',
+        parentArgs: { prompt: 'Charge the customer' },
+        runId: 'outer-run',
+        delegatedRunId: 'inner-run',
+      },
+    };
+    const messages = [makeAssistantMessage({ metadata: { pendingToolApprovals: pending } })];
+
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([
+      {
+        toolCallId: 'tc-1',
+        toolName: 'agent-billing',
+        args: { prompt: 'Charge the customer' },
+        approvalToolName: 'charge-card',
+        approvalArgs: { amountCents: 500 },
+        runId: 'inner-run',
+      },
+    ]);
+  });
+
+  it('keeps runId untouched for non-delegated entries', () => {
+    const pending = { 'tc-2': { toolCallId: 'tc-2', toolName: 'directTool', runId: 'run-1' } };
+    const messages = [makeAssistantMessage({ metadata: { pendingToolApprovals: pending } })];
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([
+      { toolCallId: 'tc-2', toolName: 'directTool', runId: 'run-1' },
+    ]);
+  });
+
+  it('preserves distinct toolCallIds for parallel calls to the same tool', () => {
+    const messages = [
+      makeAssistantMessage({
+        metadata: {
+          suspendedTools: {
+            'call-a': { toolName: 'agent-researcher', delegatedRunId: 'inner-a' },
+            'call-b': { toolName: 'agent-researcher', delegatedRunId: 'inner-b' },
+          },
+        },
+      }),
+    ];
+
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([
+      { toolCallId: 'call-a', toolName: 'agent-researcher', runId: 'inner-a' },
+      { toolCallId: 'call-b', toolName: 'agent-researcher', runId: 'inner-b' },
+    ]);
+  });
+
   it('walks assistant messages newest-to-oldest', () => {
     const newerSuspended = { newer: { toolName: 'newer' } };
     const messages = [
       makeAssistantMessage({ metadata: { suspendedTools: { older: { toolName: 'older' } } } }),
       makeAssistantMessage({ metadata: { suspendedTools: newerSuspended } }),
     ];
-    expect(extractSuspendedToolsFromMessages(messages)).toEqual([newerSuspended.newer]);
+    expect(extractSuspendedToolsFromMessages(messages)).toEqual([{ toolCallId: 'newer', ...newerSuspended.newer }]);
   });
 });
 
@@ -84,6 +149,37 @@ describe('buildAutoResumeSystemMessageSuffix', () => {
     expect(suffix).not.toBeNull();
     expect(suffix!).toContain('Analyse the suspended tools');
     expect(suffix!).toContain('fooTool');
+    expect(suffix!).toContain('suspendedToolCallId');
+  });
+
+  it('returns null when only approval suspensions are present', () => {
+    expect(buildAutoResumeSystemMessageSuffix([{ toolName: 'chargeCard', type: 'approval' }])).toBeNull();
+  });
+
+  it('excludes approval suspensions when generic suspensions are also present', () => {
+    const suffix = buildAutoResumeSystemMessageSuffix([
+      { toolName: 'chargeCard', type: 'approval' },
+      { toolName: 'collectAddress', type: 'suspension' },
+    ]);
+
+    expect(suffix).toContain('collectAddress');
+    expect(suffix).not.toContain('chargeCard');
+  });
+
+  it('omits parentRunId from the serialized suspended tools', () => {
+    const suffix = buildAutoResumeSystemMessageSuffix([
+      {
+        toolName: 'fooTool',
+        runId: 'sub-run',
+        parentRunId: 'parent-run',
+        toolCallId: 'call-1',
+      },
+    ]);
+    expect(suffix).not.toBeNull();
+    expect(suffix!).toContain('"runId":"sub-run"');
+    expect(suffix!).toContain('"toolName":"fooTool"');
+    expect(suffix!).not.toContain('parentRunId');
+    expect(suffix!).not.toContain('parent-run');
   });
 });
 

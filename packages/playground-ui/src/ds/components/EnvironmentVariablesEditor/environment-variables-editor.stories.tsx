@@ -176,12 +176,12 @@ function EnvironmentVariablesPage({ children }: { children?: ReactNode }) {
       : readOnlyVariables;
 
   return (
-    <div className="min-h-190 bg-surface1 p-6 text-neutral6">
+    <div className="min-h-190 bg-sidebar p-6 text-foreground">
       <div className="mx-auto flex max-w-6xl flex-col gap-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h2 className="text-ui-xl font-semibold text-neutral6">Environment Variables</h2>
-            <p className="mt-1 text-ui-sm text-neutral3">Store API keys, tokens, and config securely.</p>
+            <h2 className="text-title text-foreground">Environment Variables</h2>
+            <p className="mt-1 text-caption text-muted-foreground">Store API keys, tokens, and config securely.</p>
           </div>
           {children}
         </div>
@@ -233,11 +233,9 @@ function EnvironmentVariablesDrawerStory() {
         </DrawerTrigger>
         <DrawerContent className="w-3xl max-w-[calc(100vw-2rem)]">
           <EnvironmentVariablesEditor.Root editor={editor} className="contents">
-            <DrawerHeader className="flex-row items-center justify-between gap-3 border-b border-border1">
+            <DrawerHeader className="flex-row items-center justify-between gap-3 border-b border-border">
               <DrawerTitle>Add Environment Variable</DrawerTitle>
-              <EnvironmentVariablesEditor.UploadButton variant="outline" size="sm">
-                Import .env
-              </EnvironmentVariablesEditor.UploadButton>
+              <EnvironmentVariablesEditor.UploadButton size="sm">Import .env</EnvironmentVariablesEditor.UploadButton>
             </DrawerHeader>
             <DrawerBody className="overflow-y-auto">
               <div className="grid gap-6">
@@ -247,7 +245,7 @@ function EnvironmentVariablesDrawerStory() {
                 <EnvironmentVariablesEditor.DuplicateKeysError />
               </div>
             </DrawerBody>
-            <DrawerFooter className="items-center border-t border-border1">
+            <DrawerFooter className="items-center border-t border-border">
               <Button
                 type="button"
                 variant="primary"

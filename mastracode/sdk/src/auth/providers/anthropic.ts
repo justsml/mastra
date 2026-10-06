@@ -69,6 +69,10 @@ export async function completeAnthropicLogin(input: string, verifier: string): P
 
   const tokenResponse = await fetch(TOKEN_URL, {
     method: 'POST',
+    // Bound the OAuth exchange so an unresponsive upstream cannot pin the
+    // caller (and, in the shipyard server, the containing project lock)
+    // indefinitely. See 2025-07-23 shipyard latency incident.
+    signal: AbortSignal.timeout(15_000),
     headers: {
       'Content-Type': 'application/json',
     },
@@ -83,8 +87,7 @@ export async function completeAnthropicLogin(input: string, verifier: string): P
   });
 
   if (!tokenResponse.ok) {
-    const error = await tokenResponse.text();
-    throw new Error(`Token exchange failed: ${error}`);
+    throw new Error(`Token exchange failed: ${tokenResponse.status}`);
   }
 
   const tokenData = (await tokenResponse.json()) as {
@@ -127,6 +130,7 @@ export async function loginAnthropic(
 export async function refreshAnthropicToken(refreshToken: string): Promise<OAuthCredentials> {
   const response = await fetch(TOKEN_URL, {
     method: 'POST',
+    signal: AbortSignal.timeout(15_000),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       grant_type: 'refresh_token',
@@ -136,8 +140,7 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Anthropic token refresh failed: ${error}`);
+    throw new Error(`Anthropic token refresh failed: ${response.status}`);
   }
 
   const data = (await response.json()) as {

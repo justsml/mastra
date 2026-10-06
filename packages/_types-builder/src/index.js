@@ -1,10 +1,11 @@
-import { spawn } from 'child_process';
+import { spawn } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import { glob as globby } from 'tinyglobby';
-import fs from 'fs/promises';
-import path from 'path';
-import { statSync } from 'fs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { statSync } from 'node:fs';
 import { replaceTypes } from './replace-types.js';
+import { embedTypes } from './embed-types.js';
 
 const rgxFrom = /(?<=from )['|"](.*)['|"]/gm;
 const importSpecifierRegex =
@@ -149,9 +150,10 @@ async function validateDeclarationRuntimeImports(rootDir, bundledPackages) {
  *
  * @param {string} rootDir
  * @param {Set<string>} bundledPackages
+ * @param {{ rollupTypes?: Record<string, string[]> }} options Declaration entry points relative to dist and their type-only dependencies.
  * @returns {Promise<void>}
  */
-export async function generateTypes(rootDir, bundledPackages = new Set()) {
+export async function generateTypes(rootDir, bundledPackages = new Set(), { rollupTypes = {} } = {}) {
   try {
     // Use spawn instead of exec to properly inherit stdio
     // Use shell: true for cross-platform compatibility
@@ -173,6 +175,11 @@ export async function generateTypes(rootDir, bundledPackages = new Set()) {
 
       tscProcess.on('error', reject);
     });
+
+    // Roll up structural type-only boundaries before copying bundled declaration graphs.
+    for (const [entry, dependencies] of Object.entries(rollupTypes)) {
+      await embedTypes(path.join(rootDir, 'dist', entry), rootDir, new Set(dependencies));
+    }
 
     const dtsFiles = await globby('dist/**/*.d.ts', {
       cwd: rootDir,

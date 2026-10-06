@@ -1,9 +1,13 @@
+import { ActionRow } from '@mastra/playground-ui/components/ActionRow';
+import { Badge } from '@mastra/playground-ui/components/Badge';
 import { Button } from '@mastra/playground-ui/components/Button';
-import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
-import { SelectFieldBlock } from '@mastra/playground-ui/components/FormFieldBlocks';
+import { ButtonsGroup, ButtonsGroupText } from '@mastra/playground-ui/components/ButtonsGroup';
 import { ListSearch } from '@mastra/playground-ui/components/ListSearch';
-import { XIcon } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
+import { GitCompare, Play, XIcon, X } from 'lucide-react';
 import { EXPERIMENT_STATUS_OPTIONS } from './experiments-list-options';
+import type { DatasetTargetType } from '@/domains/datasets/components/target-type-options';
+import { TargetFilter } from '@/domains/shared/components/target-filter';
 
 export interface ExperimentsToolbarDatasetOption {
   value: string;
@@ -18,8 +22,26 @@ export interface ExperimentsToolbarProps {
   datasetFilter: string;
   onDatasetFilterChange: (value: string) => void;
   datasetOptions: ExperimentsToolbarDatasetOption[];
+  targetType: DatasetTargetType | '';
+  onTargetTypeChange: (type: DatasetTargetType | '') => void;
+  targetId: string;
+  onTargetIdChange: (id: string) => void;
   onReset?: () => void;
   hasActiveFilters?: boolean;
+  onRunClick?: () => void;
+  runTooltip?: string;
+  /** When omitted the Compare entry point is hidden. */
+  onCompareClick?: () => void;
+  /** When provided, the comparison selection controls replace the Compare/Run actions. */
+  selection?: ExperimentsToolbarSelection;
+}
+
+export interface ExperimentsToolbarSelection {
+  selectedCount: number;
+  onExecuteCompare: () => void;
+  onCancelSelection: () => void;
+  /** When set, the "Compare Experiments" action is disabled and this reason is shown. */
+  compareDisabledReason?: string;
 }
 
 export function ExperimentsToolbar({
@@ -30,42 +52,104 @@ export function ExperimentsToolbar({
   datasetFilter,
   onDatasetFilterChange,
   datasetOptions,
+  targetType,
+  onTargetTypeChange,
+  targetId,
+  onTargetIdChange,
   onReset,
   hasActiveFilters,
+  onRunClick,
+  runTooltip = 'Run an experiment',
+  onCompareClick,
+  selection,
 }: ExperimentsToolbarProps) {
+  const canCompare = selection?.selectedCount === 2 && !selection.compareDisabledReason;
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <ListSearch
-        label="Search experiments"
-        placeholder="Filter by experiment, dataset, or target"
-        value={search}
-        onSearch={onSearchChange}
-      />
-      <ButtonsGroup>
-        <SelectFieldBlock
-          label="Status"
-          labelIsHidden
-          name="filter-status"
-          options={[...EXPERIMENT_STATUS_OPTIONS]}
-          value={statusFilter}
-          onValueChange={onStatusFilterChange}
-          className="whitespace-nowrap"
-        />
-        <SelectFieldBlock
-          label="Dataset"
-          labelIsHidden
-          name="filter-dataset"
-          options={datasetOptions}
-          value={datasetFilter}
-          onValueChange={onDatasetFilterChange}
-          className="whitespace-nowrap"
+    <ActionRow>
+      <ActionRow.Start>
+        <div className="max-w-120 flex-1">
+          <ListSearch
+            label="Search experiments"
+            placeholder="Filter by experiment, dataset, or target"
+            value={search}
+            onSearch={onSearchChange}
+          />
+        </div>
+        <Select value={statusFilter} onValueChange={onStatusFilterChange}>
+          <SelectTrigger aria-label="Status" size="md" className="whitespace-nowrap">
+            <SelectValue placeholder="Select an option" />
+          </SelectTrigger>
+          <SelectContent>
+            {EXPERIMENT_STATUS_OPTIONS.map(option => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={datasetFilter} onValueChange={onDatasetFilterChange}>
+          <SelectTrigger aria-label="Dataset" size="md" className="whitespace-nowrap">
+            <SelectValue placeholder="Select an option" />
+          </SelectTrigger>
+          <SelectContent>
+            {datasetOptions.map(option => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <TargetFilter
+          targetType={targetType}
+          targetId={targetId}
+          onTargetTypeChange={onTargetTypeChange}
+          onTargetIdChange={onTargetIdChange}
         />
         {onReset && hasActiveFilters && (
-          <Button onClick={onReset} size="sm" variant="default">
-            <XIcon className="size-3" /> Reset
+          <Button onClick={onReset} size="sm" variant="default" icon={<XIcon />}>
+            Reset
           </Button>
         )}
-      </ButtonsGroup>
-    </div>
+      </ActionRow.Start>
+      {selection ? (
+        <ActionRow.End>
+          <ButtonsGroup className="whitespace-nowrap">
+            <ButtonsGroupText className="gap-2">
+              <Badge size="sm" variant={selection.selectedCount < 2 ? 'destructive' : 'success'}>
+                {selection.selectedCount} / 2
+              </Badge>
+              selected
+              {selection.compareDisabledReason && (
+                <span className="text-destructive-foreground">· {selection.compareDisabledReason}</span>
+              )}
+            </ButtonsGroupText>
+            <Button variant="primary" disabled={!canCompare} onClick={selection.onExecuteCompare} icon={<GitCompare />}>
+              Compare Experiments
+            </Button>
+            <Button icon={<X />} onClick={selection.onCancelSelection}>
+              Cancel
+            </Button>
+          </ButtonsGroup>
+        </ActionRow.End>
+      ) : (
+        <ActionRow.End>
+          {onCompareClick && (
+            <Button
+              onClick={onCompareClick}
+              tooltip="Select two experiments of the same dataset to compare"
+              icon={<GitCompare />}
+            >
+              Compare
+            </Button>
+          )}
+          {onRunClick && (
+            <Button onClick={onRunClick} tooltip={runTooltip} variant="primary" icon={<Play />}>
+              Run Experiment
+            </Button>
+          )}
+        </ActionRow.End>
+      )}
+    </ActionRow>
   );
 }

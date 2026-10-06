@@ -1,13 +1,13 @@
 ---
 title: "Gates and verdicts | Evals"
-description: "Define hard requirements and quality thresholds for eval runs, with a computed pass/fail verdict."
+description: "Define mandatory gates and score thresholds for Mastra evals, compute passed, scored, or failed verdicts, and enforce quality requirements in CI."
 packages:
   - "@mastra/core"
 ---
 
 # Gates and verdicts
 
-Gates and verdicts add severity semantics to `runEvals`. Gates are scorers that must score 1.0 — hard requirements that block a run. Thresholds are minimum acceptable scores on tracked metrics. The verdict summarizes the outcome as `passed`, `scored`, or `failed`.
+Gates and verdicts add severity semantics to `runEvals`. Gates are scorers that must score 1.0, hard requirements that block a run. Thresholds are minimum acceptable scores on tracked metrics. The verdict summarizes the outcome as `passed`, `scored`, or `failed`.
 
 ## When to use gates and verdicts
 
@@ -49,7 +49,7 @@ The verdict is computed from gates and thresholds after all data items are proce
 - `scored`: All gates passed, but at least one threshold scorer missed its threshold
 - `passed`: All gates scored 1.0 and all thresholds were met
 
-When no gates or threshold-bearing scorers are provided, the verdict field is omitted and `runEvals` behaves exactly as before.
+The verdict field is omitted when no gates or threshold-bearing scorers are provided, and when every configured gate and threshold returned `notScorable()` (no numeric evidence). In those cases `runEvals` still returns `scores` and `summary`.
 
 ## Gates
 
@@ -86,7 +86,7 @@ const result = await runEvals({
 })
 ```
 
-You must provide at least one scorer or gate — a run with neither throws an error.
+You must provide at least one scorer or gate, a run with neither throws an error.
 
 ## Thresholds
 
@@ -94,8 +94,8 @@ Wrap a scorer in `{ scorer, threshold }` to set pass/fail bounds. The threshold 
 
 A `threshold` can be:
 
-- **A number** — implies minimum (score at or above passes): `{ scorer, threshold: 0.7 }`
-- **An object with `min` and/or `max`** — for range-based checks: `{ scorer, threshold: { max: 0.3 } }`
+- **A number**: implies minimum (score at or above passes): `{ scorer, threshold: 0.7 }`
+- **An object with `min` and/or `max`**: for range-based checks: `{ scorer, threshold: { max: 0.3 } }`
 
 Use `max` for scorers where a high score is bad (e.g., hallucination, toxicity). Use `{ min, max }` when the score should fall within a specific band.
 

@@ -2,9 +2,39 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { getCallbackUrlCandidates } from '@mastra/mcp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { classifyServerEntry, expandEnvVars, loadMcpConfig, validateConfig } from '../config.js';
+import {
+  DEFAULT_OAUTH_REDIRECT_URL,
+  MASTRA_CODE_CLIENT_METADATA_URL,
+  classifyServerEntry,
+  expandEnvVars,
+  loadMcpConfig,
+  validateConfig,
+} from '../config.js';
+
+describe('zero-config OAuth identity', () => {
+  // The hosted Client ID Metadata Document (mastra-ai/mastracode-website,
+  // static/.well-known/oauth-client/mastracode.json) must list every URL the
+  // callback server may bind. If this assertion changes, republish the document.
+  it('pins the redirect URIs the hosted metadata document must list', () => {
+    expect(MASTRA_CODE_CLIENT_METADATA_URL).toBe('https://code.mastra.ai/.well-known/oauth-client/mastracode.json');
+    expect(getCallbackUrlCandidates(DEFAULT_OAUTH_REDIRECT_URL).map(String)).toEqual([
+      'http://127.0.0.1:1458/oauth/callback',
+      'http://127.0.0.1:1459/oauth/callback',
+      'http://127.0.0.1:1460/oauth/callback',
+      'http://127.0.0.1:1461/oauth/callback',
+      'http://127.0.0.1:1462/oauth/callback',
+      'http://127.0.0.1:1463/oauth/callback',
+      'http://127.0.0.1:1464/oauth/callback',
+      'http://127.0.0.1:1465/oauth/callback',
+      'http://127.0.0.1:1466/oauth/callback',
+      'http://127.0.0.1:1467/oauth/callback',
+      'http://127.0.0.1:1468/oauth/callback',
+    ]);
+  });
+});
 
 describe('classifyServerEntry', () => {
   it('classifies stdio entry', () => {
@@ -188,6 +218,104 @@ describe('validateConfig', () => {
     });
   });
 
+  it('applies the default loopback redirect URL when oauth.redirectUrl is omitted', () => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/mcp',
+          oauth: {},
+        },
+      },
+    });
+
+    expect(result.skippedServers).toBeUndefined();
+    expect((result.mcpServers!['remote'] as { oauth?: { redirectUrl: string } }).oauth?.redirectUrl).toBe(
+      DEFAULT_OAUTH_REDIRECT_URL,
+    );
+  });
+
+  it('rejects a non-string oauth.redirectUrl', () => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/mcp',
+          oauth: { redirectUrl: 42 },
+        },
+      },
+    });
+
+    expect(result.mcpServers).toBeUndefined();
+    expect(result.skippedServers).toEqual([
+      { name: 'remote', reason: 'Invalid OAuth config: "redirectUrl" must be a string' },
+    ]);
+  });
+
+  it('synthesizes a localhost redirect URL from oauth.callbackPort', () => {
+    // Slack's official MCP plugin config uses `clientId` + `callbackPort`
+    // (the Claude Code / Codex convention) — it must paste verbatim.
+    const result = validateConfig({
+      mcpServers: {
+        slack: {
+          url: 'https://mcp.slack.com/mcp',
+          oauth: { clientId: 'slack-client-id', callbackPort: 3118 },
+        },
+      },
+    });
+
+    expect(result.skippedServers).toBeUndefined();
+    expect((result.mcpServers!['slack'] as { oauth?: { redirectUrl: string } }).oauth?.redirectUrl).toBe(
+      'http://localhost:3118/callback',
+    );
+  });
+
+  it('rejects oauth config that sets both redirectUrl and callbackPort', () => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/mcp',
+          oauth: { redirectUrl: 'http://localhost:3000/oauth/callback', callbackPort: 3118 },
+        },
+      },
+    });
+
+    expect(result.mcpServers).toBeUndefined();
+    expect(result.skippedServers).toEqual([
+      { name: 'remote', reason: 'Invalid OAuth config: set either "redirectUrl" or "callbackPort", not both' },
+    ]);
+  });
+
+  it.each([0, 65536, -1])('rejects an out-of-range oauth.callbackPort: %p', callbackPort => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/mcp',
+          oauth: { callbackPort },
+        },
+      },
+    });
+
+    expect(result.mcpServers).toBeUndefined();
+    expect(result.skippedServers).toEqual([
+      { name: 'remote', reason: 'Invalid OAuth config: "callbackPort" must be an integer between 1 and 65535' },
+    ]);
+  });
+
+  it.each([3118.5, '3118', true])('rejects a non-integer oauth.callbackPort: %p', callbackPort => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/mcp',
+          oauth: { callbackPort },
+        },
+      },
+    });
+
+    expect(result.mcpServers).toBeUndefined();
+    expect(result.skippedServers).toEqual([
+      { name: 'remote', reason: 'Invalid OAuth config: "callbackPort" must be an integer between 1 and 65535' },
+    ]);
+  });
+
   it('accepts loopback IPv6 HTTP OAuth redirect URLs', () => {
     const result = validateConfig({
       mcpServers: {
@@ -255,6 +383,21 @@ describe('validateConfig', () => {
         remote: {
           url: 'https://mcp.example.com/sse',
           oauth: { redirectUrl: 'http://oauth.example.com/callback' },
+        },
+      },
+    });
+
+    expect(result.mcpServers).toBeUndefined();
+    expect(result.skippedServers).toHaveLength(1);
+    expect(result.skippedServers![0]!.reason).toContain('must use HTTPS');
+  });
+
+  it('rejects an HTTP OAuth redirect URL whose host only looks like a loopback address', () => {
+    const result = validateConfig({
+      mcpServers: {
+        remote: {
+          url: 'https://mcp.example.com/sse',
+          oauth: { redirectUrl: 'http://127.evil.com/callback' },
         },
       },
     });
@@ -377,6 +520,8 @@ describe('loadMcpConfig', () => {
   let homeDir: string;
   let previousHome: string | undefined;
   let previousUserProfile: string | undefined;
+  let previousCodexHome: string | undefined;
+  let previousCodexToken: string | undefined;
 
   beforeEach(() => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-config-'));
@@ -385,6 +530,8 @@ describe('loadMcpConfig', () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-home-'));
     previousHome = process.env.HOME;
     previousUserProfile = process.env.USERPROFILE;
+    previousCodexHome = process.env.CODEX_HOME;
+    previousCodexToken = process.env.CODEX_TOKEN;
     process.env.HOME = homeDir;
     process.env.USERPROFILE = homeDir;
   });
@@ -394,6 +541,10 @@ describe('loadMcpConfig', () => {
     else process.env.HOME = previousHome;
     if (previousUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = previousUserProfile;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+    if (previousCodexToken === undefined) delete process.env.CODEX_TOKEN;
+    else process.env.CODEX_TOKEN = previousCodexToken;
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
@@ -465,5 +616,81 @@ describe('loadMcpConfig', () => {
     const config = loadMcpConfig(projectDir);
 
     expect(config.mcpServers!['shared']).toEqual({ command: 'root-cmd', args: undefined, env: undefined });
+  });
+
+  it('loads the global Claude Code config only when enabled', () => {
+    writeJson(path.join(homeDir, '.claude.json'), {
+      mcpServers: { claudeGlobal: { command: 'claude-global' } },
+    });
+
+    expect(loadMcpConfig(projectDir).mcpServers).toBeUndefined();
+    expect(loadMcpConfig(projectDir, '.mastracode', { claudeCodeGlobal: true }).mcpServers).toEqual({
+      claudeGlobal: { command: 'claude-global', args: undefined, env: undefined },
+    });
+  });
+
+  it('loads and normalizes the global Codex config only when enabled', () => {
+    const codexDir = path.join(homeDir, 'custom-codex');
+    process.env['CODEX_HOME'] = codexDir;
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(codexDir, 'config.toml'),
+      [
+        '[mcp_servers.stdio]',
+        'command = "npx"',
+        'args = ["-y", "example"]',
+        '[mcp_servers.stdio.env]',
+        'TOKEN = "${CODEX_TOKEN}"',
+        '',
+        '[mcp_servers.remote]',
+        'url = "https://example.com/mcp"',
+        'bearer_token_env_var = "CODEX_TOKEN"',
+        '[mcp_servers.remote.http_headers]',
+        'X-Source = "codex"',
+        '',
+        '[mcp_servers.disabled]',
+        'command = "ignored"',
+        'enabled = false',
+      ].join('\n'),
+    );
+    process.env['CODEX_TOKEN'] = 'secret';
+
+    expect(loadMcpConfig(projectDir).mcpServers).toBeUndefined();
+    expect(loadMcpConfig(projectDir, '.mastracode', { codexGlobal: true }).mcpServers).toEqual({
+      stdio: { command: 'npx', args: ['-y', 'example'], env: { TOKEN: 'secret' } },
+      remote: {
+        url: 'https://example.com/mcp',
+        headers: { 'X-Source': 'codex', Authorization: 'Bearer secret' },
+        oauth: undefined,
+      },
+    });
+  });
+
+  it('uses Claude global, then Codex global, then existing Mastra source precedence', () => {
+    writeJson(path.join(homeDir, '.claude.json'), {
+      mcpServers: { shared: { command: 'claude-global' } },
+    });
+    const codexDir = path.join(homeDir, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(path.join(codexDir, 'config.toml'), '[mcp_servers.shared]\ncommand = "codex-global"\n');
+    writeJson(path.join(homeDir, '.mastracode', 'mcp.json'), {
+      mcpServers: { shared: { command: 'mastra-global' } },
+    });
+
+    const config = loadMcpConfig(projectDir, '.mastracode', { claudeCodeGlobal: true, codexGlobal: true });
+
+    expect(config.mcpServers!['shared']).toEqual({ command: 'mastra-global', args: undefined, env: undefined });
+  });
+
+  it('silently ignores malformed external config files', () => {
+    fs.writeFileSync(path.join(homeDir, '.claude.json'), '{bad json');
+    const codexDir = path.join(homeDir, '.codex');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(path.join(codexDir, 'config.toml'), 'not valid = [');
+
+    const config = loadMcpConfig(projectDir, '.mastracode', { claudeCodeGlobal: true, codexGlobal: true });
+
+    expect(config.mcpServers).toBeUndefined();
+    expect(config.skippedServers).toBeUndefined();
   });
 });

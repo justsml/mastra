@@ -19,6 +19,8 @@ export {
   OBSERVATIONAL_MEMORY_DEFAULTS,
   OBSERVATION_CONTINUATION_HINT,
   OBSERVATION_CONTEXT_PROMPT,
+  OBSERVATION_CONTEXT_PROMPT_THREAD,
+  getObservationContextPrompt,
   OBSERVATION_CONTEXT_INSTRUCTIONS,
 } from './constants';
 
@@ -39,6 +41,28 @@ export type {
   ExtractorSource,
 } from './extractor';
 export { WorkingMemoryExtractor } from './working-memory-extractor';
+export {
+  buildSubconsciousActivitySnapshot,
+  KnowledgeSemanticIndexCoordinator,
+  publishSubconsciousActivity,
+  renderSubconsciousActivity,
+  StaleKnowledgeSemanticIndexError,
+  Subconscious,
+  SUBCONSCIOUS_ACTIVITY_STATE_ID,
+  SubconsciousRemindExtractor,
+} from './subconscious';
+export type {
+  KnowledgeSemanticIndexCoordinatorConfig,
+  ResolvedSubconsciousAgent,
+  SubconsciousActivitySnapshot,
+  SubconsciousActivityUpdate,
+  ResolvedSubconsciousConfig,
+  SubconsciousBuiltInObservationAgent,
+  SubconsciousBuiltInObservationConfig,
+  SubconsciousConfig,
+  SubconsciousCustomObservationConfig,
+  SubconsciousObservationEntry,
+} from './subconscious';
 
 // Standalone conversation summarization (reuses the Observer + extractor plumbing)
 export { summarizeConversation } from './summarize';
@@ -48,9 +72,14 @@ export type {
   ObservationalMemoryConfig,
   ObservationDebugEvent,
   ObserveHooks,
+  ObserveLifecycleHooks,
+  ObserveTransformHooks,
+  ObserveHookContext,
   ObserveHookUsage,
+  ObserveTrigger,
   ObservationConfig,
   ReflectionConfig,
+  ContinuationHintsConfig,
   ObserverResult,
   ReflectorResult,
   // Observation marker config

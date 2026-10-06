@@ -22,6 +22,40 @@ import type {
   TaskQueryParams,
   TaskStatusUpdateEvent,
 } from '@mastra/core/a2a/client';
+import {
+  AgentCard as AgentCardV1Codec,
+  CancelTaskRequest as CancelTaskRequestV1Codec,
+  DeleteTaskPushNotificationConfigRequest as DeleteTaskPushNotificationConfigRequestV1Codec,
+  GetTaskPushNotificationConfigRequest as GetTaskPushNotificationConfigRequestV1Codec,
+  ListTaskPushNotificationConfigsRequest as ListTaskPushNotificationConfigsRequestV1Codec,
+  ListTaskPushNotificationConfigsResponse as ListTaskPushNotificationConfigsResponseV1Codec,
+  TaskPushNotificationConfig as TaskPushNotificationConfigV1Codec,
+  GetTaskRequest as GetTaskRequestV1Codec,
+  ListTasksRequest as ListTasksRequestV1Codec,
+  ListTasksResponse as ListTasksResponseV1Codec,
+  SendMessageRequest as SendMessageRequestV1Codec,
+  SendMessageResponse as SendMessageResponseV1Codec,
+  StreamResponse as StreamResponseV1Codec,
+  SubscribeToTaskRequest as SubscribeToTaskRequestV1Codec,
+  Task as TaskV1Codec,
+} from '@mastra/core/a2a/v1';
+import type {
+  AgentCard as AgentCardV1,
+  CancelTaskRequest as CancelTaskRequestV1,
+  DeleteTaskPushNotificationConfigRequest as DeleteTaskPushNotificationConfigRequestV1,
+  GetTaskPushNotificationConfigRequest as GetTaskPushNotificationConfigRequestV1,
+  ListTaskPushNotificationConfigsRequest as ListTaskPushNotificationConfigsRequestV1,
+  ListTaskPushNotificationConfigsResponse as ListTaskPushNotificationConfigsResponseV1,
+  TaskPushNotificationConfig as TaskPushNotificationConfigV1,
+  GetTaskRequest as GetTaskRequestV1,
+  ListTasksRequest as ListTasksRequestV1,
+  ListTasksResponse as ListTasksResponseV1,
+  SendMessageRequest as SendMessageRequestV1,
+  SendMessageResponse as SendMessageResponseV1,
+  StreamResponse as StreamResponseV1,
+  SubscribeToTaskRequest as SubscribeToTaskRequestV1,
+  Task as TaskV1,
+} from '@mastra/core/a2a/v1';
 import type { ClientOptions } from '../types';
 import { MastraClientError as MastraClientErrorClass } from '../types';
 import { processA2AStream } from '../utils/process-a2a-stream';
@@ -329,5 +363,128 @@ export class A2A extends BaseResource {
     });
 
     unwrapA2AResult<unknown>(response);
+  }
+}
+
+/** Client for the A2A Protocol v1.0 wire format. */
+export class A2AV1 extends BaseResource {
+  constructor(
+    options: ClientOptions,
+    private agentId: string,
+  ) {
+    super(options);
+  }
+
+  private async rpc<TResult>(method: string, params?: unknown): Promise<TResult> {
+    const response = await this.request<JSONRPCResponse>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method,
+        params,
+      },
+    });
+
+    return unwrapA2AResult<TResult>(response);
+  }
+
+  async createTaskPushNotificationConfig(params: TaskPushNotificationConfigV1): Promise<TaskPushNotificationConfigV1> {
+    const result = await this.rpc<unknown>(
+      'CreateTaskPushNotificationConfig',
+      TaskPushNotificationConfigV1Codec.toJSON(params),
+    );
+    return TaskPushNotificationConfigV1Codec.fromJSON(result);
+  }
+
+  async getTaskPushNotificationConfig(
+    params: GetTaskPushNotificationConfigRequestV1,
+  ): Promise<TaskPushNotificationConfigV1> {
+    const result = await this.rpc<unknown>(
+      'GetTaskPushNotificationConfig',
+      GetTaskPushNotificationConfigRequestV1Codec.toJSON(params),
+    );
+    return TaskPushNotificationConfigV1Codec.fromJSON(result);
+  }
+
+  async listTaskPushNotificationConfigs(
+    params: ListTaskPushNotificationConfigsRequestV1,
+  ): Promise<ListTaskPushNotificationConfigsResponseV1> {
+    const result = await this.rpc<unknown>(
+      'ListTaskPushNotificationConfigs',
+      ListTaskPushNotificationConfigsRequestV1Codec.toJSON(params),
+    );
+    return ListTaskPushNotificationConfigsResponseV1Codec.fromJSON(result);
+  }
+
+  async deleteTaskPushNotificationConfig(params: DeleteTaskPushNotificationConfigRequestV1): Promise<void> {
+    await this.rpc<unknown>(
+      'DeleteTaskPushNotificationConfig',
+      DeleteTaskPushNotificationConfigRequestV1Codec.toJSON(params),
+    );
+  }
+
+  async getAgentCard(): Promise<AgentCardV1> {
+    const card = await this.request<unknown>(`/.well-known/${this.agentId}/agent-card.json`, {
+      headers: { 'A2A-Version': '1.0' },
+    });
+    return AgentCardV1Codec.fromJSON(card);
+  }
+
+  async sendMessage(params: SendMessageRequestV1): Promise<SendMessageResponseV1> {
+    const result = await this.rpc<unknown>('SendMessage', SendMessageRequestV1Codec.toJSON(params));
+    return SendMessageResponseV1Codec.fromJSON(result);
+  }
+
+  async *sendMessageStream(params: SendMessageRequestV1): AsyncGenerator<StreamResponseV1, void, undefined> {
+    const response = await this.request<Response>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method: 'SendStreamingMessage',
+        params: SendMessageRequestV1Codec.toJSON(params),
+      },
+      stream: true,
+    });
+
+    for await (const event of processA2AStream<unknown>(await requireResponseBody(response, 'message/stream'))) {
+      yield StreamResponseV1Codec.fromJSON(event);
+    }
+  }
+
+  async getTask(params: GetTaskRequestV1): Promise<TaskV1> {
+    const result = await this.rpc<unknown>('GetTask', GetTaskRequestV1Codec.toJSON(params));
+    return TaskV1Codec.fromJSON(result);
+  }
+
+  async listTasks(params: ListTasksRequestV1): Promise<ListTasksResponseV1> {
+    const result = await this.rpc<unknown>('ListTasks', ListTasksRequestV1Codec.toJSON(params));
+    return ListTasksResponseV1Codec.fromJSON(result);
+  }
+
+  async cancelTask(params: CancelTaskRequestV1): Promise<TaskV1> {
+    const result = await this.rpc<unknown>('CancelTask', CancelTaskRequestV1Codec.toJSON(params));
+    return TaskV1Codec.fromJSON(result);
+  }
+
+  async *resubscribeTask(params: SubscribeToTaskRequestV1): AsyncGenerator<StreamResponseV1, void, undefined> {
+    const response = await this.request<Response>(`/a2a/${this.agentId}`, {
+      method: 'POST',
+      headers: { 'A2A-Version': '1.0' },
+      body: {
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method: 'SubscribeToTask',
+        params: SubscribeToTaskRequestV1Codec.toJSON(params),
+      },
+      stream: true,
+    });
+
+    for await (const event of processA2AStream<unknown>(await requireResponseBody(response, 'tasks/resubscribe'))) {
+      yield StreamResponseV1Codec.fromJSON(event);
+    }
   }
 }

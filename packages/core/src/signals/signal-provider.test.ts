@@ -70,6 +70,17 @@ class TestSignalProvider extends SignalProvider<'test-signals'> {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+// Enough of a Mastra surface for `Agent.__registerMastra`, which pushes the
+// agent's arrays of processors into `addProcessor` / `addProcessorConfiguration`.
+function createFakeMastra() {
+  return {
+    getStorage: vi.fn(),
+    addProcessor: vi.fn(),
+    addProcessorConfiguration: vi.fn(),
+    addTool: vi.fn(),
+  } as any;
+}
+
 const target1: SignalProviderTarget = { threadId: 'thread-1', resourceId: 'user-1' };
 const target2: SignalProviderTarget = { threadId: 'thread-2', resourceId: 'user-1' };
 const target3: SignalProviderTarget = { threadId: 'thread-3', resourceId: 'user-2' };
@@ -353,7 +364,7 @@ describe('SignalProvider', () => {
       expect(startFn).toHaveBeenCalledTimes(1);
     });
 
-    it('collects getTools() from providers and merges into agent tools', () => {
+    it('collects getTools() from providers and merges into agent tools', async () => {
       const getToolsSpy = vi.fn(() => ({ myTool: { id: 'myTool' } }));
 
       class ToolProvider extends SignalProvider<'tool-provider'> {
@@ -372,7 +383,7 @@ describe('SignalProvider', () => {
       });
 
       expect(getToolsSpy).toHaveBeenCalledTimes(1);
-      const tools = agent.listTools() as Record<string, unknown>;
+      const tools = (await agent.listTools()) as Record<string, unknown>;
       expect(tools).toHaveProperty('myTool');
     });
 
@@ -463,7 +474,98 @@ describe('SignalProvider', () => {
       expect(p.isConnected).toBe(true);
     });
 
-    it('wires multiple providers independently', () => {
+    it('propagates __registerMastra to processors contributed by signal providers', () => {
+      const providerInputRegister = vi.fn();
+      const providerOutputRegister = vi.fn();
+      const fakeInputProcessor = { id: 'fake-input', __registerMastra: providerInputRegister };
+      const fakeOutputProcessor = { id: 'fake-output', __registerMastra: providerOutputRegister };
+
+      class ProcessorProvider extends SignalProvider<'proc-provider'> {
+        readonly id = 'proc-provider' as const;
+        getInputProcessors() {
+          return [fakeInputProcessor as any];
+        }
+        getOutputProcessors() {
+          return [fakeOutputProcessor as any];
+        }
+      }
+
+      const agent = new Agent({
+        name: 'test-agent',
+        instructions: 'test',
+        model: { provider: 'test', name: 'test', toolChoice: 'auto' } as any,
+        signals: [new ProcessorProvider()],
+      });
+
+      const fakeMastra = createFakeMastra();
+      agent.__registerMastra(fakeMastra);
+
+      expect(providerInputRegister).toHaveBeenCalledWith(fakeMastra);
+      expect(providerOutputRegister).toHaveBeenCalledWith(fakeMastra);
+    });
+
+    // A provider-contributed processor leaves the `Array.isArray(inputProcessors)`
+    // walk in `__registerMastra` as soon as `inputProcessors` is configured as a
+    // function: the Agent folds the two into one resolved function. The processor
+    // then never receives a Mastra and cannot resolve storage.
+    it('propagates __registerMastra to provider processors when inputProcessors is a function', () => {
+      const registerSpy = vi.fn();
+      const fakeInputProcessor = { id: 'fake-input', __registerMastra: registerSpy };
+
+      class ProcessorProvider extends SignalProvider<'proc-provider'> {
+        readonly id = 'proc-provider' as const;
+        getInputProcessors() {
+          return [fakeInputProcessor as any];
+        }
+      }
+
+      const agent = new Agent({
+        name: 'test-agent',
+        instructions: 'test',
+        model: { provider: 'test', name: 'test', toolChoice: 'auto' } as any,
+        signals: [new ProcessorProvider()],
+        inputProcessors: () => [],
+      });
+
+      const fakeMastra = createFakeMastra();
+      agent.__registerMastra(fakeMastra);
+
+      expect(registerSpy).toHaveBeenCalledWith(fakeMastra);
+    });
+
+    // A provider is free to hand out fresh instances per call. Registration has
+    // to land on the instances the agent actually wired, so the getters must not
+    // be consulted again during registration.
+    it('registers the processor instance the agent wired, not a fresh one', () => {
+      const created: Array<{ id: string; __registerMastra: ReturnType<typeof vi.fn> }> = [];
+
+      class FreshProcessorProvider extends SignalProvider<'fresh-provider'> {
+        readonly id = 'fresh-provider' as const;
+        getInputProcessors() {
+          const processor = { id: `fresh-${created.length}`, __registerMastra: vi.fn() };
+          created.push(processor);
+          return [processor as any];
+        }
+      }
+
+      const agent = new Agent({
+        name: 'test-agent',
+        instructions: 'test',
+        model: { provider: 'test', name: 'test', toolChoice: 'auto' } as any,
+        signals: [new FreshProcessorProvider()],
+      });
+
+      const wired = created[0]!;
+      const lookupsAfterConstruction = created.length;
+
+      const fakeMastra = createFakeMastra();
+      agent.__registerMastra(fakeMastra);
+
+      expect(wired.__registerMastra).toHaveBeenCalledWith(fakeMastra);
+      expect(created.length).toBe(lookupsAfterConstruction);
+    });
+
+    it('wires multiple providers independently', async () => {
       class ProviderA extends SignalProvider<'provider-a'> {
         readonly id = 'provider-a' as const;
         getTools() {
@@ -488,7 +590,7 @@ describe('SignalProvider', () => {
         signals: [a, b],
       });
 
-      const tools = agent.listTools() as Record<string, unknown>;
+      const tools = (await agent.listTools()) as Record<string, unknown>;
       expect(tools).toHaveProperty('toolA');
       expect(tools).toHaveProperty('toolB');
       expect(a.isConnected).toBe(true);

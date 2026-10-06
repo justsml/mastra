@@ -1,3 +1,5 @@
+import { MastraClient } from '@mastra/client-js';
+import type { ListMemoryThreadMessagesResponse, StreamParams } from '@mastra/client-js';
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import type { TaskItem } from '@mastra/core/signals';
 import { MastraReactProvider } from '@mastra/react';
@@ -6,11 +8,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatProvider } from '../chat/chat-provider';
 import { Thread } from '../thread';
-import { memoryDisabled, memoryEnabled, v2Agent } from './fixtures/agent';
+import { emptyMcpServers, memoryDisabled, memoryEnabled, v2Agent } from './fixtures/agent';
+import { attachmentMessages } from './fixtures/attachment-messages';
 import { WorkingMemoryProvider } from '@/domains/agents/context/agent-working-memory-context';
 import { BrowserSessionProvider } from '@/domains/agents/context/browser-session-provider';
 import { ThreadInputProvider } from '@/domains/conversation';
@@ -55,6 +58,7 @@ const workingMemoryResponse = () =>
   HttpResponse.json({ workingMemory: null, source: 'thread', workingMemoryTemplate: null, threadExists: false });
 
 const baseHandlers = () => [
+  http.get(`${BASE_URL}/api/mcp/v0/servers`, () => HttpResponse.json(emptyMcpServers)),
   http.get(`${BASE_URL}/api/auth/me`, () => HttpResponse.json({ id: 'user-1' })),
   http.get(`${BASE_URL}/api/auth/capabilities`, () => HttpResponse.json({ enabled: false, login: null })),
   http.get(`${BASE_URL}/api/memory/config`, () => HttpResponse.json({ config: {} })),
@@ -101,11 +105,24 @@ const Wrapper = ({ children, threadId = 'thread-1' }: { children: ReactNode; thr
   );
 };
 
-const renderThreadTree = (
-  initialMessages: MastraDBMessage[],
-  options: { hasModelList?: boolean; threadId?: string } = {},
-) => {
-  const { hasModelList = true, threadId = 'thread-1' } = options;
+interface RenderThreadOptions {
+  hasModelList?: boolean;
+  threadId?: string;
+  suggestedPrompts?: string[];
+  isHistoryLoading?: boolean;
+  isLoadingPrevious?: boolean;
+  onLoadPrevious?: () => void | Promise<void>;
+}
+
+const renderThreadTree = (initialMessages: MastraDBMessage[], options: RenderThreadOptions = {}) => {
+  const {
+    hasModelList = true,
+    threadId = 'thread-1',
+    suggestedPrompts,
+    isHistoryLoading,
+    isLoadingPrevious,
+    onLoadPrevious,
+  } = options;
 
   return (
     <Wrapper threadId={threadId}>
@@ -118,17 +135,24 @@ const renderThreadTree = (
           supportsMemory={true}
           settings={{ modelSettings: { chatWithLegacyStream: false } }}
         >
-          <Thread agentId="agent-1" agentName="Helper" threadId={threadId} hasModelList={hasModelList} />
+          <Thread
+            agentId="agent-1"
+            agentName="Helper"
+            threadId={threadId}
+            suggestedPrompts={suggestedPrompts}
+            hasModelList={hasModelList}
+            isHistoryLoading={isHistoryLoading}
+            isLoadingPrevious={isLoadingPrevious}
+            onLoadPrevious={onLoadPrevious}
+          />
         </ChatProvider>
       </ThreadInputProvider>
     </Wrapper>
   );
 };
 
-const renderThread = (
-  initialMessages: MastraDBMessage[],
-  options: { hasModelList?: boolean; threadId?: string } = { hasModelList: true },
-) => render(renderThreadTree(initialMessages, options));
+const renderThread = (initialMessages: MastraDBMessage[], options?: RenderThreadOptions) =>
+  render(renderThreadTree(initialMessages, options));
 
 const userMessage = (text: string): MastraDBMessage => ({
   id: `m-${text}`,
@@ -162,6 +186,41 @@ const assistantMessage = (text: string, metadata?: MastraDBMessage['content']['m
   content: { format: 2, parts: [{ type: 'text', text }], metadata },
 });
 
+// Controllable browser SpeechRecognition stub: mocks the browser API only, not our hooks.
+interface FakeRecognitionEvent {
+  resultIndex: number;
+  results: Array<{ 0: { transcript: string }; isFinal: boolean }>;
+}
+
+let lastRecognition: {
+  onstart: (() => void) | null;
+  onresult: ((event: FakeRecognitionEvent) => void) | null;
+  onend: (() => void) | null;
+} | null = null;
+
+const installFakeSpeechRecognition = () => {
+  class FakeSpeechRecognition {
+    continuous = false;
+    lang = '';
+    onstart: (() => void) | null = null;
+    onresult: ((event: FakeRecognitionEvent) => void) | null = null;
+    onerror: ((event: unknown) => void) | null = null;
+    onend: (() => void) | null = null;
+    start = () => this.onstart?.();
+    stop = () => this.onend?.();
+    constructor() {
+      lastRecognition = this;
+    }
+  }
+  Object.assign(window, { SpeechRecognition: FakeSpeechRecognition, webkitSpeechRecognition: FakeSpeechRecognition });
+};
+
+const uninstallFakeSpeechRecognition = () => {
+  delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
+  delete (window as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+  lastRecognition = null;
+};
+
 afterEach(() => {
   delete window.MASTRA_AGENT_SIGNALS;
   cleanup();
@@ -173,14 +232,73 @@ describe('Thread', () => {
     server.resetHandlers();
   });
 
-  it('shows the empty welcome state when there are no messages', async () => {
-    server.use(...baseHandlers());
+  describe('when the user dictates two phrases in one browser dictation session', () => {
+    beforeEach(() => installFakeSpeechRecognition());
+    afterEach(() => uninstallFakeSpeechRecognition());
 
-    await act(async () => {
-      renderThread([]);
+    it('keeps both phrases in the composer', async () => {
+      // `/voice/speakers` returns [] in baseHandlers, so the hook uses the browser path.
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([]);
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+      await screen.findByRole('button', { name: 'Stop dictation' });
+
+      const first = { 0: { transcript: 'Accept the newer address.' }, isFinal: true };
+      act(() => {
+        lastRecognition?.onresult?.({ resultIndex: 0, results: [first] });
+      });
+      act(() => {
+        lastRecognition?.onresult?.({
+          resultIndex: 1,
+          results: [first, { 0: { transcript: 'And note that Sentinel confirmed it.' }, isFinal: true }],
+        });
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Stop dictation' }));
+
+      await waitFor(() =>
+        expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe(
+          'Accept the newer address. And note that Sentinel confirmed it. ',
+        ),
+      );
+    });
+  });
+
+  describe('when no suggested prompts are provided for an empty thread', () => {
+    it('renders the default welcome state', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([]);
+      });
+
+      expect(screen.getByTestId('thread-welcome')).toBeTruthy();
+      expect(screen.getByRole('textbox')).toBeTruthy();
     });
 
-    expect(screen.getByText('How can I help you today?')).toBeTruthy();
+    it('renders the greeting with the agent name and the composer inside the landing column', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([]);
+      });
+
+      const heading = screen.getByRole('heading', { name: /what can .* do for you today\?/i });
+      expect(heading.textContent).toContain('Helper');
+      // Emphasis contract: only the agent name is high-contrast; the surrounding copy is muted and regular weight.
+      expect(heading.classList.contains('font-normal')).toBe(true);
+      const name = screen.getByText('Helper');
+      expect(name.classList.contains('font-medium')).toBe(true);
+      expect(name.classList.contains('text-foreground')).toBe(true);
+      const landing = screen.getByTestId('thread-landing');
+      expect(landing.contains(heading)).toBe(true);
+      expect(landing.contains(screen.getByRole('textbox'))).toBe(true);
+      expect(screen.queryByTestId('thread-message-column')).toBeNull();
+    });
   });
 
   it('renders existing messages instead of the welcome state', async () => {
@@ -191,7 +309,161 @@ describe('Thread', () => {
     });
 
     expect(screen.getByText('previous question', { selector: 'p' })).toBeTruthy();
-    expect(screen.queryByText('How can I help you today?')).toBeFalsy();
+    expect(screen.queryByTestId('thread-welcome')).toBeFalsy();
+  });
+
+  describe('Thread history loading', () => {
+    describe('when history is loading and there are no messages', () => {
+      it('shows the history skeleton instead of the welcome screen', async () => {
+        server.use(...baseHandlers());
+
+        await act(async () => {
+          renderThread([], { isHistoryLoading: true });
+        });
+
+        expect(screen.getByTestId('thread-history-skeleton')).toBeTruthy();
+        expect(screen.queryByTestId('thread-welcome')).toBeNull();
+      });
+
+      it('keeps the composer available', async () => {
+        server.use(...baseHandlers());
+
+        await act(async () => {
+          renderThread([], { isHistoryLoading: true });
+        });
+
+        expect(screen.getByRole('textbox')).toBeTruthy();
+      });
+
+      it('does not render suggested prompts', async () => {
+        server.use(...baseHandlers());
+
+        await act(async () => {
+          renderThread([], { isHistoryLoading: true, suggestedPrompts: ['Check the weather'] });
+        });
+
+        expect(screen.queryByRole('button', { name: 'Check the weather' })).toBeNull();
+      });
+    });
+
+    describe('when history is loading but live messages already exist', () => {
+      it('renders the messages and no skeleton', async () => {
+        server.use(...baseHandlers());
+
+        await act(async () => {
+          renderThread([userMessage('live question')], { isHistoryLoading: true });
+        });
+
+        expect(screen.getByText('live question', { selector: 'p' })).toBeTruthy();
+        expect(screen.queryByTestId('thread-history-skeleton')).toBeNull();
+        expect(screen.queryByTestId('thread-welcome')).toBeNull();
+      });
+    });
+
+    describe('when history finished loading with no messages', () => {
+      it('shows the welcome screen with suggested prompts', async () => {
+        server.use(...baseHandlers());
+
+        await act(async () => {
+          renderThread([], { isHistoryLoading: false, suggestedPrompts: ['Check the weather'] });
+        });
+
+        expect(screen.queryByTestId('thread-history-skeleton')).toBeNull();
+        expect(screen.getByTestId('thread-welcome')).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Check the weather' })).toBeTruthy();
+      });
+    });
+  });
+
+  describe('Thread pagination (fetching older messages)', () => {
+    it('renders a loading skeleton at the top when fetching previous page', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([userMessage('live question')], { isLoadingPrevious: true, onLoadPrevious: vi.fn() });
+      });
+
+      // The live messages should still be visible
+      expect(screen.getByText('live question', { selector: 'p' })).toBeTruthy();
+
+      // The skeleton for fetching older messages should be rendered
+      const skeletonColumn = screen.getByLabelText('Loading older messages');
+      expect(skeletonColumn).toBeTruthy();
+      expect(skeletonColumn.getAttribute('aria-busy')).toBe('true');
+    });
+
+    it('does not render the skeleton when not fetching previous page', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([userMessage('live question')], { isLoadingPrevious: false });
+      });
+
+      expect(screen.queryByLabelText('Loading older messages')).toBeNull();
+    });
+  });
+
+  describe('when suggested prompts are provided for an empty thread', () => {
+    it('renders each suggested prompt', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([], { suggestedPrompts: ['Check the weather', 'Check a stock', 'Build a page'] });
+      });
+
+      expect(screen.getByRole('button', { name: 'Check the weather' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Check a stock' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Build a page' })).toBeTruthy();
+    });
+
+    it('renders the prompts as cards with increasing entrance delays', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([], { suggestedPrompts: ['Check the weather', 'Check a stock', 'Build a page'] });
+      });
+
+      const items = Array.from(screen.getByTestId('suggested-prompt-list').querySelectorAll('li'));
+      const delays = items.map(item => parseInt(item.style.animationDelay, 10));
+      expect(delays).toHaveLength(3);
+      expect(delays[1]).toBeGreaterThan(delays[0]);
+      expect(delays[2]).toBeGreaterThan(delays[1]);
+    });
+
+    it('sends the selected prompt through the agent stream endpoint', async () => {
+      const captured: Captured[] = [];
+      server.use(
+        ...baseHandlers(),
+        http.post(`${BASE_URL}/api/agents/agent-1/stream`, async ({ request }) => {
+          captured.push({ url: request.url, body: await captureBody(request) });
+          return sseResponse();
+        }),
+      );
+
+      await act(async () => {
+        renderThread([], { suggestedPrompts: ['Check the weather'] });
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Check the weather' }));
+
+      await waitFor(() => {
+        expect(captured).toHaveLength(1);
+      });
+
+      expect(JSON.stringify(captured[0].body.messages ?? [])).toContain('Check the weather');
+    });
+  });
+
+  describe('when the thread already has messages', () => {
+    it('does not render suggested prompts', async () => {
+      server.use(...baseHandlers());
+
+      await act(async () => {
+        renderThread([userMessage('previous question')], { suggestedPrompts: ['Check the weather'] });
+      });
+
+      expect(screen.queryByRole('button', { name: 'Check the weather' })).toBeFalsy();
+    });
   });
 
   describe('when rendering the thread rail', () => {
@@ -219,10 +491,6 @@ describe('Thread', () => {
       expect(screen.getByRole('navigation', { name: 'Conversation timeline' })).toBeTruthy();
       expect(screen.getAllByRole('button', { name: /Jump to/ })).toHaveLength(2);
       const rail = screen.getByTestId('thread-rail');
-      expect(screen.getByTestId('thread-rail-container').className).toContain('thread-rail-container');
-      expect(screen.getByTestId('thread-rail-layer').className).toContain('thread-rail-layer');
-      expect(screen.getByTestId('thread-rail-layer').className).toContain('left-4');
-      expect(screen.getByTestId('thread-rail-layer').className).not.toContain('xl:block');
       expect(screen.getByTestId('thread-rail-scroll-area')).toBeTruthy();
       expect(screen.getByTestId('thread-message-column').contains(rail)).toBe(false);
 
@@ -514,6 +782,215 @@ describe('Thread', () => {
     });
   });
 
+  describe('when multiple text files are uploaded and sent', () => {
+    it('sends their complete text and restores distinct named previews after a fresh history fetch', async () => {
+      let sentTexts: string[] = [];
+      let history: ListMemoryThreadMessagesResponse = { messages: [], uiMessages: null };
+      server.use(
+        http.post<never, StreamParams>(`${BASE_URL}/api/agents/agent-1/stream`, async ({ request }) => {
+          const body = await request.json();
+          history = attachmentMessages(body.messages);
+          const messages = Array.isArray(body.messages) ? body.messages : [];
+          sentTexts = messages.flatMap(message => {
+            if (!isRecord(message)) return [];
+            if (typeof message.content === 'string') return [message.content];
+            if (!Array.isArray(message.content)) return [];
+            return message.content.flatMap(part =>
+              isRecord(part) && part.type === 'text' && typeof part.text === 'string' ? [part.text] : [],
+            );
+          });
+          return sseResponse();
+        }),
+        http.get(`${BASE_URL}/api/memory/threads/thread-1/messages`, () => HttpResponse.json(history)),
+        ...baseHandlers(),
+      );
+      const csv = 'name,note\r\nZoë,"hello\nworld"\r\n';
+      const notes = 'Keep <attachment>literal</attachment> text.';
+      const files = [
+        new File([csv], 'leads.csv'),
+        new File([notes], 'settings.ini'),
+        new File(['discard'], 'discard.txt'),
+      ];
+      // JSDOM lacks Blob.text(); FileReader still reads the actual file bytes for sending.
+      Object.defineProperty(files[0], 'text', { value: async () => csv });
+      Object.defineProperty(files[1], 'text', { value: async () => notes });
+      Object.defineProperty(files[2], 'text', { value: async () => 'discard' });
+      const mounted = renderThread([]);
+      fireEvent.click(await screen.findByRole('button', { name: 'Add attachment' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Add a local file' }));
+      const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+      if (!input) throw new Error('File picker input is missing');
+      fireEvent.change(input, { target: { files } });
+      await screen.findByRole('button', { name: 'Preview settings.ini' });
+      await screen.findByRole('button', { name: 'Preview discard.txt' });
+      fireEvent.click(screen.getByRole('button', { name: 'Remove discard.txt' }));
+      expect(screen.queryByRole('button', { name: 'Preview discard.txt' })).toBeNull();
+      await waitFor(() => expect(screen.queryByLabelText('Public URL')).toBeNull());
+      fireEvent.change(screen.getByPlaceholderText('Enter your message...'), { target: { value: 'Read both files' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+      await waitFor(() =>
+        expect(sentTexts).toEqual([
+          'Read both files',
+          `<attachment name="leads.csv">${csv}</attachment>`,
+          `<attachment name="settings.ini">${notes}</attachment>`,
+        ]),
+      );
+      await waitFor(() => expect(screen.queryByTestId('composer-attachments')).toBeNull());
+      const liveMessage = screen.getByText('Read both files').closest('[data-slot="message"]');
+      expect(liveMessage).not.toBeNull();
+      expect(screen.getByRole('button', { name: 'Preview leads.csv' }).closest('[data-slot="message"]')).toBe(
+        liveMessage,
+      );
+      expect(
+        liveMessage?.querySelector('[data-slot="message-attachments"]')?.nextElementSibling?.getAttribute('data-slot'),
+      ).toBe('message-content');
+      mounted.unmount();
+      const client = new MastraClient({ baseUrl: BASE_URL });
+      const restored = await client.getMemoryThread({ threadId: 'thread-1', agentId: 'agent-1' }).listMessages();
+      expect(restored.messages).toHaveLength(1);
+      expect(restored.messages[0]?.content.parts).toMatchObject(sentTexts.map(text => ({ type: 'text', text })));
+      renderThread(restored.messages);
+      const restoredMessage = (await screen.findByText('Read both files')).closest('[data-slot="message"]');
+      expect(restoredMessage).not.toBeNull();
+      expect(
+        restoredMessage
+          ?.querySelector('[data-slot="message-attachments"]')
+          ?.nextElementSibling?.getAttribute('data-slot'),
+      ).toBe('message-content');
+      for (const [name, text] of [
+        ['leads.csv', csv],
+        ['settings.ini', notes],
+      ]) {
+        const preview = await screen.findByRole('button', { name: `Preview ${name}` });
+        expect(preview.closest('[data-slot="message"]')).toBe(restoredMessage);
+        fireEvent.click(preview);
+        const dialog = screen.getByRole('dialog', { name });
+        expect(within(dialog).getByText(text, { normalizer: value => value }).textContent).toBe(text);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+      }
+    });
+  });
+
+  describe.each(['file classification', 'URL inspection'])('when %s is pending', inspection => {
+    it('keeps the attachment until it can be included in the submitted message', async () => {
+      const captured: CapturedBody[] = [];
+      let release = () => {};
+      const pending = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const url = 'https://files.example.com/report.pdf';
+      server.use(
+        ...baseHandlers(),
+        http.head(url, async () => {
+          await pending;
+          return new HttpResponse(null, { headers: { 'content-type': 'application/pdf' } });
+        }),
+        http.post(`${BASE_URL}/api/agents/agent-1/stream`, async ({ request }) => {
+          captured.push(await captureBody(request));
+          return sseResponse();
+        }),
+      );
+      const read = FileReader.prototype.readAsArrayBuffer;
+      const probe = vi
+        .spyOn(FileReader.prototype, 'readAsArrayBuffer')
+        .mockImplementation(function (this: FileReader, blob) {
+          void pending.then(() => read.call(this, blob));
+        });
+      try {
+        await act(async () => {
+          renderThread([]);
+        });
+        const textarea = screen.getByPlaceholderText('Enter your message...');
+        fireEvent.change(textarea, { target: { value: 'Read my attachment' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }));
+        if (inspection === 'file classification') {
+          fireEvent.click(screen.getByRole('button', { name: 'Add a local file' }));
+          const picker = document.querySelector<HTMLInputElement>('input[type="file"]');
+          if (!picker) throw new Error('File picker is missing');
+          const file = new File(['pending file contents'], 'notes.unknown');
+          Object.defineProperty(file, 'text', { value: async () => 'pending file contents' });
+          fireEvent.change(picker, { target: { files: [file] } });
+          expect(probe).toHaveBeenCalledOnce();
+        } else {
+          const input = await screen.findByLabelText('Public URL');
+          fireEvent.change(input, { target: { value: url } });
+          const form = input.closest('form');
+          if (!form) throw new Error('Attachment form is missing');
+          fireEvent.submit(form);
+        }
+        const composer = textarea.closest('form');
+        if (!composer) throw new Error('Composer form is missing');
+        await act(async () => {
+          fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter' });
+          fireEvent.submit(composer);
+        });
+        expect(captured).toHaveLength(0);
+        expect(screen.getByRole('button', { name: 'Send', hidden: true }).hasAttribute('disabled')).toBe(true);
+        await act(async () => {
+          release();
+          await pending;
+        });
+        await waitFor(() => expect(screen.queryByLabelText('Public URL')).toBeNull());
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Send' }).hasAttribute('disabled')).toBe(false));
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+        await waitFor(() => expect(captured).toHaveLength(1));
+        const messages = JSON.stringify(captured[0].messages);
+        expect(messages).toContain('Read my attachment');
+        expect(messages).toContain(inspection === 'file classification' ? 'pending file contents' : url);
+      } finally {
+        release();
+        probe.mockRestore();
+      }
+    });
+  });
+
+  describe('when a text attachment is added by URL', () => {
+    it('keeps the attachment in the same composer surface as the draft', async () => {
+      const url = 'https://files.example.com/leads.csv';
+      server.use(
+        ...baseHandlers(),
+        http.head(url, () => new HttpResponse(null, { headers: { 'content-type': 'text/csv' } })),
+      );
+      await act(async () => {
+        renderThread([]);
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }));
+      const input = await screen.findByLabelText('Public URL');
+      fireEvent.change(input, { target: { value: url } });
+      const form = input.closest('form');
+      if (!form) throw new Error('Attachment form is missing');
+      fireEvent.submit(form);
+
+      const attachments = await screen.findByTestId('composer-attachments');
+      const draft = screen.getByPlaceholderText('Enter your message...');
+      const composerBox = draft.closest('[data-slot="composer-box"]');
+      expect(composerBox).not.toBeNull();
+      expect(composerBox?.contains(attachments)).toBe(true);
+      expect(attachments.parentElement?.closest('[data-slot="composer-attachments"]')).toBeNull();
+    });
+
+    it('links to the original URL instead of offering an empty file preview', async () => {
+      const url = 'https://files.example.com/leads.csv';
+      server.use(
+        ...baseHandlers(),
+        http.head(url, () => new HttpResponse(null, { headers: { 'content-type': 'text/csv' } })),
+      );
+      await act(async () => {
+        renderThread([]);
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Add attachment' }));
+      const input = await screen.findByLabelText('Public URL');
+      fireEvent.change(input, { target: { value: url } });
+      const form = input.closest<HTMLFormElement>('form');
+      if (!form) throw new Error('Attachment form is missing');
+      fireEvent.submit(form);
+      const attachments = await screen.findByTestId('composer-attachments');
+      const link = await within(attachments).findByRole('link');
+      expect(link.getAttribute('href')).toBe(url);
+      expect(within(attachments).queryByRole('button', { name: `Preview ${url}` })).toBeNull();
+    });
+  });
+
   it('attaches a URL from the popover without sending the chat message', async () => {
     const captured: Captured[] = [];
     server.use(
@@ -550,7 +1027,7 @@ describe('Thread', () => {
 
     // The attachment chip row appears and the popover closes.
     await waitFor(() => {
-      expect(document.querySelector('[data-attachments-row]')).toBeTruthy();
+      expect(screen.getByTestId('composer-attachments')).toBeTruthy();
     });
     await waitFor(() => {
       expect(screen.queryByLabelText('Public URL')).toBeFalsy();
@@ -701,10 +1178,17 @@ describe('TaskPanel', () => {
     await pushTasks([taskPlanMenu, taskShop, taskCook]);
 
     expect(await screen.findByTestId('task-panel')).toBeTruthy();
-    expect(screen.getByText('0/3 completed')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Collapse tasks' }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByLabelText('In progress')).toBeTruthy();
+    expect(screen.getAllByLabelText('Pending')).toHaveLength(2);
     expect(screen.getByText('Planning menu')).toBeTruthy();
     expect(screen.getByText('Create shopping list')).toBeTruthy();
     expect(screen.getByText('Cook meal')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse tasks' }));
+    const progress = screen.getByRole('progressbar', { name: 'Task completion' });
+    expect(progress.getAttribute('aria-valuenow')).toBe('0');
+    expect(progress.getAttribute('aria-valuemax')).toBe('3');
 
     await close();
   });
@@ -717,31 +1201,46 @@ describe('TaskPanel', () => {
     await pushTasks([taskPlanMenu, taskShop]);
     await pushTasks([completedPlan, activeShop], 'task-list-update');
 
-    expect(await screen.findByText('1/2 completed')).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByLabelText('Completed')).toBeTruthy();
+      expect(screen.getByLabelText('In progress')).toBeTruthy();
+    });
     expect(screen.getByText('Plan menu')).toBeTruthy();
     expect(screen.getByText('Shopping for ingredients')).toBeTruthy();
-    expect(screen.queryByText('Planning menu')).toBeFalsy();
+    expect(screen.getByText('Planning menu').closest('[aria-hidden="true"]')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse tasks' }));
+    const progress = screen.getByRole('progressbar', { name: 'Task completion' });
+    expect(progress.getAttribute('aria-valuenow')).toBe('1');
+    expect(progress.getAttribute('aria-valuemax')).toBe('2');
 
     await close();
   });
 
   it('scrolls the active task into view when task state updates', async () => {
-    const scrollIntoView = vi.fn();
-    const originalScrollIntoView = Element.prototype.scrollIntoView;
-    Element.prototype.scrollIntoView = scrollIntoView;
-
+    const scrollTo = vi.spyOn(Element.prototype, 'scrollTo');
+    const matchMedia = window.matchMedia;
+    const reducedMotion = vi.spyOn(window, 'matchMedia').mockImplementation(query => ({
+      ...matchMedia(query),
+      matches: query === '(prefers-reduced-motion: reduce)',
+    }));
     const { pushTasks, close } = await renderWithControlledSubscription();
 
     try {
-      const activeShop: TaskItem = { ...taskShop, status: 'in_progress', activeForm: 'Shopping for ingredients' };
+      await pushTasks([taskPlanMenu, taskShop, taskCook]);
+      fireEvent.click(screen.getByRole('button', { name: 'Collapse tasks' }));
+      scrollTo.mockClear();
 
-      await pushTasks([taskPlanMenu, activeShop, taskCook], 'task-list-update');
+      const completedPlan: TaskItem = { ...taskPlanMenu, status: 'completed' };
+      const activeShop: TaskItem = { ...taskShop, status: 'in_progress', activeForm: 'Shopping for ingredients' };
+      await pushTasks([completedPlan, activeShop, taskCook], 'task-list-update');
 
       await waitFor(() => {
-        expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+        expect(scrollTo).toHaveBeenCalledWith({ top: 28 });
       });
+      expect(screen.getByRole('listitem').textContent).toContain('Shopping for ingredients');
     } finally {
-      Element.prototype.scrollIntoView = originalScrollIntoView;
+      reducedMotion.mockRestore();
+      scrollTo.mockRestore();
       await close();
     }
   });

@@ -1,15 +1,17 @@
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import { RequestContext } from '@mastra/core/di';
-import { memoryStatusQueryKey } from '@mastra/playground-ui/domains/memory/hooks/use-memory-status';
-import { memoryThreadMessagesQueryKey } from '@mastra/playground-ui/domains/memory/hooks/use-memory-thread-messages';
-import { observationalMemoryQueryKey } from '@mastra/playground-ui/domains/memory/hooks/use-observational-memory';
+import type { ChatSendArgs } from '@mastra/playground-ui/domains/chat/context/chat-context';
+import { injectBufferingEnds } from '@mastra/playground-ui/domains/chat/om/om-parts-converter';
 import { useMastraClient } from '@mastra/react';
+import {
+  memoryStatusQueryKey,
+  memoryThreadMessagesQueryKey,
+  observationalMemoryQueryKey,
+} from '@mastra/react/hooks/memory';
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 
-import type { ChatSendArgs } from './chat-context';
-import { injectBufferingEnds } from '@/services/om-parts-converter';
 import {
   buildMaxStepsStreamErrorMessage,
   buildStreamErrorMessage,
@@ -55,7 +57,8 @@ const asHandledStreamChunk = (chunk: unknown): HandledStreamChunk | undefined =>
 };
 
 interface SendDeps {
-  requestContext?: Record<string, unknown>;
+  model?: string;
+  requestContext?: Record<string, any>;
   agentVersionId?: string;
   threadId?: string;
   modelSettingsArgs: Record<string, unknown>;
@@ -68,10 +71,11 @@ interface SendDeps {
 
 interface UseChatSendHandlerArgs {
   agentId: string;
-  requestContext?: Record<string, unknown>;
+  requestContext?: Record<string, any>;
   agentVersionId?: string;
   threadId?: string;
   modelSettingsArgs: Record<string, unknown>;
+  model?: string;
   chatWithNetwork?: boolean;
   chatWithGenerate?: boolean;
   maxSteps?: number;
@@ -118,6 +122,7 @@ export const useChatSendHandler = ({
   agentVersionId,
   threadId,
   modelSettingsArgs,
+  model,
   chatWithNetwork,
   chatWithGenerate,
   maxSteps,
@@ -146,6 +151,7 @@ export const useChatSendHandler = ({
     agentVersionId,
     threadId,
     modelSettingsArgs,
+    model,
     chatWithNetwork,
     chatWithGenerate,
     maxSteps,
@@ -157,6 +163,7 @@ export const useChatSendHandler = ({
     agentVersionId,
     threadId,
     modelSettingsArgs,
+    model,
     chatWithNetwork,
     chatWithGenerate,
     maxSteps,
@@ -196,10 +203,11 @@ export const useChatSendHandler = ({
           // Refetch the panel again once buffering completes, so any records that
           // only landed after awaitBufferStatus resolved are reflected immediately.
           refreshTimelinePanel(currentThreadId);
+          void refreshWorkingMemory?.();
         })
         .catch(() => {});
     },
-    [agentId, baseClient, queryClient, refreshTimelinePanel, setMessages],
+    [agentId, baseClient, queryClient, refreshTimelinePanel, refreshWorkingMemory, setMessages],
   );
 
   const handleHandledChunk = useCallback(
@@ -220,11 +228,21 @@ export const useChatSendHandler = ({
       ) {
         refreshObservationalMemory(handled.data?.operationType);
       }
+      if (handled?.type === 'data-om-observation-end') {
+        void refreshWorkingMemory?.();
+      }
       if (handled?.type === 'data-om-activation') {
         handleActivation(handled.data);
       }
     },
-    [handleActivation, handleObservationStart, handleProgressUpdate, refreshObservationalMemory, setStreamErrors],
+    [
+      handleActivation,
+      handleObservationStart,
+      handleProgressUpdate,
+      refreshObservationalMemory,
+      refreshWorkingMemory,
+      setStreamErrors,
+    ],
   );
 
   const send = useCallback(
@@ -246,6 +264,7 @@ export const useChatSendHandler = ({
             requestContext: requestContextInstance,
             threadId: deps.threadId,
             modelSettings: deps.modelSettingsArgs,
+            model: deps.model,
             signal: controller.signal,
             tracingOptions: deps.tracingOptions,
             onNetworkChunk: async (chunk: any) => {
@@ -266,6 +285,7 @@ export const useChatSendHandler = ({
             requestContext: requestContextInstance,
             threadId: deps.threadId,
             modelSettings: deps.modelSettingsArgs,
+            model: deps.model,
             signal: controller.signal,
             tracingOptions: deps.tracingOptions,
           });
@@ -280,6 +300,7 @@ export const useChatSendHandler = ({
             requestContext: requestContextInstance,
             threadId: deps.threadId,
             modelSettings: deps.modelSettingsArgs,
+            model: deps.model,
             tracingOptions: deps.tracingOptions,
             onChunk: async (chunk: any) => {
               if (chunk.type === 'finish') {
@@ -287,6 +308,8 @@ export const useChatSendHandler = ({
                   setStreamErrors(prev => [...prev, buildMaxStepsStreamErrorMessage(chunk, deps.maxSteps)]);
                 }
                 await refreshThreadList?.();
+                refreshTimelinePanel(deps.threadId);
+                completeObservationalMemoryBuffering(deps.threadId);
               }
               if (didUpdateWorkingMemory(chunk)) {
                 void refreshWorkingMemory?.();
@@ -296,8 +319,6 @@ export const useChatSendHandler = ({
             signal: controller.signal,
           });
 
-          refreshTimelinePanel(deps.threadId);
-          completeObservationalMemoryBuffering(deps.threadId);
           return;
         }
 

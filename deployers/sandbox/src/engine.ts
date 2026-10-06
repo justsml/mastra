@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -204,7 +203,7 @@ export function buildLaunchScript(opts: { remoteDir: string; port: number; env: 
 }
 
 /** Create a gzipped tarball of the directory contents (excluding node_modules). */
-async function createTarball(dir: string): Promise<Buffer> {
+export async function createTarball(dir: string): Promise<Buffer> {
   const tmp = await mkdtemp(join(tmpdir(), 'mastra-sandbox-'));
   const tarPath = join(tmp, 'deploy.tgz');
   try {
@@ -220,7 +219,7 @@ async function createTarball(dir: string): Promise<Buffer> {
  * path when available, otherwise falls back to base64 chunks over
  * `executeCommand` — so `executeCommand` + `networking` is the minimum contract.
  */
-async function uploadFile(sandbox: WorkspaceSandbox, remotePath: string, content: Buffer): Promise<void> {
+export async function uploadFile(sandbox: WorkspaceSandbox, remotePath: string, content: Buffer): Promise<void> {
   if (sandbox.writeFiles) {
     await sandbox.writeFiles([{ path: remotePath, content }]);
     return;
@@ -250,10 +249,10 @@ const LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml',
  * package.json, any bundled lockfile, and the install command itself. A
  * matching hash means the previous `node_modules` can be reused.
  */
-async function hashInstallInputs(dir: string, installCommand: string): Promise<string | null> {
-  const hash = createHash('sha256');
+export async function hashInstallInputs(dir: string, installCommand: string): Promise<string | null> {
+  const inputs: Buffer[] = [];
   try {
-    hash.update(await readFile(join(dir, 'package.json')));
+    inputs.push(await readFile(join(dir, 'package.json')));
   } catch {
     return null;
   }
@@ -265,8 +264,8 @@ async function hashInstallInputs(dir: string, installCommand: string): Promise<s
       // Lockfile not part of the build output.
       continue;
     }
-    hash.update(lockfile).update(content);
+    inputs.push(Buffer.from(lockfile), content);
   }
-  hash.update(installCommand);
-  return hash.digest('hex');
+  inputs.push(Buffer.from(installCommand));
+  return Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', Buffer.concat(inputs))).toString('hex');
 }

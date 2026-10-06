@@ -4,17 +4,26 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.hoisted(() => vi.resetModules());
 
 const mocks = vi.hoisted(() => ({
+  handleModelCommand: vi.fn().mockResolvedValue(undefined),
+  handleConnectCommand: vi.fn().mockResolvedValue(undefined),
+  handleLoginCommand: vi.fn().mockResolvedValue(undefined),
   handleModelsPackCommand: vi.fn().mockResolvedValue(undefined),
   handleCustomProvidersCommand: vi.fn().mockResolvedValue(undefined),
   handleGoalCommand: vi.fn().mockResolvedValue(undefined),
+  handleWorkflowsCommand: vi.fn().mockResolvedValue(undefined),
   handleSkillCommand: vi.fn().mockResolvedValue(undefined),
   handleJudgeCommand: vi.fn().mockResolvedValue(undefined),
   handleGithubCommand: vi.fn().mockResolvedValue(undefined),
   handleReportIssueCommand: vi.fn().mockResolvedValue(undefined),
   handleMcpCommand: vi.fn().mockResolvedValue(undefined),
   handleOMCommand: vi.fn().mockResolvedValue(undefined),
+  handleKnowledgeCommand: vi.fn().mockResolvedValue(undefined),
   handleMastraGatewayCommand: vi.fn().mockResolvedValue(undefined),
   handlePluginsCommand: vi.fn().mockResolvedValue(undefined),
+  handleProfileCommand: vi.fn().mockResolvedValue(undefined),
+  handleCloneCommand: vi.fn().mockResolvedValue(undefined),
+  handleThreadsCommand: vi.fn().mockResolvedValue(undefined),
+  handleNameCommand: vi.fn().mockResolvedValue(undefined),
   processSlashCommand: vi.fn().mockResolvedValue('custom output'),
   startGoalWithDefaults: vi.fn().mockResolvedValue(undefined),
   showError: vi.fn(),
@@ -28,7 +37,7 @@ vi.mock('../commands/index.js', () => ({
   handleYoloCommand: vi.fn(),
   handleThinkCommand: vi.fn(),
   handlePermissionsCommand: vi.fn(),
-  handleNameCommand: vi.fn(),
+  handleNameCommand: mocks.handleNameCommand,
   handleExitCommand: vi.fn(),
   handleHooksCommand: vi.fn(),
   handleMcpCommand: mocks.handleMcpCommand,
@@ -36,17 +45,21 @@ vi.mock('../commands/index.js', () => ({
   handleSkillCommand: mocks.handleSkillCommand,
   handleSkillsCommand: vi.fn(),
   handleNewCommand: vi.fn(),
+  handleCloneCommand: mocks.handleCloneCommand,
   handleResourceCommand: vi.fn(),
   handleDiffCommand: vi.fn(),
-  handleThreadsCommand: vi.fn(),
+  handleThreadsCommand: mocks.handleThreadsCommand,
   handleThreadTagDirCommand: vi.fn(),
   handleSandboxCommand: vi.fn(),
+  handleModelCommand: mocks.handleModelCommand,
   handleModelsPackCommand: mocks.handleModelsPackCommand,
   handleCustomProvidersCommand: mocks.handleCustomProvidersCommand,
   handleSubagentsCommand: vi.fn(),
   handleOMCommand: mocks.handleOMCommand,
+  handleKnowledgeCommand: mocks.handleKnowledgeCommand,
   handleSettingsCommand: vi.fn(),
-  handleLoginCommand: vi.fn(),
+  handleConnectCommand: mocks.handleConnectCommand,
+  handleLoginCommand: mocks.handleLoginCommand,
   handleReviewCommand: vi.fn(),
   handleReportIssueCommand: mocks.handleReportIssueCommand,
   handleSetupCommand: vi.fn(),
@@ -60,7 +73,9 @@ vi.mock('../commands/index.js', () => ({
   handleObservabilityCommand: vi.fn(),
   handleGithubCommand: mocks.handleGithubCommand,
   handleGoalCommand: mocks.handleGoalCommand,
+  handleWorkflowsCommand: mocks.handleWorkflowsCommand,
   handleJudgeCommand: mocks.handleJudgeCommand,
+  handleProfileCommand: mocks.handleProfileCommand,
 }));
 
 vi.mock('../display.js', () => ({
@@ -82,19 +97,28 @@ import { SlashCommandComponent } from '../components/slash-command.js';
 import { GOAL_JUDGE_INPUT_LOCK_MESSAGE } from '../goal-input-lock.js';
 import { createMockState } from './agent-controller-mock.js';
 
-describe('dispatchSlashCommand models routing', () => {
+describe('dispatchSlashCommand routing', () => {
   beforeEach(() => {
+    mocks.handleModelCommand.mockClear();
+    mocks.handleConnectCommand.mockClear();
+    mocks.handleLoginCommand.mockClear();
     mocks.handleModelsPackCommand.mockClear();
     mocks.handleCustomProvidersCommand.mockClear();
     mocks.handleGoalCommand.mockClear();
+    mocks.handleWorkflowsCommand.mockClear();
     mocks.handleSkillCommand.mockClear();
     mocks.handleJudgeCommand.mockClear();
     mocks.handleGithubCommand.mockClear();
     mocks.handleReportIssueCommand.mockClear();
     mocks.handleMcpCommand.mockClear();
     mocks.handleOMCommand.mockClear();
+    mocks.handleKnowledgeCommand.mockClear();
     mocks.handleMastraGatewayCommand.mockClear();
     mocks.handlePluginsCommand.mockClear();
+    mocks.handleProfileCommand.mockClear();
+    mocks.handleCloneCommand.mockClear();
+    mocks.handleThreadsCommand.mockClear();
+    mocks.handleNameCommand.mockClear();
     mocks.processSlashCommand.mockClear();
     mocks.startGoalWithDefaults.mockClear();
     mocks.showError.mockClear();
@@ -102,7 +126,7 @@ describe('dispatchSlashCommand models routing', () => {
     mocks.showInfo.mockClear();
   });
 
-  it('routes /models to handleModelsPackCommand', async () => {
+  it('routes /connect to the authentication method selector and /login to account sign-in', async () => {
     const state = {
       customSlashCommands: [],
       session: {
@@ -113,17 +137,117 @@ describe('dispatchSlashCommand models routing', () => {
     } as any;
     const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
 
-    const handled = await dispatchSlashCommand('/models', state, () => ctx);
+    expect(await dispatchSlashCommand('/connect', state, () => ctx)).toBe(true);
+    expect(await dispatchSlashCommand('/login', state, () => ctx)).toBe(true);
+    expect(mocks.handleConnectCommand).toHaveBeenCalledOnce();
+    expect(mocks.handleConnectCommand).toHaveBeenCalledWith(ctx);
+    expect(mocks.handleLoginCommand).toHaveBeenCalledOnce();
+    expect(mocks.handleLoginCommand).toHaveBeenCalledWith(ctx, 'login');
+  });
+
+  it('routes /model to the current-mode model selector', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
+
+    expect(await dispatchSlashCommand('/model', state, () => ctx)).toBe(true);
+    expect(mocks.handleModelCommand).toHaveBeenCalledWith(ctx);
+    expect(mocks.handleModelsPackCommand).not.toHaveBeenCalled();
+  });
+
+  it('routes /models and /packs to the model pack selector', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
+
+    expect(await dispatchSlashCommand('/models', state, () => ctx)).toBe(true);
+    expect(await dispatchSlashCommand('/packs', state, () => ctx)).toBe(true);
+    expect(mocks.handleModelsPackCommand).toHaveBeenCalledTimes(2);
+    expect(mocks.handleModelCommand).not.toHaveBeenCalled();
+  });
+
+  it('routes /clone to the thread clone handler and does not register /fork', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
+
+    expect(await dispatchSlashCommand('/clone', state, () => ctx)).toBe(true);
+    expect(mocks.handleCloneCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.handleCloneCommand).toHaveBeenCalledWith(ctx);
+
+    await dispatchSlashCommand('/fork', state, () => ctx);
+    expect(mocks.handleCloneCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.showError).toHaveBeenCalledWith(state, 'Unknown command: fork');
+  });
+
+  it('routes /threads and its /resume alias to the thread selector', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
+
+    expect(await dispatchSlashCommand('/resume', state, () => ctx)).toBe(true);
+    expect(await dispatchSlashCommand('/threads', state, () => ctx)).toBe(true);
+    expect(mocks.handleThreadsCommand).toHaveBeenCalledTimes(2);
+    expect(mocks.handleThreadsCommand).toHaveBeenNthCalledWith(1, ctx);
+    expect(mocks.handleThreadsCommand).toHaveBeenNthCalledWith(2, ctx);
+  });
+
+  it('routes /name and its /rename alias to the thread name handler', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = { analytics: { trackCommand: mocks.trackCommand } } as any;
+
+    expect(await dispatchSlashCommand('/rename Demo thread', state, () => ctx)).toBe(true);
+    expect(await dispatchSlashCommand('/name Legacy title', state, () => ctx)).toBe(true);
+    expect(mocks.handleNameCommand).toHaveBeenNthCalledWith(1, ctx, ['Demo', 'thread']);
+    expect(mocks.handleNameCommand).toHaveBeenNthCalledWith(2, ctx, ['Legacy', 'title']);
+  });
+
+  it('routes /profile subcommands to handleProfileCommand', async () => {
+    const state = {
+      customSlashCommands: [],
+      session: {
+        identity: { getResourceId: vi.fn(() => 'resource-1') },
+        thread: { getId: vi.fn(() => 'thread-1') },
+        mode: { get: vi.fn(() => 'build') },
+      },
+    } as any;
+    const ctx = {} as any;
+
+    const handled = await dispatchSlashCommand('/profile capture', state, () => ctx);
 
     expect(handled).toBe(true);
-    expect(mocks.handleModelsPackCommand).toHaveBeenCalledTimes(1);
-    expect(mocks.handleModelsPackCommand).toHaveBeenCalledWith(ctx);
-    expect(mocks.trackCommand).toHaveBeenCalledWith('models', {
-      action: 'attempted',
-      threadId: 'thread-1',
-      resourceId: 'resource-1',
-      mode: 'build',
-    });
+    expect(mocks.handleProfileCommand).toHaveBeenCalledWith(ctx, ['capture']);
   });
 
   it('routes /custom-providers to handleCustomProvidersCommand', async () => {
@@ -161,6 +285,14 @@ describe('dispatchSlashCommand models routing', () => {
     expect(mocks.handleOMCommand).toHaveBeenNthCalledWith(1, ctx);
     expect(mocks.handleOMCommand).toHaveBeenNthCalledWith(2, ctx);
     expect(mocks.handleMastraGatewayCommand).not.toHaveBeenCalled();
+  });
+
+  it('routes /knowledge to the scoped knowledge browser', async () => {
+    const state = { customSlashCommands: [] } as any;
+    const ctx = {} as any;
+
+    expect(await dispatchSlashCommand('/knowledge', state, () => ctx)).toBe(true);
+    expect(mocks.handleKnowledgeCommand).toHaveBeenCalledWith(ctx);
   });
 
   it('routes /gateway and the legacy /memory-gateway alias separately from Observational Memory settings', async () => {
@@ -262,6 +394,21 @@ describe('dispatchSlashCommand models routing', () => {
     expect(mocks.handleSkillCommand).toHaveBeenCalledTimes(1);
     expect(mocks.handleSkillCommand).toHaveBeenCalledWith(ctx, 'github-triage', ['focus', 'tests']);
     expect(mocks.showError).not.toHaveBeenCalled();
+  });
+
+  it.each(['/workflows', '/workflow'])('preserves whitespace in %s run JSON input', async commandName => {
+    const state = { customSlashCommands: [] } as any;
+    const ctx = {} as any;
+    const command = `${commandName} run greeting {"name":"Ada  Lovelace"}`;
+
+    const handled = await dispatchSlashCommand(command, state, () => ctx);
+
+    expect(handled).toBe(true);
+    expect(mocks.handleWorkflowsCommand).toHaveBeenCalledWith(
+      ctx,
+      ['run', 'greeting', '{"name":"Ada', 'Lovelace"}'],
+      'run greeting {"name":"Ada  Lovelace"}',
+    );
   });
 
   it('routes multiline /goal objectives as a single goal argument', async () => {

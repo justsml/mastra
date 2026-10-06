@@ -19,6 +19,27 @@ export type WorkflowScheduleTarget = {
   inputData?: unknown;
   initialState?: unknown;
   requestContext?: Record<string, unknown>;
+  /**
+   * Resource this schedule's runs are attributed to. When set, every run the
+   * schedule fires (via the cron scheduler or a manual fire) is created and
+   * persisted with this `resourceId`, so scheduled runs can be correlated and
+   * filtered per resource in multi-tenant setups. Pure run-attribution
+   * metadata — unlike an agent schedule's `resourceId`, it is not part of the
+   * schedule's identity and can be changed with a partial update.
+   */
+  resourceId?: string;
+  /**
+   * Content hash of the target workflow's serialized step graph, written by
+   * declarative schedule reconciliation on deploy. At claim time the
+   * scheduler compares this against the hash of its *locally registered*
+   * workflow and refuses to claim the fire on mismatch, fencing out
+   * not-yet-cycled instances from older builds that would otherwise execute
+   * a stale step graph (#19169). Absent on rows created by older versions
+   * and on imperative (API-created) schedules — those are unfenced.
+   *
+   * @internal — managed by `Mastra.registerDeclarativeSchedules()`.
+   */
+  definitionHash?: string;
 };
 
 // Agent-schedule semantic types are owned by the schedules feature module
@@ -80,7 +101,7 @@ export function normalizeScheduleTarget(target: ScheduleTarget): ScheduleTarget 
 }
 
 /** Lifecycle status of a schedule row. */
-export type ScheduleStatus = 'active' | 'paused';
+export type ScheduleStatus = 'active' | 'paused' | 'completed';
 
 /**
  * Polymorphic owner of a schedule. Workflow schedules created via
@@ -266,6 +287,8 @@ export abstract class SchedulesStorage extends StorageDomain {
    * Returns true if the row's `nextFireAt` matched `expectedNextFireAt` and
    * was advanced to `newNextFireAt`. Returns false if another instance
    * already advanced it (meaning the caller should skip publishing).
+   * When `newStatus` is provided, the row's status is written in the same
+   * atomic update.
    */
   abstract updateScheduleNextFire(
     id: string,
@@ -273,6 +296,7 @@ export abstract class SchedulesStorage extends StorageDomain {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    newStatus?: ScheduleStatus,
   ): Promise<boolean>;
 
   /** Delete a schedule and its trigger history. */

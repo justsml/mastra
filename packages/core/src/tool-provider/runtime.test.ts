@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MASTRA_RESOURCE_ID_KEY } from '../request-context';
+import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '../request-context';
 import { buildConnectionSuffix, resolveStoredToolProviders } from './runtime';
 import type { ResolveToolsOpts, ToolProvider, ToolProviderConnectionScope, ToolProviders } from './types';
 import { SHARED_BUCKET_ID } from './types';
+
+function requestContext(resourceId: string): RequestContext {
+  return new RequestContext([[MASTRA_RESOURCE_ID_KEY, resourceId]]);
+}
 
 function makeStubProvider(): {
   provider: ToolProvider;
@@ -48,7 +52,7 @@ describe('resolveStoredToolProviders — resolveConnectionAuthorId branches', ()
     const { provider, resolveToolsVNext } = makeStubProvider();
 
     await resolveStoredToolProviders(buildToolProviders('caller-supplied'), () => provider, {
-      requestContext: { [MASTRA_RESOURCE_ID_KEY]: 'user_abc' },
+      requestContext: requestContext('user_abc'),
       authorId: 'author_xyz',
     });
 
@@ -93,6 +97,167 @@ describe('resolveStoredToolProviders — resolveConnectionAuthorId branches', ()
     expect(resolveToolsVNext).toHaveBeenCalledTimes(1);
     expect(resolveToolsVNext.mock.calls[0]![0].authorId).toBe('author_xyz');
     expect(resolveToolsVNext.mock.calls[0]![0].scope).toBe('per-author');
+  });
+
+  it('forwards connection kind and toolkit to the provider', async () => {
+    const { provider, resolveToolsVNext } = makeStubProvider();
+
+    await resolveStoredToolProviders(buildToolProviders('per-author'), () => provider, {
+      authorId: 'author_xyz',
+    });
+
+    expect(resolveToolsVNext.mock.calls[0]![0].kind).toBe('author');
+    expect(resolveToolsVNext.mock.calls[0]![0].toolkit).toBe('gmail');
+  });
+});
+
+describe('resolveStoredToolProviders — invoker connections', () => {
+  function buildInvokerToolProviders(): ToolProviders {
+    return {
+      composio: {
+        tools: {
+          'salesforce.create_lead': { toolkit: 'salesforce' },
+        },
+        connections: {
+          salesforce: [
+            {
+              kind: 'invoker',
+              toolkit: 'salesforce',
+              connectionId: 'ca_alice_salesforce',
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  it('never derives the user bucket from the Memory resource id', async () => {
+    const { provider, resolveToolsVNext } = makeStubProvider();
+
+    await resolveStoredToolProviders(buildInvokerToolProviders(), () => provider, {
+      requestContext: requestContext('project_123'),
+      authorId: 'author_xyz',
+    });
+
+    expect(resolveToolsVNext).toHaveBeenCalledTimes(1);
+    const opts = resolveToolsVNext.mock.calls[0]![0];
+    expect(opts.authorId).toBeUndefined();
+    expect(opts.kind).toBe('invoker');
+  });
+
+  it('passes the pinned connectionId and live RequestContext through unchanged', async () => {
+    const { provider, resolveToolsVNext } = makeStubProvider();
+    const context = requestContext('project_123');
+
+    await resolveStoredToolProviders(buildInvokerToolProviders(), () => provider, {
+      requestContext: context,
+      authorId: 'author_xyz',
+    });
+
+    const opts = resolveToolsVNext.mock.calls[0]![0];
+    expect(opts.connectionId).toBe('ca_alice_salesforce');
+    expect(opts.toolkit).toBe('salesforce');
+    expect(opts.requestContext).toBe(context);
+    expect(opts.requestContext?.getRaw(MASTRA_RESOURCE_ID_KEY)).toBe('project_123');
+  });
+});
+
+describe('resolveStoredToolProviders — connectionless caller-supplied tools', () => {
+  it('materializes selected tools without a pinned connection', async () => {
+    const managementToolId = 'COMPOSIO_MANAGE_CONNECTIONS';
+    const resolveToolsVNext = vi.fn(async (_opts: ResolveToolsOpts) => ({
+      [managementToolId]: {
+        id: 'provider-internal-id',
+        description: 'Create or manage connections to user apps',
+        execute: async () => ({ success: true }),
+      },
+    }));
+    const provider: ToolProvider = {
+      ...makeStubProvider().provider,
+      defaultScope: 'caller-supplied',
+      resolveToolsVNext,
+    };
+    const toolProviders: ToolProviders = {
+      composio: {
+        tools: {
+          [managementToolId]: { toolkit: 'composio' },
+        },
+        connections: {},
+      },
+    };
+
+    const context = requestContext('tenant-user-1');
+    const resolved = await resolveStoredToolProviders(toolProviders, () => provider, {
+      requestContext: context,
+      authorId: 'agent-author',
+    });
+
+    expect(resolved[managementToolId]).toBeDefined();
+    expect(resolved[managementToolId]?.id).toBe(managementToolId);
+    expect(resolveToolsVNext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolSlugs: [managementToolId],
+        connectionId: 'tenant-user-1',
+        authorId: 'tenant-user-1',
+        scope: 'caller-supplied',
+        requestContext: context,
+      }),
+    );
+  });
+
+  it('derives the toolkit from legacy dot-prefixed tool slugs', async () => {
+    const legacyToolId = 'composio.manage_connections';
+    const resolveToolsVNext = vi.fn(async (_opts: ResolveToolsOpts) => ({
+      [legacyToolId]: {
+        id: legacyToolId,
+        description: 'Create or manage connections to user apps',
+        execute: async () => ({ success: true }),
+      },
+    }));
+    const provider: ToolProvider = {
+      ...makeStubProvider().provider,
+      defaultScope: 'caller-supplied',
+      resolveToolsVNext,
+    };
+    const toolProviders: ToolProviders = {
+      composio: {
+        tools: {
+          [legacyToolId]: {},
+        },
+        connections: {},
+      },
+    };
+
+    const resolved = await resolveStoredToolProviders(toolProviders, () => provider, {
+      requestContext: requestContext('tenant-user-1'),
+    });
+
+    expect(resolved[legacyToolId]).toBeDefined();
+    expect(resolveToolsVNext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolSlugs: [legacyToolId],
+        scope: 'caller-supplied',
+      }),
+    );
+  });
+
+  it('keeps requiring a pinned connection for providers without caller-supplied scope', async () => {
+    const { provider, resolveToolsVNext } = makeStubProvider();
+    const toolProviders: ToolProviders = {
+      composio: {
+        tools: {
+          'gmail.fetch_emails': { toolkit: 'gmail' },
+        },
+        connections: {},
+      },
+    };
+
+    const resolved = await resolveStoredToolProviders(toolProviders, () => provider, {
+      authorId: 'agent-author',
+    });
+
+    expect(resolved).toEqual({});
+    expect(resolveToolsVNext).not.toHaveBeenCalled();
   });
 });
 

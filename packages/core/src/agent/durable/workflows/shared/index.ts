@@ -7,8 +7,8 @@
  * - Evented durable agent workflow
  */
 
-export { executeDurableToolCalls } from './execute-tool-calls';
-export type { ToolExecutionContext, ToolExecutionError } from './execute-tool-calls';
+export { executeDurableAgentScorers } from './execute-scorers';
+export type { ExecuteDurableAgentScorersParams } from './execute-scorers';
 
 export {
   modelConfigSchema,
@@ -17,6 +17,7 @@ export {
   durableAgenticOutputSchema,
   baseDurableAgenticInputSchema,
   baseIterationStateSchema,
+  durableOptionsSchema,
 } from './schemas';
 export type { BaseIterationState, AccumulatedUsage } from './schemas';
 

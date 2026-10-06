@@ -14,11 +14,25 @@ import {
 } from 'recharts';
 
 import { Button } from '../../../ds/components/Button';
+import { Txt } from '../../../ds/components/Txt';
+import { overlaySurfaceStyle } from '../../../ds/primitives/raised-surface';
 import type { ExtractedOmMarker } from '../lib/extract-markers';
 import { tToTimestampMs } from '../lib/replay-selection';
 import type { TDomain } from '../lib/timeline';
-import { formatTimeDisplay, toT, tToTimestamp } from '../lib/timeline';
+import { tToTimestamp } from '../lib/timeline';
 import type { MemoryMessage, OMHistoryRecord } from '../types';
+import {
+  getAreaRowYMax,
+  isEventPoint,
+  toActiveObservationData,
+  toBufferedObservationData,
+  toCombinedRowData,
+  toContextData,
+  toEventData,
+  toMessageData,
+  toSelectedT,
+} from './flame-graph-data';
+import { formatDate } from '@/utils/date-format';
 
 export interface ZoomRange {
   left: number;
@@ -44,108 +58,29 @@ interface FlameGraphProps {
 
 type RechartsClickState = { activeLabel?: string | number } | null | undefined;
 
-const MSG_COLOR = 'var(--color-green-500, #22c55e)';
-const OBS_COLOR = '#f59e0b';
-const REFLECT_COLOR = '#ec4899';
-
-function getObservationTimestamp(record: OMHistoryRecord): string {
-  const d = record.lastObservedAt ?? record.updatedAt;
-  return typeof d === 'string' ? d : new Date(d).toISOString();
-}
-
-function toContextData(records: OMHistoryRecord[], markers: ExtractedOmMarker[], domain: TDomain) {
-  const fromRecords = records.map(r => ({
-    ts: String(getObservationTimestamp(r)),
-    pendingMessageTokens: r.pendingMessageTokens,
-  }));
-  const fromMarkers = markers.flatMap(m => {
-    if (m.pendingTokens == null) return [];
-    return {
-      ts: m.timestamp,
-      pendingMessageTokens: m.pendingTokens,
-    };
-  });
-  return [...fromRecords, ...fromMarkers]
-    .sort((a, b) => a.ts.localeCompare(b.ts))
-    .map(d => ({ t: toT(d.ts, domain), pendingMessageTokens: d.pendingMessageTokens }));
-}
-
-function toActiveObservationData(records: OMHistoryRecord[], markers: ExtractedOmMarker[], domain: TDomain) {
-  const points = [
-    ...records.map(record => ({
-      ts: String(getObservationTimestamp(record)),
-      observationTokenCount: record.observationTokenCount,
-    })),
-    ...markers.flatMap(marker => {
-      if (marker.type !== 'status' || marker.observationTokens == null) return [];
-      return {
-        ts: marker.timestamp,
-        observationTokenCount: marker.observationTokens,
-      };
-    }),
-  ].sort((a, b) => a.ts.localeCompare(b.ts));
-
-  let runningTotal = 0;
-  return points.map(point => {
-    runningTotal = Math.max(runningTotal, point.observationTokenCount);
-    return { t: toT(point.ts, domain), observationTokenCount: runningTotal };
-  });
-}
-
-function toBufferedObservationData(markers: ExtractedOmMarker[], domain: TDomain) {
-  const points = markers
-    .flatMap(marker => {
-      if (marker.observationTokens == null || (marker.type !== 'buffering-end' && marker.type !== 'activation')) {
-        return [];
-      }
-      return {
-        ts: marker.timestamp,
-        bufferedObservationTokenCount:
-          marker.type === 'activation' ? -marker.observationTokens : marker.observationTokens,
-      };
-    })
-    .sort((a, b) => a.ts.localeCompare(b.ts));
-
-  let runningTotal = 0;
-  return points.map(point => {
-    runningTotal = Math.max(0, runningTotal + point.bufferedObservationTokenCount);
-    return { t: toT(point.ts, domain), bufferedObservationTokenCount: runningTotal };
-  });
-}
-
-function toEventData(records: OMHistoryRecord[], domain: TDomain) {
-  return [...records]
-    .sort((a, b) => String(getObservationTimestamp(a)).localeCompare(String(getObservationTimestamp(b))))
-    .map(r => ({ t: toT(String(getObservationTimestamp(r)), domain), event: 1 }));
-}
-
-function toMessageData(messages: MemoryMessage[], domain: TDomain) {
-  return [...messages]
-    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-    .map(m => ({
-      t: toT(new Date(m.createdAt).toISOString(), domain),
-      event: 1,
-      role: m.role,
-    }));
-}
+const MSG_COLOR = 'var(--chart-green)';
+const OBS_COLOR = 'var(--chart-amber)';
+const REFLECT_COLOR = 'var(--chart-pink)';
 
 function TimeAxis({ domain }: { domain: TDomain }) {
   const ticks = [0, 0.25, 0.5, 0.75, 1];
   return (
     <div className="grid grid-cols-[6rem_1fr] items-center">
-      <p className="text-icon3 flex items-center self-stretch border-r border-border1/50 pl-3 text-ui-xs font-medium">
+      <Txt variant="meta" tone="muted" className="flex items-center self-stretch border-r border-border pl-3">
         Time
-      </p>
-      <div className="text-icon3 flex justify-between px-1 py-1.5 font-mono text-ui-xs">
+      </Txt>
+      <div className="flex justify-between px-1 py-1.5">
         {ticks.map(t => (
-          <span key={t}>{formatTimeDisplay(tToTimestamp(t, domain))}</span>
+          <Txt tone="muted" key={t} as="span" variant="meta" font="mono">
+            {formatDate(tToTimestamp(t, domain), 'date-time-seconds', { timeZone: 'UTC' })}
+          </Txt>
         ))}
       </div>
     </div>
   );
 }
 
-function FlameTooltip({
+export function FlameTooltip({
   active,
   payload,
   domain,
@@ -158,24 +93,31 @@ function FlameTooltip({
 }) {
   if (!active || !payload?.length) return null;
   const t = payload[0]?.payload?.t;
-  const time = domain != null && t != null ? formatTimeDisplay(tToTimestamp(t, domain)) : null;
+  const time =
+    domain != null && t != null ? formatDate(tToTimestamp(t, domain), 'date-time-seconds', { timeZone: 'UTC' }) : null;
   const visibleEntries = payload.filter(entry => entry.name !== 't' && entry.name !== 'time' && entry.value != null);
 
   if (showValue) {
     return (
-      <div className="flex flex-col gap-0.5 rounded border border-border1 bg-surface3 px-2 py-1.5 font-mono text-ui-xs shadow">
+      <div className={`${overlaySurfaceStyle} flex flex-col gap-0.5 rounded px-2 py-1.5 tabular-nums`}>
         {time && (
           <div className="flex items-center justify-between gap-3">
-            <span className="text-icon3">time</span>
-            <span className="text-neutral6">{time}</span>
+            <Txt as="span" variant="meta" tone="muted">
+              time
+            </Txt>
+            <Txt as="span" variant="meta" font="mono" tone="ink">
+              {time}
+            </Txt>
           </div>
         )}
         {visibleEntries.map(entry => (
           <div key={entry.name} className="flex items-center justify-between gap-3">
-            <span className="text-icon3">{entry.name}</span>
-            <span className="text-neutral6">
+            <Txt as="span" variant="meta" tone="muted">
+              {entry.name}
+            </Txt>
+            <Txt as="span" variant="meta" tone="ink">
               {typeof entry.value === 'number' ? Math.round(entry.value).toLocaleString() : String(entry.value)}
-            </span>
+            </Txt>
           </div>
         ))}
       </div>
@@ -183,9 +125,13 @@ function FlameTooltip({
   }
 
   return (
-    <div className="rounded border border-border1 bg-surface3 px-2 py-1 font-mono text-ui-xs shadow">
-      {time && <span className="text-neutral6">{time}</span>}
-    </div>
+    <Txt as="p" variant="meta" className={`${overlaySurfaceStyle} rounded px-2 py-1`}>
+      {time && (
+        <Txt as="span" variant="meta" font="mono" tone="ink">
+          {time}
+        </Txt>
+      )}
+    </Txt>
   );
 }
 
@@ -201,14 +147,13 @@ interface AreaRowProps {
 }
 
 function AreaRow({ label, data, dataKey, color, gradientId, domain, zoomDomain, threshold }: AreaRowProps) {
-  const maxValue = Math.max(0, ...data.map(d => Number(d[dataKey]) || 0));
-  const yMax = threshold != null ? Math.max(maxValue, threshold) : undefined;
+  const yMax = getAreaRowYMax(data, dataKey, threshold);
 
   return (
-    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border1/50 hover:z-10">
-      <p className="text-icon3 flex items-center self-stretch border-r border-border1/50 pl-3 text-ui-xs font-medium">
+    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border hover:z-10">
+      <Txt variant="meta" tone="muted" className="flex items-center self-stretch border-r border-border pl-3">
         {label}
-      </p>
+      </Txt>
       <div>
         <ResponsiveContainer width="100%" height={32}>
           <AreaChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
@@ -220,22 +165,16 @@ function AreaRow({ label, data, dataKey, color, gradientId, domain, zoomDomain, 
             </defs>
             <XAxis dataKey="t" type="number" domain={zoomDomain} allowDataOverflow hide />
             <YAxis type="number" domain={yMax != null ? [0, yMax] : undefined} hide />
-            <Tooltip
-              content={<FlameTooltip domain={domain} showValue />}
-              cursor={{ stroke: 'rgba(255,255,255,0.08)' }}
-            />
+            <Tooltip content={<FlameTooltip domain={domain} showValue />} cursor={{ stroke: 'var(--border)' }} />
             <Area
               type="linear"
               dataKey={dataKey}
               stroke={color}
               strokeWidth={1}
-              strokeOpacity={0.6}
               fill={`url(#${gradientId})`}
               isAnimationActive={false}
             />
-            {threshold != null && (
-              <ReferenceLine y={threshold} stroke={color} strokeDasharray="4 3" strokeOpacity={0.4} />
-            )}
+            {threshold != null && <ReferenceLine y={threshold} stroke="var(--border-strong)" strokeDasharray="4 3" />}
           </AreaChart>
         </ResponsiveContainer>
       </div>
@@ -254,10 +193,10 @@ interface EventRowProps {
 
 function EventRow({ label, data, color, height = 32, domain, zoomDomain }: EventRowProps) {
   return (
-    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border1/50 hover:z-10">
-      <p className="text-icon3 flex items-center self-stretch border-r border-border1/50 pl-3 text-ui-xs font-medium">
+    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border hover:z-10">
+      <Txt variant="meta" tone="muted" className="flex items-center self-stretch border-r border-border pl-3">
         {label}
-      </p>
+      </Txt>
       <div>
         <ResponsiveContainer width="100%" height={height}>
           <ScatterChart margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
@@ -312,52 +251,20 @@ function CombinedRow({
   height = 44,
   onSelectT,
 }: CombinedRowProps) {
-  const areaValueByTime = new Map<number, number>();
-  for (const point of areaData) {
-    if (point.t === undefined) continue;
-    areaValueByTime.set(point.t, Number(point[areaDataKey] ?? 0));
-  }
-  const eventsByTime = eventData.reduce<Map<number, Array<(typeof eventData)[number]>>>((acc, event) => {
-    const bucket = acc.get(event.t);
-    if (bucket) {
-      bucket.push(event);
-    } else {
-      acc.set(event.t, [event]);
-    }
-    return acc;
-  }, new Map());
-  const allTimes = Array.from(new Set([...areaValueByTime.keys(), ...eventsByTime.keys()])).sort((a, b) => a - b);
-
-  let lastAreaValue = 0;
-  const combinedData: Array<Record<string, unknown> & { t: number }> = [];
-  for (const time of allTimes) {
-    const nextAreaValue = areaValueByTime.get(time);
-    if (nextAreaValue != null) {
-      lastAreaValue = nextAreaValue;
-    }
-
-    const bucket = eventsByTime.get(time);
-    if (bucket && bucket.length > 0) {
-      for (const event of bucket) {
-        combinedData.push({ ...event, t: time, [areaDataKey]: lastAreaValue });
-      }
-    } else {
-      combinedData.push({ t: time, [areaDataKey]: lastAreaValue });
-    }
-  }
+  const combinedData = toCombinedRowData(areaData, areaDataKey, eventData);
 
   return (
-    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border1/50 hover:z-10">
-      <p className="text-icon3 flex items-center self-stretch border-r border-border1/50 pl-3 text-ui-xs font-medium">
+    <div className="relative grid grid-cols-[6rem_1fr] items-center border-b border-border hover:z-10">
+      <Txt variant="meta" tone="muted" className="flex items-center self-stretch border-r border-border pl-3">
         {label}
-      </p>
+      </Txt>
       <div>
         <ResponsiveContainer width="100%" height={height}>
           <ComposedChart
             margin={{ top: 0, right: 0, bottom: 0, left: 0 }}
             onClick={(state: RechartsClickState) => {
-              const label = state?.activeLabel;
-              if (label != null && onSelectT) onSelectT(Number(label));
+              const t = toSelectedT(state?.activeLabel);
+              if (t != null && onSelectT) onSelectT(t);
             }}
             className={onSelectT ? 'cursor-pointer' : undefined}
           >
@@ -377,18 +284,19 @@ function CombinedRow({
               dataKey={areaDataKey}
               stroke={color}
               strokeWidth={1}
-              strokeOpacity={0.6}
               fill={`url(#${gradientId})`}
               isAnimationActive={false}
-              activeDot={{ r: 5, stroke: color, strokeWidth: 2, fill: '#0a0a0a' }}
-              dot={(props: Record<string, unknown>) => {
-                const dotPayload = props.payload as { event?: number } | undefined;
-                if (!dotPayload?.event) return <></>;
-                return <circle cx={props.cx as number} cy={props.cy as number} r={4} fill={color} />;
-              }}
+              activeDot={{ r: 5, stroke: color, strokeWidth: 2, fill: 'var(--background)' }}
+              dot={(props: Record<string, unknown>) =>
+                isEventPoint(props.payload) ? (
+                  <circle cx={props.cx as number} cy={props.cy as number} r={4} fill={color} />
+                ) : (
+                  <></>
+                )
+              }
             />
             {threshold != null && (
-              <ReferenceLine yAxisId="area" y={threshold} stroke={color} strokeDasharray="4 3" strokeOpacity={0.4} />
+              <ReferenceLine yAxisId="area" y={threshold} stroke="var(--border-strong)" strokeDasharray="4 3" />
             )}
           </ComposedChart>
         </ResponsiveContainer>
@@ -453,15 +361,18 @@ function ZoomTrack({
   }, [toTimestamp, zoomLeft, zoomRight, onZoomLeftChange, onZoomRightChange]);
 
   return (
-    <div className="grid grid-cols-[6rem_1fr] items-center border-b border-border1/50">
-      <div className="flex items-center gap-1 self-stretch border-r border-border1/50 pl-3">
-        <p className="text-icon3 text-ui-xs font-medium">Zoom</p>
+    <div className="grid grid-cols-[6rem_1fr] items-center border-b border-border">
+      <div className="flex items-center gap-1 self-stretch border-r border-border pl-3">
+        <Txt variant="meta" tone="muted">
+          Zoom
+        </Txt>
         <Button variant="ghost" size="icon-sm" aria-label="Reset zoom" onClick={onReset}>
           <RotateCcw className="size-3" />
         </Button>
       </div>
       <div
         ref={trackRef}
+        data-zoom-track=""
         className="relative h-6 cursor-pointer select-none"
         onMouseDown={e => {
           const ts = toTimestamp(e.clientX);
@@ -478,14 +389,24 @@ function ZoomTrack({
           }
         }}
       >
-        <div className="absolute inset-y-0 left-0 bg-surface2/60" style={{ width: `${leftPercent}%` }} />
         <div
-          className="absolute inset-y-0 border-y border-border1/30 bg-neutral6/5"
+          data-zoom-part="before"
+          className="absolute inset-y-0 left-0 bg-background/60"
+          style={{ width: `${leftPercent}%` }}
+        />
+        <div
+          data-zoom-part="band"
+          className="absolute inset-y-0 border-y border-surface-rim bg-fill-subtle"
           style={{ left: `${leftPercent}%`, right: `${100 - rightPercent}%` }}
         />
-        <div className="absolute inset-y-0 right-0 bg-surface2/60" style={{ width: `${100 - rightPercent}%` }} />
         <div
-          className="absolute inset-y-0 w-1 cursor-col-resize bg-neutral6/50 hover:bg-neutral6"
+          data-zoom-part="after"
+          className="absolute inset-y-0 right-0 bg-background/60"
+          style={{ width: `${100 - rightPercent}%` }}
+        />
+        <div
+          data-zoom-handle="left"
+          className="absolute inset-y-0 w-1 cursor-col-resize bg-foreground/50 hover:bg-foreground"
           style={{ left: `${leftPercent}%`, transform: 'translateX(-50%)' }}
           onMouseDown={e => {
             e.preventDefault();
@@ -494,7 +415,8 @@ function ZoomTrack({
           }}
         />
         <div
-          className="absolute inset-y-0 w-1 cursor-col-resize bg-neutral6/50 hover:bg-neutral6"
+          data-zoom-handle="right"
+          className="absolute inset-y-0 w-1 cursor-col-resize bg-foreground/50 hover:bg-foreground"
           style={{ left: `${rightPercent}%`, transform: 'translateX(-50%)' }}
           onMouseDown={e => {
             e.preventDefault();

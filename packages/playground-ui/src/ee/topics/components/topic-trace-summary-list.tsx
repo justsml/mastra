@@ -1,10 +1,11 @@
-import { SearchIcon } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { TopicTraceSummary } from '../types';
 import { getVisibleTraceSummaries } from '../utils';
 import { Button } from '@/ds/components/Button';
 import { DataList } from '@/ds/components/DataList/data-list';
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/ds/components/InputGroup';
+import { useDataListKeyboard } from '@/ds/components/DataList/use-data-list-keyboard';
+import { SearchInput } from '@/ds/components/SearchInput';
 
 export interface TopicTraceSummaryListProps {
   traces: TopicTraceSummary[];
@@ -27,24 +28,21 @@ export function TopicTraceSummaryList({
     [page, pageSize, search, traces],
   );
 
+  const { containerRef, getRowProps } = useDataListKeyboard({ count: visible.traces.length });
+
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-4" aria-label="Topic trace summaries">
-      <InputGroup variant="outline">
-        <InputGroupAddon align="inline-start">
-          <SearchIcon />
-        </InputGroupAddon>
-        <InputGroupInput
-          type="search"
-          aria-label="Search traces"
-          placeholder="Search traces"
-          onChange={event => {
-            setSearch(event.target.value);
-            setPage(1);
-          }}
-        />
-      </InputGroup>
+      <SearchInput
+        label="Search traces"
+        placeholder="Search traces"
+        value={search}
+        onValueChange={value => {
+          setSearch(value);
+          setPage(1);
+        }}
+      />
 
-      <DataList columns="minmax(12rem,1fr)" className="min-h-0 flex-1">
+      <DataList columns="minmax(12rem,1fr)" className="min-h-0 flex-1" scrollRef={containerRef}>
         <DataList.Top>
           <DataList.TopCells>
             <DataList.TopCell>Trace summary</DataList.TopCell>
@@ -54,9 +52,10 @@ export function TopicTraceSummaryList({
         {visible.traces.length === 0 ? (
           <DataList.NoMatch message="No traces match this subtopic." />
         ) : (
-          visible.traces.map(trace => (
+          visible.traces.map((trace, index) => (
             <DataList.RowButton
               key={trace.id}
+              {...getRowProps(index)}
               featured={selectedTraceId === trace.id}
               onClick={() => onTraceSelect(trace)}
               aria-pressed={selectedTraceId === trace.id}
@@ -68,7 +67,7 @@ export function TopicTraceSummaryList({
       </DataList>
 
       {visible.hasMore ? (
-        <Button variant="outline" size="sm" onClick={() => setPage(currentPage => currentPage + 1)}>
+        <Button icon={<ChevronDown />} size="sm" onClick={() => setPage(currentPage => currentPage + 1)}>
           Load more traces ({visible.traces.length} of {visible.total})
         </Button>
       ) : null}

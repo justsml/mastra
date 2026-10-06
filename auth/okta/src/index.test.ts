@@ -11,17 +11,14 @@ vi.mock('jose', () => ({
   jwtVerify: vi.fn(),
 }));
 
-// Mock Okta SDK - use class syntax for proper constructor behavior
-const mockListUserGroups = vi.fn();
-vi.mock('@okta/okta-sdk-nodejs', () => ({
-  default: {
-    Client: class MockOktaClient {
-      userApi = {
-        listUserGroups: mockListUserGroups,
-      };
-    },
-  },
-}));
+function groupsResponse(groups: Array<{ profile: { name: string } }>, link?: string) {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Headers(link ? { link } : {}),
+    json: async () => groups,
+  };
+}
 
 describe('MastraAuthOkta', () => {
   beforeEach(() => {
@@ -40,6 +37,7 @@ describe('MastraAuthOkta', () => {
     delete process.env.OKTA_REDIRECT_URI;
     delete process.env.OKTA_COOKIE_PASSWORD;
     delete process.env.OKTA_ISSUER;
+    delete process.env.OKTA_AUDIENCE;
   });
 
   describe('constructor', () => {
@@ -166,6 +164,68 @@ describe('MastraAuthOkta', () => {
           updatedAt: undefined,
         },
       });
+    });
+
+    test('verifies against the configured audience option', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+
+      const auth = new MastraAuthOkta({ audience: 'api://default' });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'api://default' }),
+      );
+    });
+
+    test('verifies against OKTA_AUDIENCE when no option is given', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+      process.env.OKTA_AUDIENCE = 'https://dev-123456.okta.com';
+
+      const auth = new MastraAuthOkta();
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'https://dev-123456.okta.com' }),
+      );
+    });
+
+    test('accepts an array of audiences', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+
+      const auth = new MastraAuthOkta({ audience: ['test-client-id', 'api://default'] });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: ['test-client-id', 'api://default'] }),
+      );
+    });
+
+    test('the option wins over OKTA_AUDIENCE', async () => {
+      const mockJWKS = vi.fn();
+      (createRemoteJWKSet as any).mockReturnValue(mockJWKS);
+      (jwtVerify as any).mockResolvedValue({ payload: { sub: 'u1' } });
+      process.env.OKTA_AUDIENCE = 'from-env';
+
+      const auth = new MastraAuthOkta({ audience: 'from-option' });
+      await auth.authenticateToken('test-token', {} as any);
+
+      expect(jwtVerify).toHaveBeenCalledWith(
+        'test-token',
+        mockJWKS,
+        expect.objectContaining({ audience: 'from-option' }),
+      );
     });
 
     test('returns null for invalid token', async () => {
@@ -475,11 +535,9 @@ describe('MastraRBACOkta', () => {
   describe('getUserId option', () => {
     test('uses custom getUserId function for cross-provider support', async () => {
       // Mock Okta API to return groups when called with the correct user ID
-      mockListUserGroups.mockReturnValueOnce(
-        (async function* () {
-          yield { profile: { name: 'Admin' } };
-        })(),
-      );
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(groupsResponse([{ profile: { name: 'Admin' } }]) as any);
 
       const rbac = new MastraRBACOkta({
         roleMapping: { Admin: ['*'] },
@@ -499,7 +557,61 @@ describe('MastraRBACOkta', () => {
       const roles = await rbac.getRoles(auth0User);
       expect(roles).toEqual(['Admin']);
       // Verify getUserId resolved the correct Okta user ID for the API call
-      expect(mockListUserGroups).toHaveBeenCalledWith({ userId: 'okta-user-456' });
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://dev-123456.okta.com/api/v1/users/okta-user-456/groups?limit=200',
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'SSWS test-api-token' }) }),
+      );
+    });
+  });
+
+  describe('Okta groups API', () => {
+    test('follows Link pagination on the same org', async () => {
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          groupsResponse(
+            [{ profile: { name: 'Engineering' } }],
+            '<https://dev-123456.okta.com/api/v1/users/u1/groups?limit=200>; rel="self", ' +
+              '<https://dev-123456.okta.com/api/v1/users/u1/groups?after=abc&limit=200>; rel="next"',
+          ) as any,
+        )
+        .mockResolvedValueOnce(groupsResponse([{ profile: { name: 'Admin' } }]) as any);
+
+      const rbac = new MastraRBACOkta({ roleMapping: { Admin: ['*'] } });
+      const roles = await rbac.getRoles({ id: 'u1', oktaId: 'u1' } as OktaUser);
+
+      expect(roles).toEqual(['Engineering', 'Admin']);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(fetchSpy.mock.calls[1]![0]).toBe('https://dev-123456.okta.com/api/v1/users/u1/groups?after=abc&limit=200');
+    });
+
+    test('does not follow pagination links to another host', async () => {
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          groupsResponse([{ profile: { name: 'Engineering' } }], '<https://evil.example.com/next>; rel="next"') as any,
+        );
+
+      const rbac = new MastraRBACOkta({ roleMapping: { Admin: ['*'] } });
+      const roles = await rbac.getRoles({ id: 'u2', oktaId: 'u2' } as OktaUser);
+
+      expect(roles).toEqual(['Engineering']);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('falls back to no groups and retries after an API error', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({ ok: false, status: 500, headers: new Headers() } as any)
+        .mockResolvedValueOnce(groupsResponse([{ profile: { name: 'Admin' } }]) as any);
+
+      const rbac = new MastraRBACOkta({ roleMapping: { Admin: ['*'] } });
+      const user = { id: 'u3', oktaId: 'u3' } as OktaUser;
+
+      expect(await rbac.getRoles(user)).toEqual([]);
+      expect(await rbac.getRoles(user)).toEqual(['Admin']);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
     });
   });
 });

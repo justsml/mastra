@@ -1,8 +1,9 @@
 import { MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
 import type { MastraAuthConfig } from '@mastra/core/server';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { MASTRA_USER_KEY } from '../constants';
+import { HTTPException } from '../http-exception';
 
 import {
   canAccessPublicly,
@@ -616,39 +617,30 @@ describe('auth helpers', () => {
 
       expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('org-456:user-123');
     });
-    it('should not set resource ID when mapUserToResourceId returns null', async () => {
-      const requestContext = createRequestContext();
+    it.each([null, undefined, '', '   ', 0, false, {}, []])(
+      'rejects an invalid mapped resource ID: %s',
+      async resourceId => {
+        const requestContext = createRequestContext();
 
-      await coreAuthMiddleware({
-        ...baseCtx,
-        mastra: createMockMastra(),
-        authConfig: {
-          protected: ['/api/*'],
-          authenticateToken: async () => ({ id: 'user-123' }),
-          mapUserToResourceId: () => null,
-        },
-        requestContext,
-      });
+        const result = await coreAuthMiddleware({
+          ...baseCtx,
+          mastra: createMockMastra(),
+          authConfig: {
+            protected: ['/api/*'],
+            authenticateToken: async () => ({ id: 'user-123' }),
+            mapUserToResourceId: vi.fn().mockReturnValue(resourceId),
+          },
+          requestContext,
+        });
 
-      expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBeUndefined();
-    });
-
-    it('should not set resource ID when mapUserToResourceId returns undefined', async () => {
-      const requestContext = createRequestContext();
-
-      await coreAuthMiddleware({
-        ...baseCtx,
-        mastra: createMockMastra(),
-        authConfig: {
-          protected: ['/api/*'],
-          authenticateToken: async () => ({ id: 'user-123' }),
-          mapUserToResourceId: () => undefined,
-        },
-        requestContext,
-      });
-
-      expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBeUndefined();
-    });
+        expect(result).toEqual({
+          action: 'error',
+          status: 500,
+          body: { error: 'Failed to map authenticated user to a resource ID' },
+        });
+        expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBeUndefined();
+      },
+    );
 
     it('should not set resource ID when mapUserToResourceId is not provided', async () => {
       const requestContext = createRequestContext();
@@ -706,6 +698,45 @@ describe('auth helpers', () => {
         body: { error: 'Failed to map authenticated user to a resource ID' },
       });
       expect(requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBeUndefined();
+    });
+  });
+
+  describe('coreAuthMiddleware - errors thrown by authenticateToken', () => {
+    const run = (thrown: unknown) =>
+      coreAuthMiddleware({
+        path: '/api/agents',
+        method: 'GET',
+        getHeader: () => undefined,
+        rawRequest: {},
+        token: 'valid-token',
+        buildAuthorizeContext: () => null,
+        mastra: { getServer: () => ({}), getLogger: () => null } as any,
+        authConfig: {
+          protected: ['/api/*'],
+          authenticateToken: async () => {
+            throw thrown;
+          },
+        },
+        requestContext: { get: () => undefined, set: () => {} } as any,
+      });
+
+    it.each([
+      [503, 'Authentication service unavailable'],
+      [403, 'Account disabled'],
+      [401, 'Session revoked'],
+    ] as const)('preserves HTTPException %s status and message', async (status, message) => {
+      const result = await run(new HTTPException(status, { message }));
+      expect(result).toMatchObject({ action: 'error', status, body: { error: message } });
+    });
+
+    it.each([
+      ['plain Error', new Error('db connection string leaked')],
+      ['object with status/message', { status: 503, message: 'secret' }],
+      ['HTTPException with 200', new HTTPException(200, { message: 'ok' })],
+      ['HTTPException with 302', new HTTPException(302, { message: 'redirect' })],
+    ])('redacts %s to a generic 401', async (_label, thrown) => {
+      const result = await run(thrown);
+      expect(result).toMatchObject({ action: 'error', status: 401, body: { error: 'Invalid or expired token' } });
     });
   });
 
@@ -829,6 +860,41 @@ describe('auth helpers', () => {
       expect(headers['Set-Cookie']).toContain('wos-session=new-session');
       expect(headers['Set-Cookie']).toContain('Secure');
       expect(headers['Set-Cookie']).toContain('Domain=.example.com');
+    });
+
+    it('should preserve an HTTPException thrown by the re-authentication after refresh', async () => {
+      let callCount = 0;
+      const authConfig: any = {
+        protected: ['/api/*'],
+        authenticateToken: async () => {
+          callCount++;
+          if (callCount === 1) return null;
+          throw new HTTPException(503, { message: 'Authentication service unavailable' });
+        },
+        getSessionIdFromRequest: () => 'old-session',
+        refreshSession: async () => ({
+          id: 'new-session',
+          userId: 'user-1',
+          expiresAt: new Date(Date.now() + 86400000),
+          createdAt: new Date(),
+        }),
+        getSessionHeaders: (session: any) => ({ 'Set-Cookie': `wos-session=${session.id}` }),
+      };
+
+      const result = await coreAuthMiddleware({
+        ...baseCtx,
+        mastra: createMockMastra(),
+        authConfig,
+        requestContext: createRequestContext(),
+        rawRequest: createRawRequest(),
+      });
+
+      expect(callCount).toBe(2);
+      expect(result).toMatchObject({
+        action: 'error',
+        status: 503,
+        body: { error: 'Authentication service unavailable' },
+      });
     });
 
     it('should return 401 when refresh token is also expired', async () => {

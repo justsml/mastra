@@ -3,11 +3,16 @@ import { MockLanguageModelV1 } from '@internal/ai-sdk-v4/test';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { Memory } from '../../../memory/src';
 import { noopLogger } from '../logger';
 import type { Processor, ProcessOutputStepArgs } from '../processors/index';
 import { isProcessorWorkflow } from '../processors/index';
+import { PrefillErrorHandler } from '../processors/prefill-error-handler';
+import { ProviderHistoryCompat } from '../processors/provider-history-compat';
 import { ProcessorStepInputSchema, ProcessorStepOutputSchema } from '../processors/step-schema';
+import { StreamErrorRetryProcessor } from '../processors/stream-error-retry-processor';
 import { RequestContext } from '../request-context';
+import { InMemoryStore } from '../storage';
 import { createTool } from '../tools/tool';
 import { createStep, createWorkflow, isProcessor } from '../workflows';
 import type { MastraDBMessage } from './types';
@@ -23,6 +28,71 @@ const createMessage = (text: string, role: 'user' | 'assistant' = 'user'): Mastr
   },
   createdAt: new Date(),
 });
+
+// A unique token that only ever exists in the raw model output. Once a redacting
+// output processor removes it, it must not survive on any public result surface.
+const SENSITIVE_MARKER = 'SENSITIVE_MARKER_9d4f1c';
+
+/** Model that always emits the sensitive marker, for both generate and stream. */
+const makeRedactionModel = () =>
+  new MockLanguageModelV2({
+    doGenerate: async () => ({
+      content: [{ type: 'text' as const, text: SENSITIVE_MARKER }],
+      finishReason: 'stop' as const,
+      usage: { inputTokens: 2, outputTokens: 5, totalTokens: 7 },
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+    }),
+    doStream: async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+        { type: 'text-start', id: '1' },
+        { type: 'text-delta', id: '1', delta: SENSITIVE_MARKER },
+        { type: 'text-end', id: '1' },
+        { type: 'finish', finishReason: 'stop', usage: { inputTokens: 2, outputTokens: 5, totalTokens: 7 } },
+      ]),
+    }),
+  });
+
+/** Output processor that redacts every assistant text part down to ''. */
+class RedactAllTextProcessor implements Processor {
+  readonly id = 'redact-all-text-processor';
+  readonly name = 'Redact All Text Processor';
+
+  async processOutputResult({ messages }) {
+    return messages.map(msg => ({
+      ...msg,
+      content: {
+        ...msg.content,
+        parts: msg.content.parts.map(part => (part.type === 'text' ? { ...part, text: '' } : part)),
+      },
+    }));
+  }
+}
+
+/**
+ * Recursively assert the redacted marker is absent from a result surface.
+ * Applied to the final-output projection (`text`, `object`, `response.messages`,
+ * `response.uiMessages`), not to `steps[].content`/`steps[].response`, which are
+ * the per-step execution record of what the model actually returned.
+ */
+function expectNoSensitiveMarker(value: unknown, path = 'result', seen = new WeakSet<object>()): void {
+  if (typeof value === 'string') {
+    expect(value, `${path} still contains redacted text`).not.toContain(SENSITIVE_MARKER);
+    return;
+  }
+  if (typeof value !== 'object' || value === null) return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    value.forEach((entry, i) => expectNoSensitiveMarker(entry, `${path}[${i}]`, seen));
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    expectNoSensitiveMarker(entry, `${path}.${key}`, seen);
+  }
+}
 
 describe('Input and Output Processors', () => {
   let mockModel: MockLanguageModelV2;
@@ -663,6 +733,24 @@ describe('Input and Output Processors', () => {
       expect((result.response.messages[0].content[0] as any).text).toBe('HELLO WORLD');
     });
 
+    it('should let an output processor clear the final text to an empty string', async () => {
+      const agent = new Agent({
+        id: 'redacting-output-processor-generate-agent',
+        name: 'Redacting Output Processor Generate Agent',
+        instructions: 'You are a helpful assistant.',
+        model: makeRedactionModel(),
+        outputProcessors: [new RedactAllTextProcessor()],
+      });
+
+      const result = await agent.generate('Test');
+
+      expect(result.text).toBe('');
+      expect(result.steps.at(-1)?.text).toBe('');
+      expectNoSensitiveMarker(result.text, 'result.text');
+      expectNoSensitiveMarker(result.response.messages, 'result.response.messages');
+      expectNoSensitiveMarker(result.response.uiMessages, 'result.response.uiMessages');
+    });
+
     it('should process messages through multiple output processors in sequence', async () => {
       let finalProcessedText = '';
 
@@ -866,6 +954,70 @@ describe('Input and Output Processors', () => {
   });
 
   describe('Output Processors with stream', () => {
+    it('should let an output processor clear the final text to an empty string', async () => {
+      const agent = new Agent({
+        id: 'redacting-output-processor-stream-agent',
+        name: 'Redacting Output Processor Stream Agent',
+        instructions: 'You are a helpful assistant.',
+        model: makeRedactionModel(),
+        outputProcessors: [new RedactAllTextProcessor()],
+      });
+
+      const stream = await agent.stream('Test');
+      // Drain the stream so finalization runs before reading the resolved promises.
+      for await (const _ of stream.textStream) {
+      }
+
+      const fullOutput = await stream.getFullOutput();
+      expect(await stream.text).toBe('');
+      expect((await stream.steps).at(-1)?.text).toBe('');
+      expect(fullOutput.text).toBe('');
+      expectNoSensitiveMarker(fullOutput.text, 'fullOutput.text');
+      expectNoSensitiveMarker(fullOutput.response.messages, 'fullOutput.response.messages');
+      expectNoSensitiveMarker(fullOutput.response.uiMessages, 'fullOutput.response.uiMessages');
+    });
+
+    it('should run output processors when the provider throws', async () => {
+      let processorRan = false;
+      let seenFinishReason: string | undefined;
+
+      class ObservingProcessor implements Processor {
+        readonly id = 'observing-processor';
+        readonly name = 'Observing Processor';
+
+        async processOutputResult({ messages, result }) {
+          processorRan = true;
+          seenFinishReason = result?.finishReason;
+          return messages;
+        }
+      }
+
+      const agent = new Agent({
+        id: 'provider-error-processor-agent',
+        name: 'Provider Error Processor Agent',
+        instructions: 'You are a helpful assistant.',
+        model: new MockLanguageModelV2({
+          doStream: async () => {
+            throw new Error('provider exploded');
+          },
+        }),
+        outputProcessors: [new ObservingProcessor()],
+      });
+
+      const stream = await agent.stream('Hello');
+      // Drain the stream; the provider error terminates it.
+      try {
+        for await (const _ of stream.fullStream) {
+        }
+      } catch {
+        // stream consumption may rethrow the provider error
+      }
+      await stream.getFullOutput().catch(() => {});
+
+      expect(processorRan).toBe(true);
+      expect(seenFinishReason).toBe('error');
+    });
+
     it('should process text chunks through output processors in real-time', async () => {
       class TestOutputProcessor implements Processor {
         readonly id = 'test-output-processor';
@@ -1634,6 +1786,138 @@ describe('New Processor Features', () => {
   });
 
   describe('retry mechanism', () => {
+    /**
+     * Model that returns a rejected structured payload first, then an accepted one.
+     * Used to prove `result.object` names the same attempt as `result.text`.
+     */
+    const makeStructuredRetryModel = () => {
+      const rejected = '{"answer":"REJECTED","score":1}';
+      const accepted = '{"answer":"ACCEPTED","score":9}';
+      let calls = 0;
+      const nextText = () => (++calls === 1 ? rejected : accepted);
+      return {
+        get callCount() {
+          return calls;
+        },
+        model: new MockLanguageModelV2({
+          doGenerate: async () => ({
+            content: [{ type: 'text' as const, text: nextText() }],
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+          }),
+          doStream: async () => ({
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: nextText() },
+              { type: 'text-end', id: 'text-1' },
+              { type: 'finish', finishReason: 'stop', usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 } },
+            ]),
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+          }),
+        }),
+      };
+    };
+
+    /** Rejects the first structured attempt, accepts the retried one. */
+    const rejectFirstAttemptProcessor = {
+      id: 'reject-first-structured-attempt',
+      processOutputStep: async ({ text, abort, retryCount }: any) => {
+        if (retryCount === 0 && text?.includes('REJECTED')) {
+          abort('Structured output was rejected, please retry', { retry: true });
+        }
+        return [];
+      },
+    } satisfies Processor;
+
+    const retrySchema = z.object({ answer: z.string(), score: z.number() });
+
+    it('should expose the retried object, not the rejected attempt, from generate', async () => {
+      const harness = makeStructuredRetryModel();
+      const agent = new Agent({
+        id: 'structured-retry-generate-agent',
+        name: 'Structured Retry Generate Agent',
+        instructions: 'You are a helpful assistant.',
+        model: harness.model,
+        outputProcessors: [rejectFirstAttemptProcessor],
+        maxProcessorRetries: 3,
+      });
+
+      const result = await agent.generate('Hello', { structuredOutput: { schema: retrySchema } });
+
+      expect(harness.callCount).toBe(2);
+      expect(result.tripwire).toBeFalsy();
+      // text already reflected the accepted attempt before this fix
+      expect(result.text).toContain('ACCEPTED');
+      // object must name the same accepted attempt as text
+      expect(result.object).toEqual({ answer: 'ACCEPTED', score: 9 });
+    });
+
+    it('should expose the retried object, not the rejected attempt, from stream', async () => {
+      const harness = makeStructuredRetryModel();
+      const agent = new Agent({
+        id: 'structured-retry-stream-agent',
+        name: 'Structured Retry Stream Agent',
+        instructions: 'You are a helpful assistant.',
+        model: harness.model,
+        outputProcessors: [rejectFirstAttemptProcessor],
+        maxProcessorRetries: 3,
+      });
+
+      const stream = await agent.stream('Hello', { structuredOutput: { schema: retrySchema } });
+      for await (const _ of stream.fullStream) {
+      }
+      const fullOutput = await stream.getFullOutput();
+
+      expect(harness.callCount).toBe(2);
+      expect(fullOutput.tripwire).toBeFalsy();
+      expect(fullOutput.text).toContain('ACCEPTED');
+      expect(fullOutput.object).toEqual({ answer: 'ACCEPTED', score: 9 });
+      expect(await stream.object).toEqual({ answer: 'ACCEPTED', score: 9 });
+    });
+
+    it('should expose the retried object when `object` is awaited without draining the stream', async () => {
+      const harness = makeStructuredRetryModel();
+      const agent = new Agent({
+        id: 'structured-retry-await-object-agent',
+        name: 'Structured Retry Await Object Agent',
+        instructions: 'You are a helpful assistant.',
+        model: harness.model,
+        outputProcessors: [rejectFirstAttemptProcessor],
+        maxProcessorRetries: 3,
+      });
+
+      const stream = await agent.stream('Hello', { structuredOutput: { schema: retrySchema } });
+      // documented usage: await `object` directly, never touching `fullStream`
+      expect(await stream.object).toEqual({ answer: 'ACCEPTED', score: 9 });
+      expect(harness.callCount).toBe(2);
+    });
+
+    it('should expose the retried object when the `object` promise is captured before the retry settles', async () => {
+      const harness = makeStructuredRetryModel();
+      const agent = new Agent({
+        id: 'structured-retry-early-object-agent',
+        name: 'Structured Retry Early Object Agent',
+        instructions: 'You are a helpful assistant.',
+        model: harness.model,
+        outputProcessors: [rejectFirstAttemptProcessor],
+        maxProcessorRetries: 3,
+      });
+
+      const stream = await agent.stream('Hello', { structuredOutput: { schema: retrySchema } });
+      // materializes the promise before the first attempt is even rejected
+      const objectPromise = stream.object;
+      for await (const _ of stream.fullStream) {
+      }
+
+      expect(await objectPromise).toEqual({ answer: 'ACCEPTED', score: 9 });
+      expect(harness.callCount).toBe(2);
+    });
+
     it('should retry with feedback when processor calls abort with retry: true', async () => {
       let callCount = 0;
       const receivedMessages: any[][] = [];
@@ -1691,16 +1975,13 @@ describe('New Processor Features', () => {
       // Should have made 2 calls to the model
       expect(callCount).toBe(2);
 
-      // The second call should include the retry feedback message as a system message
+      // The retry feedback is appended after the conversation (not added as a system message),
+      // so the retry keeps the previous request's prompt prefix.
       const secondCallMessages = receivedMessages[1];
-      const hasRetryFeedback = secondCallMessages.some((msg: any) => {
-        if (msg.role === 'system') {
-          const content = typeof msg.content === 'string' ? msg.content : '';
-          return content.includes('Response quality too low');
-        }
-        return false;
-      });
-      expect(hasRetryFeedback).toBe(true);
+      expect(secondCallMessages.filter((msg: any) => msg.role === 'system')).toHaveLength(1);
+      const feedbackMessage = secondCallMessages.at(-1);
+      expect(feedbackMessage.role).toBe('user');
+      expect(JSON.stringify(feedbackMessage.content)).toContain('Response quality too low');
 
       // Final result text should only include the accepted response
       // The rejected step has tripwire data, so its text returns empty
@@ -1714,6 +1995,95 @@ describe('New Processor Features', () => {
       expect((result.steps[0] as any).tripwire.reason).toBe('Response quality too low, please improve');
       // Second step should not have tripwire (accepted)
       expect((result.steps[1] as any).tripwire).toBeUndefined();
+    });
+
+    it('should only append to the prompt on retries so the provider prompt cache is reused', async () => {
+      const prompts: LanguageModelV2Prompt[] = [];
+      const turns = [
+        { tool: 'a' },
+        { text: 'bad response' },
+        { tool: 'b' },
+        { text: 'bad response' },
+        { text: 'good response' },
+      ];
+      const mockModel = new MockLanguageModelV2({
+        doStream: async ({ prompt }) => {
+          prompts.push(prompt);
+          const turn = turns[prompts.length - 1]!;
+          const usage = { inputTokens: 5, outputTokens: 5, totalTokens: 10 };
+          const chunks =
+            'tool' in turn
+              ? [
+                  {
+                    type: 'tool-call' as const,
+                    toolCallId: turn.tool,
+                    toolName: 'lookup',
+                    input: JSON.stringify({ key: turn.tool }),
+                  },
+                  { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
+                ]
+              : [
+                  { type: 'text-start' as const, id: 't' },
+                  { type: 'text-delta' as const, id: 't', delta: turn.text },
+                  { type: 'text-end' as const, id: 't' },
+                  { type: 'finish' as const, finishReason: 'stop' as const, usage },
+                ];
+          return { rawCall: { rawPrompt: null, rawSettings: {} }, stream: convertArrayToReadableStream(chunks) };
+        },
+      });
+
+      const lookup = createTool({
+        id: 'lookup',
+        description: 'Look up a value',
+        inputSchema: z.object({ key: z.string() }),
+        execute: async ({ key }) => ({ value: key }),
+      });
+
+      const qualityChecker = {
+        id: 'quality-checker',
+        processOutputStep: async ({ text, abort, retryCount, messageList }: any) => {
+          if (retryCount === 0 && text?.includes('bad response')) {
+            abort('Response quality too low, please improve', { retry: true });
+          }
+          return messageList;
+        },
+      } satisfies Processor;
+
+      const agent = new Agent({
+        id: 'retry-prompt-cache-agent',
+        name: 'Retry Prompt Cache Agent',
+        instructions: 'You are a helpful assistant.',
+        model: mockModel,
+        tools: { lookup },
+        outputProcessors: [qualityChecker],
+        maxProcessorRetries: 3,
+      });
+
+      const result = await agent.stream('Hello', { maxSteps: 10 });
+      expect(await result.text).toBe('good response');
+      expect(prompts).toHaveLength(5);
+
+      // Mastra stamps `providerOptions.mastra` on prompt parts; providers don't send it.
+      const wire = (prompt: LanguageModelV2Prompt) =>
+        JSON.parse(JSON.stringify(prompt), (key, value) => (key === 'mastra' ? undefined : value));
+
+      // Each request extends the previous one, including across two retries with the same feedback.
+      for (let i = 1; i < prompts.length; i++) {
+        expect(wire(prompts[i]!).slice(0, prompts[i - 1]!.length)).toEqual(wire(prompts[i - 1]!));
+        expect(prompts[i]!.filter(msg => msg.role === 'system')).toHaveLength(1);
+      }
+
+      // The abort reason is sent verbatim as the last message.
+      const feedbackText = '<system-reminder>Response quality too low, please improve</system-reminder>';
+      const feedback = { role: 'user', content: [expect.objectContaining({ type: 'text', text: feedbackText })] };
+      const feedbackCount = (prompt: LanguageModelV2Prompt) =>
+        prompt.filter(
+          msg => msg.role === 'user' && msg.content.some(part => part.type === 'text' && part.text === feedbackText),
+        ).length;
+      expect(feedbackCount(prompts[2]!)).toBe(1);
+      expect(wire(prompts[2]!).at(-1)).toEqual(feedback);
+      expect(feedbackCount(prompts[4]!)).toBe(2);
+      expect(wire(prompts[4]!).at(-1)).toEqual(feedback);
     });
 
     it('should increment retryCount on each retry', async () => {
@@ -1876,11 +2246,11 @@ describe('New Processor Features', () => {
       });
       expect(hasRejectedResponse).toBe(false);
 
-      // The retry feedback should be present as a system message
-      const hasRetryFeedback = retryPrompt.some(
-        msg => msg.role === 'system' && msg.content.includes('Fabrication detected'),
-      );
-      expect(hasRetryFeedback).toBe(true);
+      // The retry feedback is appended as the last message, not added as a system message
+      expect(retryPrompt.filter(msg => msg.role === 'system')).toHaveLength(1);
+      const feedbackMessage = retryPrompt.at(-1)!;
+      expect(feedbackMessage.role).toBe('user');
+      expect(JSON.stringify(feedbackMessage.content)).toContain('Fabrication detected');
 
       // Final result should be the corrected response
       expect(result.text).toBe('corrected response');
@@ -3477,5 +3847,620 @@ describe('Workflow as Processor', () => {
       expect(stepLog[0]).toEqual({ stepNumber: 0, stepsLength: 0 });
       expect(stepLog[1]).toEqual({ stepNumber: 1, stepsLength: 1 });
     });
+  });
+});
+
+describe('output tripwire text disclosure (#24443)', () => {
+  const ANSWER = 'We deliver on Friday. Card or bank transfer.';
+  const usage = { inputTokens: 4, outputTokens: 10, totalTokens: 14 };
+
+  const makeModel = () =>
+    new MockLanguageModelV2({
+      doGenerate: async () => ({
+        content: [{ type: 'text' as const, text: ANSWER }],
+        finishReason: 'stop' as const,
+        usage,
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: ANSWER },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage },
+        ]),
+      }),
+    });
+
+  const makeAgent = (hook: 'processOutputResult' | 'processOutputStep' | 'processOutputStream') => {
+    const processor: Processor = { id: `tripwire-${hook}` };
+    if (hook === 'processOutputStream') {
+      processor.processOutputStream = async ({ part, abort }) => {
+        if (part.type === 'finish') abort(`rejected at ${hook}`);
+        return part;
+      };
+    } else {
+      processor[hook] = async ({ abort }: any) => abort(`rejected at ${hook}`);
+    }
+    return new Agent({
+      id: `disclosure-${hook}`,
+      name: 'disclosure',
+      instructions: 'Answer briefly.',
+      model: makeModel(),
+      outputProcessors: [processor],
+    });
+  };
+
+  const assistantText = (messages: any[]) =>
+    messages
+      .filter(m => m.role === 'assistant')
+      .flatMap(m => (typeof m.content === 'string' ? [m.content] : m.content))
+      .map((p: any) => (typeof p === 'string' ? p : p.type === 'text' ? p.text : ''))
+      .join('');
+
+  for (const hook of ['processOutputResult', 'processOutputStep', 'processOutputStream'] as const) {
+    it(`stream(): text agrees with steps, response and getFullOutput when ${hook} trips`, async () => {
+      const stream = await makeAgent(hook).stream('Do you deliver here?');
+      const full = await stream.getFullOutput();
+      const text = await stream.text;
+      const steps = await stream.steps;
+      const response = await stream.response;
+
+      expect(stream.tripwire?.reason).toBe(`rejected at ${hook}`);
+      expect(stream.tripwire?.processorId).toBe(`tripwire-${hook}`);
+      expect(full.text).toBe(text);
+      const responseText = assistantText(response?.messages ?? []);
+      if (hook === 'processOutputResult') {
+        expect(steps.length).toBeGreaterThan(0);
+        expect(responseText).toBe(ANSWER);
+      }
+      if (steps.length > 0) expect(steps.map(s => s.text).join('')).toBe(text);
+      if (responseText) expect(responseText).toBe(text);
+      if (hook !== 'processOutputStep') expect(text).toBe(ANSWER);
+    });
+
+    it(`generate(): text agrees with steps when ${hook} trips`, async () => {
+      const result = await makeAgent(hook).generate('Do you deliver here?');
+      expect(result.tripwire?.reason).toBe(`rejected at ${hook}`);
+      if (hook === 'processOutputResult') {
+        expect(result.steps.length).toBeGreaterThan(0);
+        expect(assistantText(result.response?.messages ?? [])).toBe(ANSWER);
+      }
+      if (result.steps.length > 0) expect(result.steps.map(s => s.text).join('')).toBe(result.text);
+      if (hook !== 'processOutputStep') expect(result.text).toBe(ANSWER);
+    });
+  }
+});
+
+describe('error processors — shared stability defaults', () => {
+  const testModel = new MockLanguageModelV2({
+    doGenerate: async () => ({
+      content: [{ type: 'text' as const, text: 'ok' }],
+      finishReason: 'stop' as const,
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      rawCall: { rawPrompt: [], rawSettings: {} },
+      warnings: [],
+    }),
+  });
+
+  const DEFAULT_ERROR_PROCESSOR_IDS = [
+    'provider-history-compat',
+    'prefill-error-handler',
+    'stream-error-retry-processor',
+  ] as const;
+
+  const bareAgent = (config: Record<string, unknown> = {}) =>
+    new Agent({
+      id: 'stability-defaults-agent',
+      name: 'Stability Defaults Agent',
+      instructions: 'test',
+      model: testModel,
+      ...config,
+    });
+
+  it('resolves the shared stability defaults, in order, for a bare agent', async () => {
+    const agent = bareAgent();
+
+    const resolved = await agent.listErrorProcessors();
+
+    expect(resolved.map(processor => processor.id)).toEqual([...DEFAULT_ERROR_PROCESSOR_IDS]);
+  });
+
+  it('keeps the caller list first and adds only the defaults it does not already carry', async () => {
+    const customProcessor: Processor = {
+      id: 'custom-error-processor',
+      processAPIError: async () => ({ retry: true }),
+    };
+    const agent = bareAgent({ errorProcessors: [customProcessor] });
+
+    const resolved = await agent.listErrorProcessors();
+
+    // The caller's processor runs first: error processors short-circuit on the first `{ retry: true }`,
+    // so a caller processor placed behind the default retry would never be reached.
+    expect(resolved[0]).toBe(customProcessor);
+    expect(resolved.map(processor => processor.id)).toEqual(['custom-error-processor', ...DEFAULT_ERROR_PROCESSOR_IDS]);
+  });
+
+  it('does not duplicate a caller processor whose id matches a default', async () => {
+    const customCompat = new ProviderHistoryCompat();
+    const agent = bareAgent({ errorProcessors: [customCompat] });
+
+    const resolved = await agent.listErrorProcessors();
+    const compatProcessors = resolved.filter(processor => processor.id === 'provider-history-compat');
+
+    expect(compatProcessors).toEqual([customCompat]);
+    expect(resolved.map(processor => processor.id)).toEqual([
+      'provider-history-compat',
+      'prefill-error-handler',
+      'stream-error-retry-processor',
+    ]);
+    // The caller's instance is the one that runs, and it stays in the caller's position.
+    expect(resolved[0]).toBe(customCompat);
+  });
+
+  it('leaves a caller list that already names every default untouched', async () => {
+    const customRetry = new StreamErrorRetryProcessor({ maxRetries: 5 });
+    const agent = bareAgent({
+      errorProcessors: [new ProviderHistoryCompat(), customRetry, new PrefillErrorHandler()],
+    });
+
+    const resolved = await agent.listErrorProcessors();
+
+    expect(resolved).toHaveLength(3);
+    expect(resolved[1]).toBe(customRetry);
+  });
+
+  it('merges the defaults into an explicitly empty caller list', async () => {
+    const agent = bareAgent({ errorProcessors: [] });
+
+    // An empty list is a base like any other; `errorProcessorDefaults: false` is the only opt-out.
+    expect((await agent.listErrorProcessors()).map(processor => processor.id)).toEqual([
+      ...DEFAULT_ERROR_PROCESSOR_IDS,
+    ]);
+  });
+
+  it('resolves a function-form errorProcessors list before deduping', async () => {
+    const customCompat = new ProviderHistoryCompat();
+    const customProcessor: Processor = {
+      id: 'custom-error-processor',
+      processAPIError: async () => ({ retry: true }),
+    };
+    const agent = bareAgent({ errorProcessors: () => [customCompat, customProcessor] });
+
+    const resolved = await agent.listErrorProcessors();
+
+    expect(resolved.map(processor => processor.id)).toEqual([
+      'provider-history-compat',
+      'custom-error-processor',
+      'prefill-error-handler',
+      'stream-error-retry-processor',
+    ]);
+    expect(resolved[0]).toBe(customCompat);
+  });
+
+  it('resolves a dynamic error-processor list once per run and runs the same instance in both lanes', async () => {
+    const processLLMRequest = vi.fn(() => undefined);
+    const resolver = vi.fn((): Processor[] => [
+      { id: 'dynamic-error', processLLMRequest, processAPIError: () => undefined },
+    ]);
+    const agent = bareAgent({ errorProcessorDefaults: false, errorProcessors: resolver });
+
+    await agent.generate('hello');
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(processLLMRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('inserts the added repair processors ahead of a caller retry processor', async () => {
+    const customRetry = new StreamErrorRetryProcessor({ maxRetries: 5 });
+    const agent = bareAgent({ errorProcessors: [customRetry] });
+
+    const resolved = await agent.listErrorProcessors();
+
+    // Naming only the retry processor must not put it ahead of the repairs: error processors
+    // short-circuit on the first `{ retry: true }`, and a retry processor configured with broad
+    // matchers would claim errors the repairs could fix, so both repairs have to stay ahead of it.
+    expect(resolved.map(processor => processor.id)).toEqual([...DEFAULT_ERROR_PROCESSOR_IDS]);
+    expect(resolved[2]).toBe(customRetry);
+  });
+
+  it('inserts added defaults in canonical order around a caller processor naming the last one', async () => {
+    const customPrefill = new PrefillErrorHandler();
+    const agent = bareAgent({ errorProcessors: [customPrefill] });
+
+    const resolved = await agent.listErrorProcessors();
+
+    expect(resolved.map(processor => processor.id)).toEqual([...DEFAULT_ERROR_PROCESSOR_IDS]);
+    expect(resolved[1]).toBe(customPrefill);
+  });
+
+  it('does not reorder caller processors that carry no default id', async () => {
+    const customRetry = new StreamErrorRetryProcessor({ maxRetries: 5 });
+    const customProcessor: Processor = {
+      id: 'custom-error-processor',
+      processAPIError: async () => ({ retry: true }),
+    };
+    const agent = bareAgent({ errorProcessors: [customRetry, customProcessor] });
+
+    const resolved = await agent.listErrorProcessors();
+
+    // Caller processors keep their relative order; the added default goes to the position its id
+    // gives it relative to the other defaults, and the unordered caller processor stays put.
+    expect(resolved.map(processor => processor.id)).toEqual([
+      'provider-history-compat',
+      'prefill-error-handler',
+      'stream-error-retry-processor',
+      'custom-error-processor',
+    ]);
+    expect(resolved[1]).toBeInstanceOf(PrefillErrorHandler);
+    expect(resolved[2]).toBe(customRetry);
+    expect(resolved[3]).toBe(customProcessor);
+  });
+
+  it('leaves getConfiguredProcessorIds reporting only what the caller configured', async () => {
+    const customProcessor: Processor = {
+      id: 'custom-error-processor',
+      processAPIError: async () => ({ retry: true }),
+    };
+
+    expect((await bareAgent().getConfiguredProcessorIds()).errorProcessorIds).toEqual([]);
+    expect(
+      (await bareAgent({ errorProcessors: [customProcessor] }).getConfiguredProcessorIds()).errorProcessorIds,
+    ).toEqual(['custom-error-processor']);
+  });
+
+  it('runs only the caller list when `errorProcessorDefaults` is false', async () => {
+    const customProcessor: Processor = {
+      id: 'custom-error-processor',
+      processAPIError: async () => ({ retry: true }),
+    };
+    const agent = bareAgent({ errorProcessors: [customProcessor], errorProcessorDefaults: false });
+
+    // The one thing `errorProcessors: [mine]` cannot otherwise express: no defaults merged in.
+    expect(await agent.listErrorProcessors()).toEqual([customProcessor]);
+  });
+
+  it('resolves no error processors for a bare agent when `errorProcessorDefaults` is false', async () => {
+    const agent = bareAgent({ errorProcessorDefaults: false });
+
+    expect(await agent.listErrorProcessors()).toEqual([]);
+  });
+});
+
+describe('LLM request lane — error-phase processors', () => {
+  const promptTexts = (prompt: LanguageModelV2Prompt): string[] =>
+    prompt.flatMap(message =>
+      typeof message.content === 'string'
+        ? [message.content]
+        : message.content.flatMap(part => (part.type === 'text' ? [part.text] : [])),
+    );
+
+  /**
+   * Error processor that rewrites the outbound prompt and records what it saw, so a test can prove both
+   * that it ran and that its rewrite reached the model.
+   */
+  const makePromptRewritingErrorProcessor = () => {
+    const seenPrompts: LanguageModelV2Prompt[] = [];
+    const calls = { processLLMRequest: 0, processInput: 0, processInputStep: 0, processAPIError: 0 };
+    const processor: Processor & { id: string } = {
+      id: 'prompt-rewriting-error-processor',
+      processLLMRequest: ({ prompt }) => {
+        calls.processLLMRequest += 1;
+        seenPrompts.push(prompt);
+        return {
+          prompt: prompt.map(message => {
+            if (message.role !== 'user') return message;
+            return {
+              ...message,
+              content: [{ type: 'text' as const, text: 'REWRITTEN_BY_ERROR_PROCESSOR' }],
+            };
+          }),
+        };
+      },
+      processInput: async () => {
+        calls.processInput += 1;
+      },
+      processInputStep: async () => {
+        calls.processInputStep += 1;
+        return {};
+      },
+      processAPIError: async () => {
+        calls.processAPIError += 1;
+      },
+    };
+    return { processor, seenPrompts, calls };
+  };
+
+  it('runs processLLMRequest for an error-lane processor and shows it the model prompt', async () => {
+    const { processor, seenPrompts, calls } = makePromptRewritingErrorProcessor();
+    const capturedPrompts: LanguageModelV2Prompt[] = [];
+    const model = new MockLanguageModelV2({
+      doGenerate: async ({ prompt }) => {
+        capturedPrompts.push(prompt);
+        return {
+          content: [{ type: 'text' as const, text: 'ok' }],
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'llm-request-lane-agent',
+      name: 'LLM Request Lane Agent',
+      instructions: 'test',
+      model,
+      errorProcessors: [processor],
+    });
+
+    await agent.generate('hello');
+
+    expect(calls.processLLMRequest).toBeGreaterThan(0);
+    expect(seenPrompts[0]).toBeTruthy();
+    // The rewrite is what the model actually receives.
+    expect(capturedPrompts.length).toBeGreaterThan(0);
+    expect(promptTexts(capturedPrompts[0]!)).toContain('REWRITTEN_BY_ERROR_PROCESSOR');
+  });
+
+  it('does not leak an error-lane processor into the input step', async () => {
+    const { processor, calls } = makePromptRewritingErrorProcessor();
+    const agent = new Agent({
+      id: 'llm-request-lane-agent',
+      name: 'LLM Request Lane Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text' as const, text: 'ok' }],
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        }),
+      }),
+      errorProcessors: [processor],
+    });
+
+    await agent.generate('hello');
+
+    // The widening reaches the provider-boundary lane only: the input steps must not run for it.
+    expect(calls.processInput).toBe(0);
+    expect(calls.processInputStep).toBe(0);
+    expect(await agent.listResolvedInputProcessors()).not.toContain(processor);
+  });
+
+  it('lists an error-lane processor once when it is also an input processor', async () => {
+    const { processor } = makePromptRewritingErrorProcessor();
+    const agent = new Agent({
+      id: 'llm-request-lane-agent',
+      name: 'LLM Request Lane Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text' as const, text: 'ok' }],
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        }),
+      }),
+      inputProcessors: [processor],
+      errorProcessors: [processor],
+    });
+
+    const lane = await agent.__listLLMRequestProcessors();
+    expect(lane.filter(entry => !isProcessorWorkflow(entry) && entry.id === processor.id)).toHaveLength(1);
+  });
+
+  it('adds the error-phase defaults to the request lane without disturbing the input lane', async () => {
+    const agent = new Agent({
+      id: 'llm-request-lane-agent',
+      name: 'LLM Request Lane Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text' as const, text: 'ok' }],
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        }),
+      }),
+    });
+
+    const laneIds = (await agent.__listLLMRequestProcessors())
+      .filter(entry => !isProcessorWorkflow(entry))
+      .map(entry => entry.id);
+
+    // An error-lane `ProviderHistoryCompat` is the reason the lane widens.
+    expect(laneIds).toContain('provider-history-compat');
+    // The input lane itself is untouched.
+    const inputIds = (await agent.listResolvedInputProcessors())
+      .filter(entry => !isProcessorWorkflow(entry))
+      .map(entry => entry.id);
+    expect(inputIds).not.toContain('provider-history-compat');
+    expect(laneIds).toEqual([...new Set(laneIds)]);
+  });
+
+  it('applies a call-time errorProcessors override to the request lane', async () => {
+    const { processor, calls } = makePromptRewritingErrorProcessor();
+    const capturedPrompts: LanguageModelV2Prompt[] = [];
+    const agent = new Agent({
+      id: 'llm-request-lane-override-agent',
+      name: 'LLM Request Lane Override Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async ({ prompt }) => {
+          capturedPrompts.push(prompt);
+          return {
+            content: [{ type: 'text' as const, text: 'ok' }],
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            rawCall: { rawPrompt: [], rawSettings: {} },
+            warnings: [],
+          };
+        },
+      }),
+    });
+
+    await agent.generate('hello', { errorProcessors: [processor] });
+
+    // The call-time processor runs its prompt hook even though the agent
+    // configured no error processors.
+    expect(calls.processLLMRequest).toBeGreaterThan(0);
+    expect(promptTexts(capturedPrompts[0]!)).toContain('REWRITTEN_BY_ERROR_PROCESSOR');
+  });
+
+  it('drops the default error processors from the request lane when the call-time list is empty', async () => {
+    const phcSpy = vi.spyOn(ProviderHistoryCompat.prototype, 'processLLMRequest');
+    const agent = new Agent({
+      id: 'llm-request-lane-empty-override-agent',
+      name: 'LLM Request Lane Empty Override Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          content: [{ type: 'text' as const, text: 'ok' }],
+          finishReason: 'stop' as const,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          rawCall: { rawPrompt: [], rawSettings: {} },
+          warnings: [],
+        }),
+      }),
+    });
+
+    await agent.generate('hello', { errorProcessors: [] });
+
+    // `errorProcessors: []` replaces the resolved list — defaults included — so
+    // the default ProviderHistoryCompat must not rewrite the outbound prompt.
+    expect(phcSpy).not.toHaveBeenCalled();
+    phcSpy.mockRestore();
+  });
+});
+
+describe('anthropic tool id repair — prompt-scoped through the agent', () => {
+  const ANTHROPIC_MODEL = { provider: 'anthropic.messages', modelId: 'claude-sonnet-4-5' };
+
+  /** Formats the tool ids carried by a converted v2 prompt, in order. */
+  const promptToolIds = (prompt: LanguageModelV2Prompt): string[] =>
+    prompt
+      .flatMap(message => (Array.isArray(message.content) ? message.content : []))
+      .map(part => (part as { toolCallId?: string }).toolCallId)
+      .filter((id): id is string => typeof id === 'string');
+
+  /**
+   * Format-2 history carrying an Anthropic-illegal tool id (`call.abc:1`). The array is kept by
+   * reference so the test can assert afterwards that the agent did not rewrite it in place.
+   */
+  const historyWithInvalidToolId = () => [
+    { role: 'user' as const, content: 'search for this' },
+    {
+      role: 'assistant' as const,
+      content: [
+        { type: 'text' as const, text: 'Searching.' },
+        {
+          type: 'tool-call' as const,
+          toolCallId: 'call.abc:1',
+          toolName: 'search',
+          input: { query: 'Mastra' },
+        },
+      ],
+    },
+    {
+      role: 'tool' as const,
+      content: [
+        {
+          type: 'tool-result' as const,
+          toolCallId: 'call.abc:1',
+          toolName: 'search',
+          output: { type: 'text' as const, value: 'result' },
+        },
+      ],
+    },
+    { role: 'user' as const, content: 'thanks' },
+  ];
+
+  /** Every tool id the message objects carry, wherever the message shape stores it. */
+  const idsInMessages = (messages: unknown): string[] =>
+    JSON.stringify(messages).match(/call[._][A-Za-z0-9_:.]+/g) ?? [];
+
+  it('repairs the outbound prompt on a bare Anthropic agent, leaving persisted history alone', async () => {
+    const capturedPrompts: LanguageModelV2Prompt[] = [];
+    const agent = new Agent({
+      id: 'tool-id-repair-agent',
+      name: 'Tool Id Repair Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        provider: ANTHROPIC_MODEL.provider,
+        modelId: ANTHROPIC_MODEL.modelId,
+        doGenerate: async ({ prompt }) => {
+          capturedPrompts.push(prompt as LanguageModelV2Prompt);
+          return {
+            content: [{ type: 'text' as const, text: 'ok' }],
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            rawCall: { rawPrompt: [], rawSettings: {} },
+            warnings: [],
+          };
+        },
+      }),
+    });
+
+    const history = historyWithInvalidToolId();
+    const before = structuredClone(history);
+
+    // A bare agent carries the shared stability defaults, so `ProviderHistoryCompat` runs in the
+    // prompt lane without the caller wiring anything.
+    await agent.generate(history as never);
+
+    expect(capturedPrompts).toHaveLength(1);
+    const sentIds = promptToolIds(capturedPrompts[0]!);
+    expect(sentIds).toEqual(['call_abc_1', 'call_abc_1']);
+    for (const id of sentIds) expect(id).toMatch(/^[a-zA-Z0-9_-]+$/);
+
+    // Prompt-scoped: the caller's own message objects are not rewritten in place.
+    expect(history).toEqual(before);
+    expect(idsInMessages(history)).toEqual(['call.abc:1', 'call.abc:1']);
+  });
+
+  it('keeps the original ids in stored history when the agent has memory', async () => {
+    const storage = new InMemoryStore();
+    const memory = new Memory({ storage, options: { lastMessages: 100, generateTitle: false } });
+    const capturedPrompts: LanguageModelV2Prompt[] = [];
+    const agent = new Agent({
+      id: 'tool-id-repair-memory-agent',
+      name: 'Tool Id Repair Memory Agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        provider: ANTHROPIC_MODEL.provider,
+        modelId: ANTHROPIC_MODEL.modelId,
+        doGenerate: async ({ prompt }) => {
+          capturedPrompts.push(prompt as LanguageModelV2Prompt);
+          return {
+            content: [{ type: 'text' as const, text: 'ok' }],
+            finishReason: 'stop' as const,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            rawCall: { rawPrompt: [], rawSettings: {} },
+            warnings: [],
+          };
+        },
+      }),
+      memory,
+    });
+
+    const threadId = 'tool-id-repair-thread';
+    const resourceId = 'tool-id-repair-resource';
+    await agent.generate(historyWithInvalidToolId() as never, { memory: { thread: threadId, resource: resourceId } });
+
+    // The outbound prompt was sanitized.
+    expect(promptToolIds(capturedPrompts[0]!)).toEqual(['call_abc_1', 'call_abc_1']);
+
+    // Stored history still carries the original ids.
+    const memoryStore = await storage.getStore('memory');
+    const { messages } = await memoryStore!.listMessages({ threadId, perPage: 100 });
+    expect(idsInMessages(messages)).toEqual(['call.abc:1', 'call.abc:1']);
   });
 });

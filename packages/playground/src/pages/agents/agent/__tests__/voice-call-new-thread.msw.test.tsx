@@ -7,7 +7,8 @@ import React from 'react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import AgentPage from '../index';
+import AgentPage from '../thread';
+import { draftAuthDisabled } from './fixtures/drafts';
 import { StudioConfigContext } from '@/domains/configuration';
 import { server } from '@/test/msw-server';
 
@@ -89,10 +90,10 @@ const renderPage = () => {
     >
       <MastraReactProvider baseUrl={BASE_URL}>
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={[`/agents/${AGENT_ID}/chat/new`]}>
+          <MemoryRouter initialEntries={[`/agents/${AGENT_ID}/threads/new`]}>
             <LocationProbe />
             <Routes>
-              <Route path="/agents/:agentId/chat/:threadId" element={<AgentPage />} />
+              <Route path="/agents/:agentId/threads/:threadId" element={<AgentPage />} />
             </Routes>
           </MemoryRouter>
         </QueryClientProvider>
@@ -105,6 +106,7 @@ function installHandlers() {
   // The worker "creates" the thread and persists the greeting when the call connects.
   let callStarted = false;
   server.use(
+    http.get(`${BASE_URL}/api/auth/capabilities`, () => HttpResponse.json(draftAuthDisabled)),
     http.post(`${BASE_URL}/voice/livekit/connection-details`, () => {
       callStarted = true;
       return HttpResponse.json({
@@ -171,21 +173,21 @@ afterEach(() => {
   fakeRooms.length = 0;
 });
 
-describe('voice call from a brand-new chat (/chat/new)', () => {
+describe('voice call from a brand-new chat (/threads/new)', () => {
   it('navigates to the thread URL and shows persisted messages in the chat', async () => {
     installHandlers();
     renderPage();
 
     // Page renders in new-thread state with the voice button available.
     const button = await screen.findByTestId('voice-call-button');
-    expect(screen.getByTestId('location-probe').textContent).toBe(`/agents/${AGENT_ID}/chat/new`);
+    expect(screen.getByTestId('location-probe').textContent).toBe(`/agents/${AGENT_ID}/threads/new`);
 
     fireEvent.click(button);
 
-    // The call connecting must transition the page out of /chat/new (like a text send).
+    // The call connecting must transition the page out of /threads/new (like a text send).
     await waitFor(() => {
       const path = screen.getByTestId('location-probe').textContent!;
-      expect(path).toMatch(new RegExp(`^/agents/${AGENT_ID}/chat/(?!new$).+`));
+      expect(path).toMatch(new RegExp(`^/agents/${AGENT_ID}/threads/(?!new$).+`));
     });
 
     // With the messages query now enabled, the persisted greeting appears in the chat.

@@ -47,7 +47,27 @@ const serializedStepSchema = z.object({
  * Represents different step flow types in the workflow graph
  */
 const serializedStepFlowEntrySchema = z.object({
-  type: z.enum(['step', 'sleep', 'sleepUntil', 'waitForEvent', 'parallel', 'conditional', 'loop', 'foreach']),
+  type: z.enum([
+    'step',
+    'agent',
+    'tool',
+    'classifier',
+    'mapping',
+    'sleep',
+    'sleepUntil',
+    'waitForEvent',
+    'parallel',
+    'conditional',
+    'loop',
+    'foreach',
+    'workflow',
+  ]),
+  // Identity/display fields shared by declarative and control-flow entries.
+  // This schema documents responses (OpenAPI/generated clients); it is not
+  // parsed at runtime, so per-type fields beyond these stay untyped.
+  id: z.string().optional(),
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 /**
@@ -66,6 +86,7 @@ export const workflowInfoSchema = z.object({
   stateSchema: z.string().optional(),
   options: z.object({}).optional(),
   isProcessorWorkflow: z.boolean().optional(),
+  origin: z.enum(['code', 'dynamic']).optional(),
 });
 
 /**
@@ -80,7 +101,10 @@ export const listWorkflowsResponseSchema = z.record(z.string(), workflowInfoSche
 const workflowRunSchema = z.object({
   workflowName: z.string(),
   runId: z.string(),
-  snapshot: typedPermissive<WorkflowRunState | string>(z.union([z.record(z.string(), z.unknown()), z.string()])),
+  // `Pick<...>` is the reduced snapshot returned when listing runs with `summary=true`.
+  snapshot: typedPermissive<WorkflowRunState | Pick<WorkflowRunState, 'status' | 'timestamp'> | string>(
+    z.union([z.record(z.string(), z.unknown()), z.string()]),
+  ),
   createdAt: z.date(),
   updatedAt: z.date(),
   resourceId: z.string().optional(),
@@ -105,7 +129,18 @@ export const listWorkflowRunsQuerySchema = createCombinedPaginationSchema().exte
   toDate: z.coerce.date().optional(),
   resourceId: z.string().optional(),
   status: workflowRunStatusSchema.optional(),
+  summary: z
+    .preprocess(value => (value === 'true' ? true : value === 'false' ? false : value), z.boolean())
+    .optional()
+    .describe('When true, each run snapshot is reduced to { status, timestamp }. Defaults to false.'),
 });
+
+export const workflowRunCountsEntrySchema = z.object({
+  running: z.number(),
+  suspended: z.number(),
+});
+
+export const workflowRunCountsResponseSchema = z.record(z.string(), workflowRunCountsEntrySchema);
 
 /**
  * Base schema for workflow execution with input data and tracing

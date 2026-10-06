@@ -37,8 +37,9 @@ export const ToolCard = ({ item, editable, onToggle }: ToolCardProps) => {
         isIntegration ? (
           needsConnection ? (
             <Txt
-              variant="ui-xs"
-              className="flex h-7 items-center text-neutral3"
+              variant="meta"
+              tone="muted"
+              className="flex h-7 items-center"
               data-testid={`tool-card-requires-connection-${item.type}-${item.id}`}
             >
               Requires connection
@@ -49,7 +50,7 @@ export const ToolCard = ({ item, editable, onToggle }: ToolCardProps) => {
               data-testid={`tool-card-connections-${item.type}-${item.id}`}
             >
               {connectionLabels.map(label => (
-                <Badge key={label} className="h-auto py-0.5 text-[10px]">
+                <Badge key={label} size="xs">
                   {label}
                 </Badge>
               ))}

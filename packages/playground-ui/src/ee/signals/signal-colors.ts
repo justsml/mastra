@@ -1,21 +1,48 @@
-export const SIGNAL_HUES = {
-  goal: 145,
-  outcome: 35,
-  behavior: 225,
-  sentiment: 300,
-} as const;
+import { hashLabel } from '@/lib/colors';
 
-export function getSignalHue(signalName: string) {
-  switch (signalName.toLowerCase()) {
-    case 'goal':
-      return SIGNAL_HUES.goal;
-    case 'outcome':
-      return SIGNAL_HUES.outcome;
-    case 'behavior':
-      return SIGNAL_HUES.behavior;
-    case 'sentiment':
-      return SIGNAL_HUES.sentiment;
-    default:
-      return 0;
-  }
+type SignalHue = 'green' | 'orange' | 'blue' | 'purple' | 'pink' | 'amber';
+
+const SIGNAL_HUES: Record<string, SignalHue> = {
+  goal: 'green',
+  outcome: 'orange',
+  behavior: 'blue',
+  sentiment: 'purple',
+};
+
+const CUSTOM_SIGNAL_HUES: SignalHue[] = ['pink', 'amber'];
+
+const SIGNAL_AREA_CLASS: Record<SignalHue, string> = {
+  green: 'fill-badge-green-strong',
+  orange: 'fill-badge-orange-strong',
+  blue: 'fill-badge-blue-strong',
+  purple: 'fill-badge-purple-strong',
+  pink: 'fill-badge-pink-strong',
+  amber: 'fill-badge-amber-strong',
+};
+
+const SIGNAL_CONNECTOR_CLASS: Record<SignalHue, string> = {
+  green: 'stroke-badge-green-edge',
+  orange: 'stroke-badge-orange-edge',
+  blue: 'stroke-badge-blue-edge',
+  purple: 'stroke-badge-purple-edge',
+  pink: 'stroke-badge-pink-edge',
+  amber: 'stroke-badge-amber-edge',
+};
+
+function getSignalHue(signalName: string): SignalHue {
+  const name = signalName.toLowerCase();
+  const builtInHue = Object.hasOwn(SIGNAL_HUES, name) ? SIGNAL_HUES[name] : undefined;
+  return builtInHue ?? CUSTOM_SIGNAL_HUES[hashLabel(name) % CUSTOM_SIGNAL_HUES.length] ?? 'pink';
+}
+
+export function getSignalColor(signalName: string) {
+  return `var(--chart-${getSignalHue(signalName)})`;
+}
+
+export function getSignalAreaClass(signalName: string) {
+  return SIGNAL_AREA_CLASS[getSignalHue(signalName)];
+}
+
+export function getSignalConnectorClass(signalName: string) {
+  return SIGNAL_CONNECTOR_CLASS[getSignalHue(signalName)];
 }

@@ -1,6 +1,7 @@
 'use client';
 
 import { DataList } from '@mastra/playground-ui/components/DataList';
+import { Txt } from '@mastra/playground-ui/components/Txt';
 
 export interface CSVPreviewTableProps {
   headers: string[];
@@ -29,13 +30,7 @@ export function CSVPreviewTable({ headers, data, maxRows = 5 }: CSVPreviewTableP
   return (
     <div className="flex flex-col gap-2">
       {headers.length > 0 ? (
-        <DataList
-          columns={columns}
-          variant="lined"
-          className="max-h-80 rounded-lg border border-border1"
-          mask={{ left: false }}
-          stickyHeaderBackground="tinted"
-        >
+        <DataList columns={columns} className="max-h-80" mask={{ left: false }}>
           <DataList.Top>
             {headers.map((header: string, index: number) => (
               <DataList.TopCell key={`${index}-${header}`} sticky={index === 0 ? 'start' : undefined}>
@@ -53,8 +48,8 @@ export function CSVPreviewTable({ headers, data, maxRows = 5 }: CSVPreviewTableP
                     return (
                       <DataList.RowHeaderCell
                         key={`${index}-${header}`}
-                        height="compact"
-                        className="max-w-[14rem] text-ui-sm"
+
+                        className="max-w-[14rem] text-caption"
                       >
                         {value}
                       </DataList.RowHeaderCell>
@@ -62,7 +57,7 @@ export function CSVPreviewTable({ headers, data, maxRows = 5 }: CSVPreviewTableP
                   }
 
                   return (
-                    <DataList.Cell key={`${index}-${header}`} height="compact" className="max-w-[12rem] text-ui-sm">
+                    <DataList.Cell key={`${index}-${header}`} className="max-w-[12rem] text-caption">
                       <span className="block truncate">{value}</span>
                     </DataList.Cell>
                   );
@@ -74,11 +69,11 @@ export function CSVPreviewTable({ headers, data, maxRows = 5 }: CSVPreviewTableP
       ) : null}
 
       {/* Row count indicator */}
-      <div className="text-xs text-neutral4">
+      <Txt as="p" variant="caption" tone="muted">
         {displayData.length < totalRows
           ? `Showing ${displayData.length} of ${totalRows} rows`
           : `${totalRows} row${totalRows !== 1 ? 's' : ''}`}
-      </div>
+      </Txt>
     </div>
   );
 }

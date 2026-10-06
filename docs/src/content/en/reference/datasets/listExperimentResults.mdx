@@ -1,6 +1,6 @@
 ---
 title: "Reference: dataset.listExperimentResults() | Datasets"
-description: "Documentation for the `dataset.listExperimentResults()` method, which lists results for a specific experiment."
+description: "Lists individual item results for a specific experiment with optional filters and pagination. Filters are applied at the storage layer."
 packages:
   - "@mastra/core"
 ---
@@ -16,9 +16,7 @@ Lists individual item results for a specific experiment with optional filters an
 ```typescript
 import { Mastra } from '@mastra/core'
 
-const mastra = new Mastra({
-  /* storage config */
-})
+const mastra = new Mastra({/* storage config */})
 
 const dataset = await mastra.datasets.get({ id: 'dataset-id' })
 

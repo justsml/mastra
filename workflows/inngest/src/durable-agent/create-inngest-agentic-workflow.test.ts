@@ -1,8 +1,13 @@
 import { DurableAgentDefaults } from '@mastra/core/agent/durable';
-import { Inngest } from 'inngest';
-import { describe, expect, it } from 'vitest';
 
-import { createInngestDurableAgenticWorkflow } from './create-inngest-agentic-workflow';
+import { MessageList } from '@mastra/core/agent/message-list';
+import type { AnyExportedSpan, ObservabilityExporter, TracingEvent } from '@mastra/core/observability';
+import { SpanType, TracingEventType } from '@mastra/core/observability';
+import { Observability } from '@mastra/observability';
+import { Inngest } from 'inngest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { createInngestDurableAgenticWorkflow, InngestDurableStepIds } from './create-inngest-agentic-workflow';
 
 /**
  * Regression coverage for #19317: the Inngest durable engine must honor
@@ -15,11 +20,31 @@ import { createInngestDurableAgenticWorkflow } from './create-inngest-agentic-wo
  * unlike a shared mutable options object.
  */
 
+function findEntry(steps: any[], predicate: (entry: any) => boolean): any {
+  for (const entry of steps ?? []) {
+    if (predicate(entry)) return entry;
+    const inner = entry.step?.executionGraph ? entry.step : entry.step?.step;
+    if (inner?.executionGraph) {
+      const nested = findEntry(inner.executionGraph.steps, predicate);
+      if (nested) return nested;
+    }
+    if (entry.steps) {
+      const nested = findEntry(entry.steps, predicate);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
 function findForeachEntry(steps: any[]): any {
   for (const entry of steps ?? []) {
     if (entry.type === 'foreach') return entry;
-    if (entry.step?.executionGraph) {
-      const nested = findForeachEntry(entry.step.executionGraph.steps);
+    // Loop/foreach entries wrap their body in a `SingleStepEntry`, so a nested
+    // workflow lives one level deeper (`entry.step.step`); plain `type: 'step'`
+    // entries still hold the workflow directly on `entry.step`.
+    const inner = entry.step?.executionGraph ? entry.step : entry.step?.step;
+    if (inner?.executionGraph) {
+      const nested = findForeachEntry(inner.executionGraph.steps);
       if (nested) return nested;
     }
     if (entry.steps) {
@@ -92,5 +117,316 @@ describe('createInngestDurableAgenticWorkflow tool-call concurrency', () => {
         ],
       }),
     ).toBe(1);
+  });
+});
+
+/**
+ * Regression coverage for #19842: durable tool execution on the Inngest engine
+ * must run with a tracing context.
+ *
+ * 1. `extract-tool-calls` forwards the LLM step's exported MODEL_STEP span
+ *    (`stepSpanData`) onto every tool-call input, so `createDurableToolCallStep`
+ *    can rebuild it into the tool's `tracingContext` (live TOOL_CALL span +
+ *    execution-time children such as workspace_action spans).
+ * 2. `collect-tool-results` no longer creates retroactive TOOL_CALL spans (they
+ *    would duplicate the live ones) — it only bundles results for the shared
+ *    llmMappingStep, which ends the step span and emits tool-result chunks.
+ */
+describe('createInngestDurableAgenticWorkflow tool-call tracing (#19842)', () => {
+  const inngest = new Inngest({ id: 'inngest-agentic-workflow-tracing-tests' });
+  const workflow = createInngestDurableAgenticWorkflow({ inngest });
+  const steps = (workflow as any).executionGraph.steps;
+
+  const findMapping = (id: string) => findEntry(steps, entry => entry.type === 'mapping' && entry.id === id);
+
+  it('extract-tool-calls forwards stepSpanData onto every tool-call input', async () => {
+    const entry = findMapping('extract-tool-calls');
+    expect(entry).toBeDefined();
+    expect(typeof entry.mapConfig).toBe('function');
+
+    const stepSpanData = { spanId: 'step-span-1', traceId: 'trace-1' };
+    const result = await entry.mapConfig({
+      inputData: {
+        toolCalls: [
+          { toolCallId: 'call-1', toolName: 'writeFile', args: { path: 'a.txt' } },
+          { toolCallId: 'call-2', toolName: 'readFile', args: { path: 'b.txt' } },
+        ],
+        stepSpanData,
+      },
+    });
+
+    expect(result).toHaveLength(2);
+    for (const toolCall of result) {
+      expect(toolCall.stepSpanData).toEqual(stepSpanData);
+    }
+    expect(result[0]).toMatchObject({ toolCallId: 'call-1', toolName: 'writeFile' });
+  });
+
+  it('collect-tool-results does not create retroactive spans and bundles results for mapping', async () => {
+    const entry = findMapping('collect-tool-results');
+    expect(entry).toBeDefined();
+    expect(typeof entry.mapConfig).toBe('function');
+
+    const rebuildSpan = vi.fn();
+    const getSelectedInstance = vi.fn(() => ({ rebuildSpan }));
+    const llmOutput = {
+      toolCalls: [{ toolCallId: 'call-1', toolName: 'writeFile', args: {} }],
+      stepSpanData: { spanId: 'step-span-1' },
+      state: { s: 1 },
+    };
+    const toolResults = [{ toolCallId: 'call-1', toolName: 'writeFile', result: 'ok' }];
+
+    const result = await entry.mapConfig({
+      inputData: toolResults,
+      getStepResult: () => llmOutput,
+      getInitData: () => ({
+        runId: 'run-1',
+        agentId: 'agent-1',
+        messageId: 'msg-1',
+        agentSpanData: { spanId: 'agent-span-1' },
+        state: { s: 0 },
+      }),
+      mastra: { observability: { getSelectedInstance } },
+    });
+
+    // No retroactive span creation — the live TOOL_CALL span is created by the
+    // tool-call step, and llmMappingStep owns step-span end + tool-result chunks.
+    expect(getSelectedInstance).not.toHaveBeenCalled();
+    expect(rebuildSpan).not.toHaveBeenCalled();
+
+    expect(result).toEqual({
+      llmOutput,
+      toolResults,
+      runId: 'run-1',
+      agentId: 'agent-1',
+      messageId: 'msg-1',
+      state: { s: 1 },
+    });
+  });
+});
+
+/**
+ * `map-final-output` calls `runDurableFinishSideEffects` directly (no step tooling — the
+ * mapping already runs inside the engine's durable boundary). These tests only care about
+ * how spans are ended, so they pass an empty serialized MessageList; with no registry
+ * entry the helper's side-effect blocks (processors, persistence, title) are no-ops.
+ */
+const emptyMessageListState = () => new MessageList().serialize();
+
+describe('createInngestDurableAgenticWorkflow final span ends', () => {
+  it('ends the model span with usage on attributes and the agent span with text only', async () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-final-span-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+    const entry = findEntry(
+      (workflow as any).executionGraph.steps,
+      entry => entry.type === 'mapping' && entry.id === 'map-final-output',
+    );
+    expect(entry).toBeDefined();
+
+    const ended: AnyExportedSpan[] = [];
+    const observability = new Observability({
+      configs: {
+        default: {
+          serviceName: 'inngest-final-span-test',
+          exporters: [
+            {
+              name: 'capture',
+              async exportTracingEvent(event: TracingEvent) {
+                if (event.type === TracingEventType.SPAN_ENDED) ended.push(event.exportedSpan);
+              },
+              async shutdown() {},
+            } satisfies ObservabilityExporter,
+          ],
+        },
+      },
+    });
+    const instance = observability.getSelectedInstance({})!;
+    expect(instance).toBeDefined();
+
+    // Real spans, exported the way InngestAgent.stream() hands them to the workflow.
+    const agentSpan = instance.startSpan({ type: SpanType.AGENT_RUN, name: "agent run: 'a'" });
+    const modelSpan = agentSpan.createChildSpan({ type: SpanType.MODEL_GENERATION, name: "llm: 'm'" });
+    const usage = { inputTokens: 3, outputTokens: 5, totalTokens: 8 };
+    const accumulatedSteps = [{ text: 'final answer' }];
+
+    await entry.mapConfig({
+      inputData: {
+        runId: 'run-1',
+        accumulatedSteps,
+        accumulatedUsage: usage,
+        lastStepResult: { reason: 'stop', isContinued: false, warnings: [] },
+        modelSpanData: modelSpan.exportSpan(),
+        agentSpanData: agentSpan.exportSpan(),
+        messageListState: emptyMessageListState(),
+        state: {},
+      },
+      getInitData: () => ({ runId: 'run-1', agentId: 'agent-1' }),
+      mastra: { observability, getLogger: () => undefined },
+    });
+
+    const endedModel = ended.find(span => span.type === SpanType.MODEL_GENERATION);
+    const endedAgent = ended.find(span => span.type === SpanType.AGENT_RUN);
+    expect(endedModel).toBeDefined();
+    expect(endedAgent).toBeDefined();
+
+    // Usage belongs on the attributes, normalized to UsageStats the way every other
+    // model span records it, rather than raw in the output.
+    expect(endedModel!.output).toEqual({ text: 'final answer' });
+    expect(endedModel!.output).not.toHaveProperty('toolCalls');
+    expect(endedModel!.attributes).toMatchObject({
+      finishReason: 'stop',
+      usage: { inputTokens: 3, outputTokens: 5, inputDetails: { text: 3 }, outputDetails: { text: 5 } },
+    });
+    expect(endedModel!.output).not.toHaveProperty('usage');
+
+    // The agent span records the text only; usage and steps stay on the workflow result.
+    expect(endedAgent!.output).toEqual({ text: 'final answer' });
+    expect(endedAgent!.output).not.toHaveProperty('usage');
+    expect(endedAgent!.output).not.toHaveProperty('steps');
+  });
+
+  it('records tool calls from every step on the model span output (#25807)', async () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-final-span-tool-calls-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+    const entry = findEntry(
+      (workflow as any).executionGraph.steps,
+      entry => entry.type === 'mapping' && entry.id === 'map-final-output',
+    );
+
+    const ended: AnyExportedSpan[] = [];
+    const observability = new Observability({
+      configs: {
+        default: {
+          serviceName: 'inngest-final-span-tool-calls-test',
+          exporters: [
+            {
+              name: 'capture',
+              async exportTracingEvent(event: TracingEvent) {
+                if (event.type === TracingEventType.SPAN_ENDED) ended.push(event.exportedSpan);
+              },
+              async shutdown() {},
+            } satisfies ObservabilityExporter,
+          ],
+        },
+      },
+    });
+    const instance = observability.getSelectedInstance({})!;
+    const agentSpan = instance.startSpan({ type: SpanType.AGENT_RUN, name: "agent run: 'a'" });
+    const modelSpan = agentSpan.createChildSpan({ type: SpanType.MODEL_GENERATION, name: "llm: 'm'" });
+
+    await entry.mapConfig({
+      inputData: {
+        runId: 'run-1',
+        accumulatedSteps: [
+          { text: '', toolCalls: [{ toolCallId: 'c1', toolName: 'echo', args: { text: 'a' }, stepSpanData: {} }] },
+          { text: '', toolCalls: [{ toolCallId: 'c2', toolName: 'echo', args: { text: 'b' } }] },
+          { text: 'final answer' },
+        ],
+        accumulatedUsage: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+        lastStepResult: { reason: 'stop', isContinued: false, warnings: [] },
+        modelSpanData: modelSpan.exportSpan(),
+        agentSpanData: agentSpan.exportSpan(),
+        messageListState: emptyMessageListState(),
+        state: {},
+      },
+      getInitData: () => ({ runId: 'run-1', agentId: 'agent-1' }),
+      mastra: { observability, getLogger: () => undefined },
+    });
+
+    const endedModel = ended.find(span => span.type === SpanType.MODEL_GENERATION);
+    expect(endedModel!.output).toEqual({
+      text: 'final answer',
+      toolCalls: [
+        { toolCallId: 'c1', toolName: 'echo', args: { text: 'a' } },
+        { toolCallId: 'c2', toolName: 'echo', args: { text: 'b' } },
+      ],
+    });
+  });
+
+  it('keeps usage and steps on the workflow result', async () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-final-output-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+    const entry = findEntry(
+      (workflow as any).executionGraph.steps,
+      entry => entry.type === 'mapping' && entry.id === 'map-final-output',
+    );
+
+    const usage = { inputTokens: 3, outputTokens: 5, totalTokens: 8 };
+    const accumulatedSteps = [{ text: 'final answer' }];
+
+    const result = await entry.mapConfig({
+      inputData: {
+        runId: 'run-1',
+        accumulatedSteps,
+        accumulatedUsage: usage,
+        lastStepResult: { reason: 'stop', isContinued: false, warnings: [] },
+        messageListState: emptyMessageListState(),
+        state: {},
+      },
+      getInitData: () => ({ runId: 'run-1', agentId: 'agent-1' }),
+      mastra: { getLogger: () => undefined },
+    });
+
+    expect(result.output).toEqual({ text: 'final answer', usage, steps: accumulatedSteps });
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow bookkeeping (#24731)', () => {
+  it('configures both workflows to skip no-op durable bookkeeping', () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-events-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+    const iterationWorkflow = workflow.steps[InngestDurableStepIds.AGENTIC_EXECUTION];
+
+    expect(workflow.options.emitStepEvents).toBe(false);
+    expect(iterationWorkflow.options.emitStepEvents).toBe(false);
+    expect(workflow.options.evaluatePersistencePredicateBeforeDurableOperation).toBe(true);
+    expect(iterationWorkflow.options.evaluatePersistencePredicateBeforeDurableOperation).toBe(true);
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow snapshot policy (#24796)', () => {
+  it('persists suspended and terminal snapshots so finished runs are not resumable', () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-snapshot-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+    const iterationWorkflow = workflow.steps[InngestDurableStepIds.AGENTIC_EXECUTION];
+
+    for (const wf of [workflow, iterationWorkflow]) {
+      const persist = (workflowStatus: string) => wf.options.shouldPersistSnapshot({ workflowStatus, stepResults: {} });
+      for (const status of ['suspended', 'success', 'failed', 'canceled', 'bailed', 'tripwire']) {
+        expect(persist(status)).toBe(true);
+      }
+      for (const status of ['running', 'waiting', 'pending']) {
+        expect(persist(status)).toBe(false);
+      }
+    }
+  });
+});
+
+describe('Inngest per-step processor history (#25193)', () => {
+  it('forwards accumulated steps to the LLM execution step on later iterations', async () => {
+    const inngest = new Inngest({ id: 'inngest-processor-history-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+    const entry = findEntry(
+      (workflow as any).executionGraph.steps,
+      candidate => candidate.type === 'mapping' && candidate.id === 'map-to-llm-input',
+    );
+    expect(entry).toBeDefined();
+
+    const priorStep = { text: 'read_context completed', toolCalls: [{ toolName: 'read_context' }] };
+    const inputData = {
+      runId: 'run-1',
+      agentId: 'agent-1',
+      messageId: 'msg-1',
+      messageListState: emptyMessageListState(),
+      toolsMetadata: [],
+      modelConfig: {},
+      options: {},
+      state: {},
+      stepIndex: 1,
+      accumulatedSteps: [priorStep],
+    };
+    const mapped = await entry.mapConfig({ inputData });
+    expect(mapped.stepIndex).toBe(1);
+    expect(mapped.accumulatedSteps).toEqual([priorStep]);
   });
 });

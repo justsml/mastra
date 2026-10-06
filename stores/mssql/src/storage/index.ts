@@ -1,6 +1,6 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
-import type { StorageDomains, CreateIndexOptions } from '@mastra/core/storage';
+import type { StorageDomains, CreateIndexOptions, RetentionConfig } from '@mastra/core/storage';
 
 import sql from 'mssql';
 import { AgentsMSSQL } from './domains/agents';
@@ -8,10 +8,19 @@ import { BackgroundTasksMSSQL } from './domains/background-tasks';
 import { MemoryMSSQL } from './domains/memory';
 import { ObservabilityMSSQL } from './domains/observability';
 import { ScoresMSSQL } from './domains/scores';
+import { WorkflowDefinitionsMSSQL } from './domains/workflow-definitions';
 import { WorkflowsMSSQL } from './domains/workflows';
 
 // Export domain classes for direct use with MastraStorage composition
-export { AgentsMSSQL, BackgroundTasksMSSQL, MemoryMSSQL, ObservabilityMSSQL, ScoresMSSQL, WorkflowsMSSQL };
+export {
+  AgentsMSSQL,
+  BackgroundTasksMSSQL,
+  MemoryMSSQL,
+  ObservabilityMSSQL,
+  ScoresMSSQL,
+  WorkflowDefinitionsMSSQL,
+  WorkflowsMSSQL,
+};
 export type { MssqlDomainConfig } from './db';
 
 /**
@@ -73,6 +82,7 @@ export type MSSQLConfigType = {
    * ```
    */
   indexes?: CreateIndexOptions[];
+  retention?: RetentionConfig;
 } & (
   | {
       /**
@@ -155,7 +165,7 @@ export class MSSQLStore extends MastraCompositeStore {
     if (!config.id || typeof config.id !== 'string' || config.id.trim() === '') {
       throw new Error('MSSQLStore: id must be provided and cannot be empty.');
     }
-    super({ id: config.id, name: 'MSSQLStore', disableInit: config.disableInit });
+    super({ id: config.id, name: 'MSSQLStore', disableInit: config.disableInit, retention: config.retention });
     try {
       this.schema = config.schemaName || 'dbo';
 
@@ -203,6 +213,7 @@ export class MSSQLStore extends MastraCompositeStore {
       const backgroundTasks = new BackgroundTasksMSSQL(domainConfig);
 
       const agents = new AgentsMSSQL(domainConfig);
+      const workflowDefinitions = new WorkflowDefinitionsMSSQL(domainConfig);
 
       this.stores = {
         scores,
@@ -211,6 +222,7 @@ export class MSSQLStore extends MastraCompositeStore {
         observability,
         backgroundTasks,
         agents,
+        workflowDefinitions,
       };
     } catch (e) {
       throw new MastraError(

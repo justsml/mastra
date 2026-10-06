@@ -1,7 +1,32 @@
 import type { RequestContext } from '../request-context';
-import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
+import { getRequestContextInputValues } from '../request-context/input-source';
+import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '../schema';
 import { getZodTypeName, isZodArray, isZodObject, unwrapZodType } from '../utils/zod-utils';
+
+const TOOL_OUTPUT_VALIDATION_SCHEMA: unique symbol = Symbol.for('mastra.tool.outputValidationSchema');
+
+type ToolWithOutputSchema = {
+  outputSchema?: unknown;
+  [TOOL_OUTPUT_VALIDATION_SCHEMA]?: StandardSchemaWithJSON;
+};
+
+export function registerToolOutputValidationSchema(tool: object, schema: unknown): void {
+  if (!isStandardSchemaWithJSON(schema)) return;
+
+  Object.defineProperty(tool, TOOL_OUTPUT_VALIDATION_SCHEMA, {
+    configurable: true,
+    enumerable: true,
+    value: schema,
+  });
+}
+
+export function resolveToolOutputValidationSchema(tool: ToolWithOutputSchema): StandardSchemaWithJSON | undefined {
+  const outputSchema = typeof tool.outputSchema === 'function' ? tool.outputSchema() : tool.outputSchema;
+  if (isStandardSchemaWithJSON(outputSchema)) return outputSchema;
+
+  return tool[TOOL_OUTPUT_VALIDATION_SCHEMA];
+}
 
 /**
  * Safely validates data against a Standard Schema.
@@ -72,6 +97,21 @@ function getPathKey(segment: PropertyKey | { key: PropertyKey }): string {
     return String(segment.key);
   }
   return String(segment);
+}
+
+/**
+ * Builds a path-aware Error from Standard Schema issues.
+ * The `errors` array lets consumers (e.g. the @mastra/mcp 1.x tools/call handler) report one line per field.
+ */
+export function createStandardSchemaIssuesError(issues: ReadonlyArray<StandardSchemaIssue>): Error & {
+  errors: { path: string[]; message: string }[];
+} {
+  const errors = issues.map(issue => ({
+    path: (issue.path ?? []).map(segment => getPathKey(segment)),
+    message: issue.message,
+  }));
+  const message = errors.map(e => `- ${e.path.join('.') || 'root'}: ${e.message}`).join('\n');
+  return Object.assign(new Error(message), { errors });
 }
 
 /**
@@ -458,6 +498,9 @@ export function validateToolInput<T = unknown>(
     return { data: input as T };
   }
 
+  // Temporary fix: should be validated higher up the chain that it's a complete standard schema
+  schema = toStandardSchema(schema);
+
   // Validation pipeline:
   //
   // 1. normalizeNullishInput: Convert top-level null/undefined to {} or [] based on schema type.
@@ -561,16 +604,20 @@ export function validateToolInput<T = unknown>(
     }
   }
 
-  // All attempts failed - return the original (non-stripped) error since it's
-  // more informative about what the schema actually expects
-  const errorMessages = validation.issues
+  // All attempts failed. When nulls caused first-pass failures, report the
+  // path-stripped retry's issues: first-pass issues include nulls on optional
+  // fields that stripping already resolved, hiding the real failure (GitHub #24539).
+  // Otherwise the retry stripped every null (including valid .nullable() values),
+  // so the first-pass issues are the accurate ones.
+  const finalIssues = failingNullPaths.size > 0 ? retryValidation.issues : validation.issues;
+  const errorMessages = finalIssues
     .map(e => `- ${e.path?.map(p => getPathKey(p)).join('.') || 'root'}: ${e.message}`)
     .join('\n');
 
   const error: ValidationError<T> = {
     error: true,
     message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
-    validationErrors: buildFormattedErrors<T>(validation.issues),
+    validationErrors: buildFormattedErrors<T>(finalIssues),
   };
 
   return { error };
@@ -609,7 +656,7 @@ export function validateToolOutput<T = unknown>(
 
   const error: ValidationError<T> = {
     error: true,
-    message: `Tool output validation failed${toolId ? ` for ${toolId}` : ''}. The tool returned invalid output:\n${errorMessages}\n\nReturned output: ${truncateForLogging(output)}`,
+    message: `Tool output validation failed${toolId ? ` for ${toolId}` : ''}. The tool returned invalid output:\n${errorMessages}\n\nReturned output: ${truncateForLogging(redactSensitiveKeys(output))}`,
     validationErrors: buildFormattedErrors<T>(validation.issues),
   };
 
@@ -626,25 +673,34 @@ const SENSITIVE_KEYS = ['password', 'secret', 'token', 'apiKey', 'api_key', 'aut
  * @param obj The object to redact
  * @returns A new object with sensitive values replaced with '[REDACTED]'
  */
-function redactSensitiveKeys(obj: unknown): unknown {
-  if (obj === null || typeof obj !== 'object') {
+function redactSensitiveKeys(obj: unknown, ancestors: WeakSet<object> = new WeakSet()): unknown {
+  // Objects with toJSON (e.g. Date) serialize themselves; walking their own keys would drop them to `{}`.
+  if (obj === null || typeof obj !== 'object' || typeof (obj as { toJSON?: unknown }).toJSON === 'function') {
     return obj;
   }
 
+  // Leave circular references in place so serialization fails the same way it would without redaction.
+  if (ancestors.has(obj)) {
+    return obj;
+  }
+  ancestors.add(obj);
+
+  let result: unknown;
   if (Array.isArray(obj)) {
-    return obj.map(redactSensitiveKeys);
+    result = obj.map(item => redactSensitiveKeys(item, ancestors));
+  } else {
+    const redacted: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (SENSITIVE_KEYS.some(sensitive => key.toLowerCase().includes(sensitive.toLowerCase()))) {
+        redacted[key] = '[REDACTED]';
+      } else {
+        redacted[key] = redactSensitiveKeys(value, ancestors);
+      }
+    }
+    result = redacted;
   }
 
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (SENSITIVE_KEYS.some(sensitive => key.toLowerCase().includes(sensitive.toLowerCase()))) {
-      result[key] = '[REDACTED]';
-    } else if (typeof value === 'object' && value !== null) {
-      result[key] = redactSensitiveKeys(value);
-    } else {
-      result[key] = value;
-    }
-  }
+  ancestors.delete(obj);
   return result;
 }
 
@@ -664,21 +720,17 @@ export function validateRequestContext<T = any>(
 ): { data: T | Record<string, any>; error?: ValidationError<T> } {
   // If no schema, return request context values as-is
   if (!schema) {
-    return { data: (requestContext?.all ?? {}) as T };
+    return { data: getRequestContextInputValues(requestContext) as T };
   }
 
   // Get the values from request context
-  const contextValues = requestContext?.all ?? {};
+  const contextValues = getRequestContextInputValues(requestContext);
 
   // Convert PublicSchema to StandardSchemaWithJSON for validation
   const standardSchema = toStandardSchema(schema);
 
   // Validate using standard schema interface
-  const validation = standardSchema['~standard'].validate(contextValues);
-
-  if (validation instanceof Promise) {
-    throw new Error('Your schema is async, which is not supported. Please use a sync schema.');
-  }
+  const validation = safeValidate(standardSchema, contextValues);
 
   if ('value' in validation) {
     return { data: validation.value };

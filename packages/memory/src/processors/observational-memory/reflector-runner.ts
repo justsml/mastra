@@ -1,5 +1,6 @@
 import { Agent } from '@mastra/core/agent';
-import type { MessageList } from '@mastra/core/agent';
+import type { AgentMemoryOption, MessageList } from '@mastra/core/agent';
+import type { WidenModelId } from '@mastra/core/llm';
 import type { Mastra } from '@mastra/core/mastra';
 import { getThreadOMMetadata, setThreadOMMetadata } from '@mastra/core/memory';
 import type { MastraMemory } from '@mastra/core/memory';
@@ -10,9 +11,10 @@ import type { MemoryStorage, ObservationalMemoryRecord } from '@mastra/core/stor
 import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Memory } from '../..';
-import { resolveActivationTTL } from './activation-ttl';
+import { getMarkerActivationTTL, resolveActivationTTL } from './activation-ttl';
 import { BufferingCoordinator } from './buffering-coordinator';
 import { omDebug, omError } from './debug';
+import { isOmModelExecutionError, isOmModelExecutionFailure, OmModelExecutionError } from './error';
 import {
   applyExtractorHooks,
   buildThreadMetadataFromExtractedValues,
@@ -34,8 +36,10 @@ import {
   createObservationFailedMarker,
   createObservationStartMarker,
 } from './markers';
+import { getObservableMessages } from './message-utils';
 import type { ModelByInputTokens } from './model-by-input-tokens';
 import { didProviderChange } from './model-context';
+import { describeDegenerateOutput } from './observer-agent';
 import { registerOp, unregisterOp, isOpActiveInProcess } from './operation-registry';
 import {
   buildReflectorSystemPrompt,
@@ -45,17 +49,21 @@ import {
   validateCompression,
 } from './reflector-agent';
 import type { CompressionLevel } from './reflector-agent';
-import { withRetry } from './retry';
+import { assertCompleteModelResponse, withRetry } from './retry';
 import { createTemporaryOmMemoryContext } from './temporary-memory';
 import { getMaxThreshold } from './thresholds';
 import type { TokenCounter } from './token-counter';
 import { withOmTracingSpan } from './tracing';
+import { applyTextTransform } from './transform-hooks';
 import type {
   ObservationDebugEvent,
   ObservationMarkerConfig,
   ObservationModelContext,
   ObserveHookUsage,
   ObserveHooks,
+  ObserveTransformHooks,
+  ObserveTrigger,
+  ReflectionCommittedContext,
   ResolvedObservationConfig,
   ResolvedReflectionConfig,
   ThresholdRange,
@@ -97,9 +105,8 @@ async function persistThreadExtractedValues(
     threadTitle: metadataUpdate.threadTitle ?? previousOmMetadata?.threadTitle,
     extracted: { ...(previousOmMetadata?.extracted ?? {}), ...(metadataUpdate.extracted ?? {}) },
   });
-  await storage.updateThread({
+  await storage.patchThread({
     id: threadId,
-    title: thread.title ?? '',
     metadata: newMetadata,
   });
 }
@@ -117,7 +124,7 @@ function getCurrentModel(model?: ObservationModelContext): string | undefined {
 }
 
 function getLastModelFromMessageList(messageList?: MessageList): string | undefined {
-  const messages = messageList?.get.all.db();
+  const messages = messageList ? getObservableMessages(messageList) : undefined;
   if (!messages) return undefined;
 
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -204,10 +211,28 @@ export class ReflectorRunner {
     messageList: MessageList | undefined,
     threadId: string,
     resourceId?: string,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   private readonly getCompressionStartLevel: (requestContext?: RequestContext) => Promise<CompressionLevel>;
   private readonly memory?: Memory;
+  private readonly onReflectionCommitted?: (context: ReflectionCommittedContext) => Promise<void>;
+  private readonly hooks?: ObserveTransformHooks;
   private mastra?: Mastra;
+
+  /**
+   * Per-lock-key observation-token count of the last unproductive synchronous
+   * reflection (failed, or committed while still over the reflection
+   * threshold). `call()` already runs the full bounded compression ladder for
+   * a given input, so re-running it against unchanged observations cannot
+   * succeed — threshold-triggered sync reflection is skipped while the count
+   * is unchanged and retried as soon as the input differs.
+   * Keyed by lock key (thread/resource), which is stable across generations —
+   * record ids change every time a generation is created.
+   *
+   * Lifecycle: an entry is deleted when a sync reflection finishes under
+   * threshold and replaced on each unproductive attempt. Entries are one
+   * number per active thread/resource key and live for the runner's lifetime.
+   */
+  private readonly syncReflectionSuppression = new Map<string, number>();
 
   constructor(opts: {
     reflectionConfig: ResolvedReflectionConfig;
@@ -227,11 +252,13 @@ export class ReflectorRunner {
       messageList: MessageList | undefined,
       threadId: string,
       resourceId?: string,
-    ) => Promise<void>;
+    ) => Promise<boolean>;
     getCompressionStartLevel: (requestContext?: RequestContext) => Promise<CompressionLevel>;
     resolveModel: ReflectionModelResolver;
     mastra?: Mastra;
     memory?: Memory;
+    onReflectionCommitted?: (context: ReflectionCommittedContext) => Promise<void>;
+    hooks?: ObserveTransformHooks;
   }) {
     this.reflectionConfig = opts.reflectionConfig;
     this.observationConfig = opts.observationConfig;
@@ -246,6 +273,8 @@ export class ReflectorRunner {
     this.getCompressionStartLevel = opts.getCompressionStartLevel;
     this.mastra = opts.mastra;
     this.memory = opts.memory;
+    this.onReflectionCommitted = opts.onReflectionCommitted;
+    this.hooks = opts.hooks;
   }
 
   __registerMastra(mastra: Mastra): void {
@@ -257,16 +286,30 @@ export class ReflectorRunner {
     memory?: MastraMemory,
     extractors = this.reflectionConfig.extractors,
   ): Agent {
+    let agentModel: WidenModelId<ConcreteReflectionModel> = model;
+    if (Array.isArray(agentModel)) {
+      agentModel = agentModel.map(fallback => ({ ...fallback, maxRetries: 0 }));
+    } else if (typeof agentModel === 'function') {
+      const resolveDynamicModel = agentModel;
+      agentModel = (async args => {
+        const resolvedModel = await resolveDynamicModel(args);
+        return Array.isArray(resolvedModel)
+          ? resolvedModel.map(fallback => ({ ...fallback, maxRetries: 0 }))
+          : resolvedModel;
+      }) as typeof agentModel;
+    }
     const agent = new Agent({
       id: 'observational-memory-reflector',
       name: 'Reflector',
       instructions: buildReflectorSystemPrompt(this.reflectionConfig.instruction, extractors),
-      model,
+      model: agentModel,
+      maxRetries: 0,
+      // withRetry owns retries and restarts each attempt from a clean prompt.
+      // Processor retries would continue from the failed attempt instead.
+      errorProcessorDefaults: false,
       ...(memory ? { memory } : {}),
+      ...(this.mastra ? { mastra: this.mastra } : {}),
     });
-    if (this.mastra) {
-      agent.__registerMastra(this.mastra);
-    }
     return agent;
   }
 
@@ -277,7 +320,7 @@ export class ReflectorRunner {
         record ? this.getEffectiveReflectionTokens(record) : this.reflectionConfig.observationTokens,
       ),
       scope: this.scope,
-      activateAfterIdle: this.reflectionConfig.activateAfterIdle,
+      activateAfterIdle: getMarkerActivationTTL(this.reflectionConfig.activateAfterIdle),
     };
   }
 
@@ -354,6 +397,7 @@ export class ReflectorRunner {
       ? this.createAgent(resolvedModel.model, temporaryMemory.memory, activeExtractors)
       : this.createAgent(resolvedModel.model, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(requestContext, agent.id);
+    let attemptMemory: AgentMemoryOption | undefined;
     const targetThreshold = observationTokensThreshold ?? getMaxThreshold(this.reflectionConfig.observationTokens);
 
     let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
@@ -365,6 +409,8 @@ export class ReflectorRunner {
     let parsed: ReturnType<typeof parseReflectorOutput> = { observations: '', suggestedContinuation: undefined };
     let reflectedTokens = 0;
     let attemptNumber = 0;
+    /** True when the latest attempt returned an empty block for non-empty input. */
+    let emptyOutput = false;
 
     while (currentLevel <= maxLevel) {
       attemptNumber++;
@@ -407,50 +453,64 @@ export class ReflectorRunner {
                 // Reset chunk counter per attempt so retry-after-transient-error
                 // doesn't get tagged with the previous attempt's chunk count.
                 chunkCount = 0;
-                const streamResult = await agent.stream(prompt, {
-                  modelSettings: {
-                    ...this.reflectionConfig.modelSettings,
-                  },
-                  providerOptions: this.reflectionConfig.providerOptions as any,
-                  ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
-                  ...(abortSignal ? { abortSignal } : {}),
-                  ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
-                  ...childObservabilityContext,
-                  ...(attemptNumber === 1
-                    ? {
-                        onChunk(chunk: any) {
-                          chunkCount++;
-                          if (chunkCount === 1 || chunkCount % 50 === 0) {
-                            const preview =
-                              chunk.type === 'text-delta'
-                                ? ` text="${chunk.textDelta?.slice(0, 80)}..."`
-                                : chunk.type === 'tool-call'
-                                  ? ` tool=${chunk.toolName}`
-                                  : '';
-                            omDebug(`[OM:callReflector] chunk#${chunkCount}: type=${chunk.type}${preview}`);
-                          }
-                        },
-                        onFinish(event: any) {
-                          omDebug(
-                            `[OM:callReflector] onFinish: chunks=${chunkCount}, finishReason=${event.finishReason}, inputTokens=${event.usage?.inputTokens}, outputTokens=${event.usage?.outputTokens}, textLen=${event.text?.length}`,
-                          );
-                        },
-                        onAbort(event: any) {
-                          omDebug(
-                            `[OM:callReflector] onAbort: chunks=${chunkCount}, reason=${event?.reason ?? 'unknown'}`,
-                          );
-                        },
-                        onError({ error }: { error: unknown }) {
-                          omError(`[OM:callReflector] onError after ${chunkCount} chunks`, error);
-                        },
-                      }
-                    : {}),
-                });
+                try {
+                  attemptMemory = temporaryMemory?.newThread();
+                  const streamResult = await agent.stream(prompt, {
+                    // One prompt, one reply. Without this cap, a reply cut off with finishReason
+                    // "other" or "unknown" makes the loop continue from the partial text, and
+                    // assertCompleteModelResponse would only see the final step's "stop".
+                    maxSteps: 1,
+                    modelSettings: {
+                      ...this.reflectionConfig.modelSettings,
+                    },
+                    providerOptions: this.reflectionConfig.providerOptions as any,
+                    ...(attemptMemory ? { memory: attemptMemory } : {}),
+                    ...(abortSignal ? { abortSignal } : {}),
+                    ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
+                    ...childObservabilityContext,
+                    ...(attemptNumber === 1
+                      ? {
+                          onChunk(chunk: any) {
+                            chunkCount++;
+                            if (chunkCount === 1 || chunkCount % 50 === 0) {
+                              const preview =
+                                chunk.type === 'text-delta'
+                                  ? ` text="${chunk.textDelta?.slice(0, 80)}..."`
+                                  : chunk.type === 'tool-call'
+                                    ? ` tool=${chunk.toolName}`
+                                    : '';
+                              omDebug(`[OM:callReflector] chunk#${chunkCount}: type=${chunk.type}${preview}`);
+                            }
+                          },
+                          onFinish(event: any) {
+                            omDebug(
+                              `[OM:callReflector] onFinish: chunks=${chunkCount}, finishReason=${event.finishReason}, inputTokens=${event.usage?.inputTokens}, outputTokens=${event.usage?.outputTokens}, textLen=${event.text?.length}`,
+                            );
+                          },
+                          onAbort(event: any) {
+                            omDebug(
+                              `[OM:callReflector] onAbort: chunks=${chunkCount}, reason=${event?.reason ?? 'unknown'}`,
+                            );
+                          },
+                          onError({ error }: { error: unknown }) {
+                            omError(`[OM:callReflector] onError after ${chunkCount} chunks`, error);
+                          },
+                        }
+                      : {}),
+                  });
 
-                return streamResult.getFullOutput();
+                  return assertCompleteModelResponse(await streamResult.getFullOutput(), 'OM reflector');
+                } catch (error) {
+                  if (abortSignal?.aborted || !isOmModelExecutionFailure(error)) throw error;
+                  throw new OmModelExecutionError('reflector-model', error);
+                }
               }, abortSignal),
           }),
-        { label: 'reflector', abortSignal },
+        {
+          label: 'reflector',
+          abortSignal,
+          maxRetries: this.reflectionConfig.maxRetries,
+        },
       );
 
       omDebug(
@@ -467,9 +527,18 @@ export class ReflectorRunner {
 
       parsed = parseReflectorOutput(result.text, observations, activeExtractors);
 
+      emptyOutput = !parsed.degenerate && observations.trim().length > 0 && parsed.observations.trim().length === 0;
       if (parsed.degenerate) {
         omDebug(
-          `[OM:callReflector] attempt #${attemptNumber}: degenerate repetition detected, treating as compression failure`,
+          `[OM:callReflector] attempt #${attemptNumber}: degenerate repetition detected, treating as compression failure. ${describeDegenerateOutput(result.text, 2000)}`,
+        );
+        reflectedTokens = originalTokens;
+      } else if (emptyOutput) {
+        // An empty block over non-empty input is never a valid compression —
+        // treat it like degenerate output so the ladder escalates instead of
+        // accepting 0 tokens as a successful result.
+        omDebug(
+          `[OM:callReflector] attempt #${attemptNumber}: empty observations block for non-empty input, treating as compression failure`,
         );
         reflectedTokens = originalTokens;
       } else {
@@ -479,12 +548,18 @@ export class ReflectorRunner {
         `[OM:callReflector] attempt #${attemptNumber} parsed: reflectedTokens=${reflectedTokens}, targetThreshold=${targetThreshold}, compressionValid=${validateCompression(reflectedTokens, targetThreshold)}, parsedObsLen=${parsed.observations?.length}, degenerate=${parsed.degenerate ?? false}`,
       );
 
-      if (!parsed.degenerate && (validateCompression(reflectedTokens, targetThreshold) || currentLevel >= maxLevel)) {
+      if (
+        !parsed.degenerate &&
+        !emptyOutput &&
+        (validateCompression(reflectedTokens, targetThreshold) || currentLevel >= maxLevel)
+      ) {
         break;
       }
 
-      if (parsed.degenerate && currentLevel >= maxLevel) {
-        omDebug(`[OM:callReflector] degenerate output persists at maxLevel=${maxLevel}, breaking`);
+      if ((parsed.degenerate || emptyOutput) && currentLevel >= maxLevel) {
+        omDebug(
+          `[OM:callReflector] ${parsed.degenerate ? 'degenerate' : 'empty'} output persists at maxLevel=${maxLevel}, breaking`,
+        );
         break;
       }
 
@@ -524,13 +599,25 @@ export class ReflectorRunner {
       currentLevel = Math.min(currentLevel + 1, maxLevel) as CompressionLevel;
     }
 
+    // A reflection of non-empty observations must never come back empty: the
+    // caller commits the result as the new activeObservations (sync path) or
+    // as the bufferedReflection replacing the reflected slice (buffered path),
+    // so returning '' here silently wipes memory. Empty output only happens
+    // when every ladder attempt was degenerate (parseReflectorOutput discards
+    // degenerate text) or the model returned nothing — both are failures.
+    if (observations.trim().length > 0 && parsed.observations.trim().length === 0) {
+      throw new Error(
+        `Reflector produced empty output after ${attemptNumber} attempt(s)${parsed.degenerate ? ' (degenerate repetition)' : ''} — refusing to commit an empty reflection over ${originalTokens} observation tokens`,
+      );
+    }
+
     const structuredExtraction = await extractStructuredValues({
       agent,
       source: 'reflector',
       extractors: activeExtractors,
-      memory: temporaryMemory?.options,
+      memory: attemptMemory,
       priorExtractedValues,
-      requestContext,
+      requestContext: internalRequestContext,
       observabilityContext,
       abortSignal,
     });
@@ -547,6 +634,8 @@ export class ReflectorRunner {
       mainAgent,
       memory: this.memory,
       sendSignal,
+      writer: streamContext?.writer,
+      abortSignal,
       requestContext,
     });
     const extractedValues = hookedValues.values;
@@ -577,6 +666,7 @@ export class ReflectorRunner {
     priorExtractedValues?: Record<string, unknown>,
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
+    trigger?: ObserveTrigger,
   ): void {
     const bufferKey = this.buffering.getReflectionBufferKey(lockKey);
 
@@ -591,54 +681,73 @@ export class ReflectorRunner {
       omError('[OM] Failed to set buffering reflection flag', err);
     });
 
-    reflectionHooks?.onReflectionStart?.();
-    const asyncOp = this.doAsyncBufferedReflection(
-      record,
-      bufferKey,
-      writer,
-      requestContext,
-      observabilityContext,
-      priorExtractedValues,
-      mainAgent,
-      sendSignal,
-    )
-      .then(outcome => {
-        reflectionHooks?.onReflectionEnd?.({
-          usage: outcome?.usage,
-          ...(outcome?.providerMetadata ? { providerMetadata: outcome.providerMetadata } : {}),
-        });
-      })
-      .catch(async error => {
+    const asyncOp = (async () => {
+      let outcome:
+        | {
+            usage?: ObserveHookUsage;
+            providerMetadata?: ProviderMetadata;
+          }
+        | undefined;
+      let reflectionError: Error | undefined;
+      try {
+        await reflectionHooks?.onReflectionStart?.();
+        outcome = await this.doAsyncBufferedReflection(
+          record,
+          bufferKey,
+          writer,
+          requestContext,
+          observabilityContext,
+          priorExtractedValues,
+          mainAgent,
+          sendSignal,
+          trigger,
+        );
+      } catch (error) {
+        reflectionError = error instanceof Error ? error : new Error(String(error));
         if (writer) {
-          const failedMarker = createBufferingFailedMarker({
-            cycleId: `reflect-buf-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
-            operationType: 'reflection',
-            startedAt: new Date().toISOString(),
-            tokensAttempted: observationTokens,
-            error: error instanceof Error ? error.message : String(error),
-            recordId: record.id,
-            threadId: record.threadId ?? '',
-          });
-          // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
-          void writer.custom({ ...failedMarker, transient: true }).catch(() => {});
-          await this.persistMarkerToStorage(failedMarker, record.threadId ?? '', record.resourceId ?? undefined);
+          try {
+            const failedMarker = createBufferingFailedMarker({
+              cycleId: `reflect-buf-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+              operationType: 'reflection',
+              startedAt: new Date().toISOString(),
+              tokensAttempted: observationTokens,
+              error,
+              failurePolicy: this.reflectionConfig.failurePolicy,
+              recordId: record.id,
+              threadId: record.threadId ?? '',
+            });
+            // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
+            void writer.custom({ ...failedMarker, transient: true }).catch(() => {});
+            await this.persistMarkerToStorage(failedMarker, record.threadId ?? '', record.resourceId ?? undefined);
+          } catch (markerError) {
+            omError(
+              '[OM] Failed to persist buffering-failed marker after async buffered reflection failure',
+              markerError,
+            );
+          }
         }
         omError('[OM] Async buffered reflection failed', error);
-        reflectionHooks?.onReflectionEnd?.({
-          usage: undefined,
-          error: error instanceof Error ? error : new Error(String(error)),
-        });
         // Clear the boundary so a failed reflection doesn't permanently block
-        // future async reflection attempts (line 554 checks this map).
+        // future async reflection attempts.
         BufferingCoordinator.lastBufferedBoundary.delete(bufferKey);
-      })
-      .finally(() => {
+      } finally {
+        try {
+          await reflectionHooks?.onReflectionEnd?.({
+            usage: outcome?.usage,
+            error: reflectionError,
+            ...(outcome?.providerMetadata ? { providerMetadata: outcome.providerMetadata } : {}),
+          });
+        } catch (hookError) {
+          omError('[OM] onReflectionEnd hook failed after async buffered reflection', hookError);
+        }
+
         BufferingCoordinator.asyncBufferingOps.delete(bufferKey);
         unregisterOp(record.id, 'bufferingReflection');
         this.storage.setBufferingReflectionFlag(record.id, false).catch(err => {
           omError('[OM] Failed to clear buffering reflection flag', err);
         });
-      });
+      }
+    })();
 
     BufferingCoordinator.asyncBufferingOps.set(bufferKey, asyncOp);
   }
@@ -656,6 +765,7 @@ export class ReflectorRunner {
     priorExtractedValues?: Record<string, unknown>,
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
+    trigger?: ObserveTrigger,
   ): Promise<
     | {
         usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -682,7 +792,19 @@ export class ReflectorRunner {
     const linesToReflect =
       avgTokensPerLine > 0 ? Math.min(Math.floor(activationPointTokens / avgTokensPerLine), totalLines) : totalLines;
 
-    const activeObservations = allLines.slice(0, linesToReflect).join('\n');
+    const hookContext = {
+      threadId: currentRecord.threadId ?? undefined,
+      resourceId: currentRecord.resourceId ?? undefined,
+      trigger,
+    };
+    // Only the text handed to the reflector is transformed; line-count
+    // bookkeeping stays based on the untransformed slice.
+    const activeObservations = await applyTextTransform(
+      this.hooks,
+      'beforeReflection',
+      allLines.slice(0, linesToReflect).join('\n'),
+      hookContext,
+    );
     const reflectedObservationLineCount = linesToReflect;
     const sliceTokenEstimate = Math.round(avgTokensPerLine * linesToReflect);
     const compressionTarget = Math.round(sliceTokenEstimate * 0.75);
@@ -729,6 +851,12 @@ export class ReflectorRunner {
       undefined,
       mainAgent,
       sendSignal,
+    );
+    reflectResult.observations = await applyTextTransform(
+      this.hooks,
+      'afterReflection',
+      reflectResult.observations,
+      hookContext,
     );
 
     await persistThreadExtractedValues(
@@ -794,6 +922,7 @@ export class ReflectorRunner {
       previousModel?: string;
       currentModel?: string;
     },
+    committedContext?: Omit<ReflectionCommittedContext, 'observations'>,
   ): Promise<TryActivateResult> {
     const bufferKey = this.buffering.getReflectionBufferKey(lockKey);
 
@@ -897,6 +1026,13 @@ export class ReflectorRunner {
       currentRecord: freshRecord,
       tokenCount: combinedTokenCount,
     });
+    if (committedContext) {
+      await this.notifyReflectionCommitted({
+        ...committedContext,
+        observations: allLines.slice(0, reflectedLineCount).join('\n').trim(),
+        writer,
+      });
+    }
 
     BufferingCoordinator.lastBufferedBoundary.delete(bufferKey);
 
@@ -926,7 +1062,8 @@ export class ReflectorRunner {
         currentModel: activationMetadata?.currentModel,
         config: {
           ...this.getObservationMarkerConfig(freshRecord),
-          activateAfterIdle: activationMetadata?.activateAfterIdle ?? this.reflectionConfig.activateAfterIdle,
+          activateAfterIdle:
+            activationMetadata?.activateAfterIdle ?? getMarkerActivationTTL(this.reflectionConfig.activateAfterIdle),
         },
       });
       // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
@@ -944,6 +1081,15 @@ export class ReflectorRunner {
     return { status: 'activated' };
   }
 
+  private async notifyReflectionCommitted(context: ReflectionCommittedContext): Promise<void> {
+    if (!this.onReflectionCommitted || !context.parentThreadId || !context.resourceId) return;
+    try {
+      await this.onReflectionCommitted(context);
+    } catch (error) {
+      omDebug(`[OM:reflect] post-commit reflection agent failed: ${error}`);
+    }
+  }
+
   /**
    * Check if reflection needed and trigger if so.
    * Supports both synchronous reflection and async buffered reflection.
@@ -957,9 +1103,12 @@ export class ReflectorRunner {
     abortSignal?: AbortSignal;
     mainAgent?: ProcessorContext['agent'];
     sendSignal?: ProcessorContext['sendSignal'];
+    sendStateSignal?: ProcessorContext['sendStateSignal'];
     messageList?: MessageList;
     currentModel?: ObservationModelContext;
     reflectionHooks?: Pick<ObserveHooks, 'onReflectionStart' | 'onReflectionEnd'>;
+    /** Which pipeline path initiated this cycle; forwarded to transform hooks. */
+    trigger?: ObserveTrigger;
     requestContext?: RequestContext;
     observabilityContext?: ObservabilityContext;
     lastActivityAt?: number;
@@ -971,9 +1120,11 @@ export class ReflectorRunner {
       abortSignal,
       mainAgent,
       sendSignal,
+      sendStateSignal,
       messageList,
       currentModel,
       reflectionHooks,
+      trigger,
       requestContext,
       observabilityContext,
       lastActivityAt,
@@ -1017,6 +1168,7 @@ export class ReflectorRunner {
           priorExtractedValues,
           mainAgent,
           sendSignal,
+          trigger,
         );
       }
     }
@@ -1072,6 +1224,15 @@ export class ReflectorRunner {
         writer,
         messageList,
         activationMetadata,
+        {
+          parentThreadId: requestedThreadId ?? record.threadId ?? '',
+          resourceId: record.resourceId ?? '',
+          requestContext,
+          mainAgent,
+          sendStateSignal,
+          abortSignal,
+          observabilityContext,
+        },
       );
       if (activationResult.status === 'activated') {
         return;
@@ -1114,6 +1275,7 @@ export class ReflectorRunner {
           priorExtractedValues,
           mainAgent,
           sendSignal,
+          trigger,
         );
         return;
       }
@@ -1122,7 +1284,24 @@ export class ReflectorRunner {
     // ════════════════════════════════════════════════════════════
     // SYNC PATH: Do synchronous reflection (blocking)
     // ════════════════════════════════════════════════════════════
-    reflectionHooks?.onReflectionStart?.();
+    // Suppress threshold-triggered sync reflection while the input is
+    // unchanged from the last unproductive attempt: shouldReflect stays true
+    // while observations remain over threshold, so without this every
+    // activation blocks on re-running the full compression ladder against the
+    // exact observations it just failed to compress. Any change to the
+    // observation count makes the input different and lifts the suppression.
+    // TTL and provider-change triggers are exempt — they reflect for
+    // activation semantics, not to shrink observations.
+    if (activationTriggeredBy === 'threshold') {
+      const suppressedAtTokens = this.syncReflectionSuppression.get(lockKey);
+      if (suppressedAtTokens !== undefined && observationTokens === suppressedAtTokens) {
+        omDebug(
+          `[OM:reflect] skipping sync reflection — observations unchanged at ${observationTokens} tokens since the last unproductive attempt; retrying once they change`,
+        );
+        return;
+      }
+    }
+
     await this.storage.setReflectingFlag(record.id, true);
     registerOp(record.id, 'reflecting');
 
@@ -1168,10 +1347,24 @@ export class ReflectorRunner {
     let reflectionUsage: ObserveHookUsage | undefined;
     let reflectionProviderMetadata: ProviderMetadata | undefined;
     let reflectionError: Error | undefined;
+    let lifecycleError: unknown;
     try {
+      try {
+        await reflectionHooks?.onReflectionStart?.();
+      } catch (error) {
+        lifecycleError = error;
+        reflectionError = error instanceof Error ? error : new Error(String(error));
+        throw error;
+      }
+
       const compressionStartLevel = await this.getCompressionStartLevel(requestContext);
+      const hookContext = {
+        threadId: requestedThreadId ?? record.threadId ?? undefined,
+        resourceId: record.resourceId ?? undefined,
+        trigger,
+      };
       const reflectResult = await this.call(
-        record.activeObservations,
+        await applyTextTransform(this.hooks, 'beforeReflection', record.activeObservations, hookContext),
         undefined,
         streamContext,
         reflectThreshold,
@@ -1184,6 +1377,12 @@ export class ReflectorRunner {
         undefined,
         mainAgent,
         sendSignal,
+      );
+      reflectResult.observations = await applyTextTransform(
+        this.hooks,
+        'afterReflection',
+        reflectResult.observations,
+        hookContext,
       );
       reflectionUsage = reflectResult.usage;
       reflectionProviderMetadata = reflectResult.providerMetadata;
@@ -1199,6 +1398,29 @@ export class ReflectorRunner {
         currentRecord: record,
         reflection: reflectResult.observations,
         tokenCount: reflectionTokenCount,
+      });
+
+      // Best-effort results still over threshold are committed (they usually
+      // shrink observations somewhat), but shouldReflect remains true — record
+      // the committed count so the next activation doesn't immediately block
+      // on re-reflecting the identical observations. The committed reflection
+      // becomes the new active observations, so its token count is the input
+      // identity of any immediate retry.
+      if (reflectionTokenCount >= reflectThreshold) {
+        this.syncReflectionSuppression.set(lockKey, reflectionTokenCount);
+      } else {
+        this.syncReflectionSuppression.delete(lockKey);
+      }
+      await this.notifyReflectionCommitted({
+        parentThreadId: requestedThreadId ?? record.threadId ?? '',
+        resourceId: record.resourceId ?? '',
+        observations: record.activeObservations ?? '',
+        requestContext,
+        mainAgent,
+        sendStateSignal,
+        writer,
+        abortSignal,
+        observabilityContext,
       });
 
       if (writer && streamContext) {
@@ -1230,33 +1452,88 @@ export class ReflectorRunner {
         usage: reflectResult.usage,
       });
     } catch (error) {
-      if (writer && streamContext) {
-        const failedMarker = createObservationFailedMarker({
-          cycleId: streamContext.cycleId,
-          operationType: 'reflection',
-          startedAt: streamContext.startedAt,
-          tokensAttempted: observationTokens,
-          error: error instanceof Error ? error.message : String(error),
-          recordId: record.id,
-          threadId,
-        });
+      reflectionError = error instanceof Error ? error : new Error(String(error));
+      const failedMarker = createObservationFailedMarker({
+        cycleId: streamContext?.cycleId ?? cycleId,
+        operationType: 'reflection',
+        startedAt: streamContext?.startedAt ?? startedAt,
+        tokensAttempted: observationTokens,
+        error,
+        failurePolicy: this.reflectionConfig.failurePolicy,
+        recordId: record.id,
+        threadId,
+      });
+      if (writer) {
         // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
         await writer.custom({ ...failedMarker, transient: true }).catch(() => {});
-        await this.persistMarkerToStorage(failedMarker, threadId, record.resourceId ?? undefined);
       }
-      reflectionError = error instanceof Error ? error : new Error(String(error));
-      if (abortSignal?.aborted) {
+      // Reflection runs before the current assistant reply exists, so the marker
+      // belongs to the live user input. Fall back to a storage scan when no
+      // MessageList is available (e.g. async buffering activation).
+      let persistedToList = false;
+      try {
+        persistedToList = await this.persistMarkerToMessage(
+          failedMarker,
+          messageList,
+          threadId,
+          record.resourceId ?? undefined,
+        );
+      } catch {
+        persistedToList = false;
+      }
+      if (!persistedToList) {
+        // Best-effort: a marker storage failure must not replace the reflector error.
+        try {
+          await this.persistMarkerToStorage(failedMarker, threadId, record.resourceId ?? undefined);
+        } catch (markerError) {
+          omError('[OM] Failed to persist reflection-failed marker', markerError);
+        }
+      }
+      this.emitDebugEvent({
+        type: 'reflection_failed',
+        timestamp: new Date(),
+        threadId,
+        resourceId: record.resourceId ?? '',
+        inputTokens: observationTokens,
+        failurePolicy: this.reflectionConfig.failurePolicy,
+        failureKind: failedMarker.data.failureKind,
+        error: reflectionError.message,
+      });
+      if (
+        lifecycleError !== undefined ||
+        abortSignal?.aborted ||
+        this.reflectionConfig.failurePolicy !== 'continue' ||
+        !isOmModelExecutionError(error) ||
+        error.failureKind !== 'reflector-model'
+      ) {
         throw error;
       }
+      this.syncReflectionSuppression.set(lockKey, observationTokens);
       omError('[OM] Reflection failed', error);
     } finally {
-      await this.storage.setReflectingFlag(record.id, false);
-      reflectionHooks?.onReflectionEnd?.({
-        usage: reflectionUsage,
-        error: reflectionError,
-        ...(reflectionProviderMetadata ? { providerMetadata: reflectionProviderMetadata } : {}),
-      });
-      unregisterOp(record.id, 'reflecting');
+      try {
+        await this.storage.setReflectingFlag(record.id, false);
+      } finally {
+        unregisterOp(record.id, 'reflecting');
+      }
+
+      let endHookError: unknown;
+      try {
+        await reflectionHooks?.onReflectionEnd?.({
+          usage: reflectionUsage,
+          error: reflectionError,
+          ...(reflectionProviderMetadata ? { providerMetadata: reflectionProviderMetadata } : {}),
+        });
+      } catch (error) {
+        endHookError = error;
+      }
+
+      if (endHookError !== undefined) {
+        if (lifecycleError === undefined && !abortSignal?.aborted) throw endHookError;
+        omDebug(
+          `[OM:hooks] onReflectionEnd hook failed after cycle failure: ${endHookError instanceof Error ? endHookError.message : String(endHookError)}`,
+        );
+      }
     }
   }
 }

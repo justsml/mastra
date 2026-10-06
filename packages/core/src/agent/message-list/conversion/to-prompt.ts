@@ -98,13 +98,26 @@ export function aiV4CoreMessageToV1PromptMessage(coreMessage: CoreMessageV4): La
         } else if (Buffer.isBuffer(part.image) || part.image instanceof ArrayBuffer) {
           processedImage = new Uint8Array(part.image);
         } else {
-          // part.image is a string - could be a URL, data URI, or raw base64
+          // part.image is a string - could be a URL, data URI, raw base64, or a
+          // provider file ID (e.g. OpenAI "file-...")
           const categorized = categorizeFileData(part.image, part.mimeType);
 
           if (categorized.type === 'raw') {
             // Raw base64 — keep as Uint8Array so providers receive raw bytes
             // and don't double-wrap in a data URI (e.g. Gemini inline_data.data)
             processedImage = new Uint8Array(Buffer.from(part.image, 'base64'));
+          } else if (categorized.type === 'providerFileId') {
+            // Provider file IDs (e.g. OpenAI "file-...") are not parseable URLs and
+            // can't be expressed as a V1 image part. Emit a file part instead so the
+            // ID survives untouched and providers can forward it by reference.
+            const { image: _image, type: _type, ...rest } = part;
+            roleContent[role].push({
+              ...rest,
+              type: 'file',
+              data: part.image,
+              mimeType: categorized.mimeType || 'application/octet-stream',
+            });
+            break;
           } else {
             processedImage = new URL(part.image);
           }
@@ -194,7 +207,12 @@ export function aiV5ModelMessageToV2PromptMessage(modelMessage: AIV5Type.ModelMe
 
   const role = modelMessage.role;
 
-  for (const part of modelMessage.content) {
+  for (const part of modelMessage.content ?? []) {
+    // Defensive: upstream rewrites (e.g. observational memory) have produced sparse
+    // content arrays in production. A hole here would crash the provider converter
+    // with an unattributable "Cannot read properties of undefined (reading 'type')".
+    if (!part || typeof part !== 'object') continue;
+
     const incompatibleMessage = `Saw incompatible message content part type ${part.type} for message role ${role}`;
 
     switch (part.type) {
@@ -232,6 +250,10 @@ export function aiV5ModelMessageToV2PromptMessage(modelMessage: AIV5Type.ModelMe
         roleContent[role].push({
           ...part,
           toolName: sanitizeToolName(part.toolName),
+          // Providers read `output.type` unguarded (e.g. @ai-sdk/openai-compatible).
+          // An output-less tool result (lost result chunk, OM rewrite) must still
+          // present a valid LanguageModelV2ToolResultOutput shape.
+          output: part.output ?? { type: 'json' as const, value: null },
         });
         break;
       }
@@ -286,30 +308,26 @@ export function aiV5ModelMessageToV2PromptMessage(modelMessage: AIV5Type.ModelMe
   );
 }
 
+type ConvertibleToolResultPartType = 'media' | 'image-url' | 'file-url';
+
 /**
- * Convert a V2 (AI SDK v5 / spec `v2`) prompt into the shape AI SDK v6
- * (spec `v3`) providers expect, by translating tool-result `media` parts into
- * the `image-data`/`file-data` content parts that v6 providers consume.
- *
- * This is a single-responsibility conversion meant to be chained after the
- * base v5 prompt build: `aiV6.llmPrompt()` = `aiV5.llmPrompt()` -> this.
+ * Convert multimodal tool-result parts (`media`, `image-url`, `file-url`) in a
+ * V2 (AI SDK v5 / spec `v2`) prompt using a caller-provided target shape.
  *
  * Mastra's `toModelOutput` and the vendored AI SDK v5 use `{ type: 'media' }`
- * as the authored multimodal tool-result content type. AI SDK v6 added a
- * `mapToolResultOutput` step that converts `media` -> `image-data` (for
- * `image/*` media types) or `file-data` (everything else) before the prompt
- * reaches the provider, and v6 providers (e.g. `@ai-sdk/anthropic@3`) only
- * recognize `image-data`/`file-data` — they have no `media` case. The vendored
- * v5 converter does not run that translation, so a v5-built prompt handed to a
- * v6 provider drops the raw `media` part (image tool results arrive empty).
- *
- * This MUST only run for v6 (`v3`) providers: v5 providers (spec `v2`) accept
- * `media` and have no `image-data`/`file-data` case, so translating for them
- * would re-break v5.
- *
- * See: https://github.com/mastra-ai/mastra/issues/17876
+ * as the authored Base64 tool-result content type, while remote URLs are kept
+ * as `image-url`/`file-url` parts. Newer AI SDK provider specs use different
+ * content-part shapes, so callers provide the target conversion for their
+ * provider spec. Returning the same item from the callback is a pass-through.
  */
-export function aiV5PromptToAIV6Prompt(prompt: LanguageModelV2Prompt): LanguageModelV2Prompt {
+function convertToolResultContent(
+  prompt: LanguageModelV2Prompt,
+  convertPart: (
+    contentPart: Record<string, unknown>,
+    partType: ConvertibleToolResultPartType,
+    mediaType: string,
+  ) => unknown,
+): LanguageModelV2Prompt {
   return prompt.map(message => {
     if (message.role !== `tool`) return message;
 
@@ -323,12 +341,14 @@ export function aiV5PromptToAIV6Prompt(prompt: LanguageModelV2Prompt): LanguageM
       const value = (output.value as unknown[]).map(item => {
         if (item == null || typeof item !== `object`) return item;
         const contentPart = item as Record<string, unknown>;
-        if (contentPart.type !== `media` || typeof contentPart.data !== `string`) return item;
-        outputModified = true;
+        const isMediaPart = contentPart.type === `media` && typeof contentPart.data === `string`;
+        const isUrlPart =
+          (contentPart.type === `image-url` || contentPart.type === `file-url`) && typeof contentPart.url === `string`;
+        if (!isMediaPart && !isUrlPart) return item;
         const mediaType = typeof contentPart.mediaType === `string` ? contentPart.mediaType : ``;
-        return mediaType.startsWith(`image/`)
-          ? { type: `image-data`, data: contentPart.data, mediaType }
-          : { type: `file-data`, data: contentPart.data, mediaType };
+        const converted = convertPart(contentPart, contentPart.type as ConvertibleToolResultPartType, mediaType);
+        if (converted !== item) outputModified = true;
+        return converted;
       });
 
       if (!outputModified) return part;
@@ -338,4 +358,83 @@ export function aiV5PromptToAIV6Prompt(prompt: LanguageModelV2Prompt): LanguageM
 
     return messageModified ? { ...message, content } : message;
   }) as LanguageModelV2Prompt;
+}
+
+/**
+ * Remote URLs cannot appear in Base64 `media.data`, but messages persisted by
+ * older versions stored them there (issue #22618) — `://` is not valid Base64,
+ * so this detection is unambiguous. Scheme matching is case-insensitive per
+ * RFC 3986: legacy values were stored verbatim, so `HTTPS://…` must heal too.
+ */
+function isRemoteUrl(data: string): boolean {
+  return /^https?:\/\//i.test(data);
+}
+
+/**
+ * Convert v5-authored media tool results to the `image-data`/`file-data` shape
+ * expected only by AI SDK v6 (`v3`) providers. V5 providers accept `media`, and
+ * V7 providers expect `file` parts with tagged data instead. `image-url` and
+ * `file-url` parts are natively valid V3 tool-result content and pass through
+ * unchanged; legacy `media` parts carrying a remote URL are healed into them.
+ *
+ * See: https://github.com/mastra-ai/mastra/issues/17876 and
+ * https://github.com/mastra-ai/mastra/issues/22618
+ */
+export function aiV5PromptToAIV6Prompt(prompt: LanguageModelV2Prompt): LanguageModelV2Prompt {
+  return convertToolResultContent(prompt, (contentPart, partType, mediaType) => {
+    if (partType !== `media`) return contentPart;
+    const isImage = mediaType.startsWith(`image/`);
+    const data = contentPart.data as string;
+    const remoteUrl = isRemoteUrl(data) ? parseUrl(data) : undefined;
+    if (remoteUrl) {
+      const rest = { ...contentPart };
+      delete rest.data;
+      return { ...rest, type: isImage ? `image-url` : `file-url`, url: data };
+    }
+    return { ...contentPart, type: isImage ? `image-data` : `file-data`, mediaType };
+  });
+}
+
+// V4 file parts carry `url: URL`. Unparseable strings pass through so a bad
+// tool output reaches the provider instead of throwing mid-request.
+function parseUrl(url: unknown): URL | undefined {
+  if (url instanceof URL) return url;
+  if (typeof url !== 'string') return undefined;
+  try {
+    return new URL(url);
+  } catch {
+    return undefined;
+  }
+}
+
+export function aiV5PromptToAIV7Prompt(prompt: LanguageModelV2Prompt): LanguageModelV2Prompt {
+  return convertToolResultContent(prompt, (contentPart, partType, mediaType) => {
+    if (partType === `image-url` || partType === `file-url`) {
+      const url = parseUrl(contentPart.url);
+      // Unparseable URLs can't be a V4 url file part; surface them to the model as text.
+      if (!url) return { type: `text`, text: String(contentPart.url) };
+      const rest = { ...contentPart };
+      delete rest.url;
+      return {
+        ...rest,
+        type: `file`,
+        data: { type: `url`, url },
+        // V4 file parts require a mediaType.
+        mediaType: mediaType || (partType === `image-url` ? `image/jpeg` : `application/octet-stream`),
+      };
+    }
+    const data = contentPart.data as string;
+    const remoteUrl = isRemoteUrl(data) ? parseUrl(data) : undefined;
+    if (remoteUrl) {
+      const rest = { ...contentPart };
+      delete rest.data;
+      return {
+        ...rest,
+        type: `file`,
+        data: { type: `url`, url: remoteUrl },
+        mediaType: mediaType || `application/octet-stream`,
+      };
+    }
+    return { ...contentPart, type: `file`, data: { type: `data`, data }, mediaType };
+  });
 }

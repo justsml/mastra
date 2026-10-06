@@ -22,20 +22,6 @@ test.describe('Admin Role', () => {
   });
 
   test.describe('when an admin user navigates the studio', () => {
-    test('admin sees all navigation items', async ({ page }) => {
-      await setupAdminAuth(page);
-      await page.goto('/agents');
-
-      // Wait for page to load
-      await expectCurrentBreadcrumb(page, 'Agents');
-
-      // Verify all main navigation links are visible
-      await expect(page.getByRole('link', { name: /^Agents$/i })).toBeVisible();
-      await expect(page.getByRole('link', { name: /^Workflows$/i })).toBeVisible();
-      await expect(page.getByRole('link', { name: /^Tools$/i })).toBeVisible();
-      await expect(page.getByRole('link', { name: /^MCP Servers$/i })).toBeVisible();
-    });
-
     test('admin can navigate to all main sections', async ({ page }) => {
       await setupAdminAuth(page);
 
@@ -94,12 +80,12 @@ test.describe('Admin Role', () => {
 
     test('admin can view agent tools', async ({ page }) => {
       await setupAdminAuth(page);
-      await page.goto('/agents/weather-agent/settings');
+      await page.goto('/agents/weather-agent/chat/new');
 
-      // The agent has tools - admin should be able to see them in the settings overview.
-      await expect(page.getByTestId('agent-settings-view')).toBeVisible({ timeout: 10000 });
-      await expect(page.getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true');
-      await expect(page.getByRole('heading', { name: 'Tools' })).toBeVisible({ timeout: 10000 });
+      // The overview side panel starts collapsed; the admin can open it and see the agent tools.
+      await page.getByTestId('agent-overview-panel-toggle').click();
+      await expect(page.getByTestId('agent-overview-panel')).toBeVisible({ timeout: 10000 });
+      await expect(page.getByRole('heading', { name: /^Tools/ })).toBeVisible({ timeout: 10000 });
       await expect(page.getByRole('link', { name: 'weatherInfo' })).toHaveAttribute(
         'href',
         /\/agents\/weather-agent\/tools\/weatherInfo$/,
@@ -147,8 +133,8 @@ test.describe('Admin Role', () => {
 
       // Admin should see the trigger/run workflow controls
       // The workflow trigger should be visible and enabled
-      const triggerButton = page.getByRole('button', { name: /run|trigger|execute/i });
-      await expect(triggerButton.first()).toBeVisible();
+      const triggerButton = page.getByRole('button', { name: 'Run', exact: true });
+      await expect(triggerButton).toBeVisible();
     });
 
     test('admin workflow execution button is not disabled', async ({ page }) => {
@@ -156,7 +142,7 @@ test.describe('Admin Role', () => {
       await page.goto('/workflows/lessComplexWorkflow');
 
       // Look for any run/execute button
-      const runButton = page.getByRole('button', { name: /run|trigger|execute/i }).first();
+      const runButton = page.getByRole('button', { name: 'Run', exact: true });
 
       // Wait for button to be visible
       await expect(runButton).toBeVisible();
@@ -315,7 +301,7 @@ test.describe('Admin Role', () => {
       await page.goto('/workflows/lessComplexWorkflow');
 
       // Admin should see run button enabled
-      const runButton = page.getByRole('button', { name: /run|trigger|execute/i }).first();
+      const runButton = page.getByRole('button', { name: 'Run', exact: true });
       await expect(runButton).toBeVisible();
       await expect(runButton).not.toBeDisabled();
 

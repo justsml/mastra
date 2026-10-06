@@ -1,7 +1,7 @@
 import type { MastraFGAPermissionInput } from '@mastra/core/auth/ee';
 import type { RequestContext } from '@mastra/core/di';
 import { MastraMemory } from '@mastra/core/memory';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '../constants';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, isReservedRequestContextKey } from '../constants';
 import { MastraFGAPermissions } from '../fga-permissions';
 import { HTTPException } from '../http-exception';
 
@@ -30,6 +30,32 @@ export function sanitizeBody(body: Record<string, unknown>, disallowedKeys: stri
       delete body[key];
     }
   }
+}
+
+const CREDENTIAL_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'x-goog-api-key',
+  'cookie',
+]);
+
+/**
+ * Removes credential-bearing headers from client-supplied `modelSettings.headers`
+ * so a caller's own auth (e.g. the app's bearer token) can never override the
+ * provider credential configured on the server. Non-credential headers are kept.
+ */
+export function stripClientCredentialHeaders(body: Record<string, unknown>) {
+  const modelSettings = body.modelSettings;
+  if (!modelSettings || typeof modelSettings !== 'object') return;
+  const headers = (modelSettings as { headers?: unknown }).headers;
+  if (!headers || typeof headers !== 'object') return;
+
+  const kept = Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !CREDENTIAL_HEADER_NAMES.has(name.toLowerCase())),
+  );
+  body.modelSettings = { ...modelSettings, headers: kept };
 }
 
 export function parsePerPage(
@@ -62,6 +88,24 @@ export function parseFilters(filters: string | string[] | undefined): Record<str
   );
 }
 
+/**
+ * Merges a body-supplied requestContext into the trusted server RequestContext.
+ * The server context is authoritative: reserved keys are skipped and body values
+ * only fill keys the server context has not already set.
+ */
+export function mergeBodyRequestContext(serverRequestContext: RequestContext, bodyRequestContext: unknown): void {
+  if (!bodyRequestContext || typeof bodyRequestContext !== 'object') {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(bodyRequestContext)) {
+    if (isReservedRequestContextKey(key)) continue;
+    if (serverRequestContext.get(key) === undefined) {
+      serverRequestContext.set(key, value);
+    }
+  }
+}
+
 // ============================================================================
 // Authorization Utilities
 // ============================================================================
@@ -76,6 +120,16 @@ export function getEffectiveResourceId(
 ): string | undefined {
   const contextResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
   return contextResourceId || clientResourceId;
+}
+
+/**
+ * Returns the resource id resolved from the request context alone (set via
+ * `mapUserToResourceId` or the `x-resource-id` header), ignoring any
+ * client-provided value. Its presence indicates a resource-scoped caller;
+ * its absence indicates a privileged/service context.
+ */
+export function getContextResourceId(requestContext: RequestContext | undefined): string | undefined {
+  return requestContext?.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
 }
 
 /**

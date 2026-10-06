@@ -1,8 +1,10 @@
 import { LogoWithoutText } from '@mastra/playground-ui/components/Logo';
+import { Txt } from '@mastra/playground-ui/components/Txt';
+import { useAuthCapabilities, isAuthenticated } from '@mastra/react/hooks/auth';
 import { Lock } from 'lucide-react';
-import { useAuthCapabilities } from '../hooks/use-auth-capabilities';
-import { isAuthenticated } from '../types';
+import { AuthHeadersForm } from './auth-headers-form';
 import { LoginButton } from './login-button';
+import { withStudioBasePath } from '@/lib/studio-base-path';
 
 export type AuthRequiredProps = {
   children: React.ReactNode;
@@ -52,18 +54,23 @@ export function AuthRequired({ children, loginUrl = '/login', signupUrl = '/sign
   // User is not authenticated - show login prompt
   const redirectUri = typeof window !== 'undefined' ? window.location.href : undefined;
 
-  // No login capability available - show auth required message without login option
+  // No login capability available - show auth required message without login
+  // option. Every route stays blocked; the blocked screen itself collects the
+  // authorization header.
   if (!capabilities.login) {
     return (
       <div className="flex h-full w-full items-center justify-center">
         <div className="flex flex-col items-center space-y-6 text-center">
           <LogoWithoutText className="h-16 w-16 opacity-50" />
           <div className="space-y-2">
-            <h2 className="text-xl font-semibold text-neutral6">Authentication Required</h2>
-            <p className="max-w-sm text-neutral3">
-              This page requires authentication, but no login method is configured. Please contact your administrator.
+            <Txt as="h2" variant="heading" tone="ink">
+              Authentication Required
+            </Txt>
+            <p className="max-w-sm text-muted-foreground">
+              Add the authorization header that Studio needs to reach your Mastra server.
             </p>
           </div>
+          <AuthHeadersForm />
         </div>
       </div>
     );
@@ -71,7 +78,7 @@ export function AuthRequired({ children, loginUrl = '/login', signupUrl = '/sign
 
   // Login capability available - show sign in prompt
   const handleSignUp = () => {
-    const url = new URL(signupUrl, window.location.origin);
+    const url = new URL(withStudioBasePath(signupUrl), window.location.origin);
     if (redirectUri) {
       url.searchParams.set('redirect', redirectUri);
     }
@@ -83,22 +90,30 @@ export function AuthRequired({ children, loginUrl = '/login', signupUrl = '/sign
       <div className="flex flex-col items-center space-y-6 text-center">
         <LogoWithoutText className="h-16 w-16 opacity-50" />
         <div className="space-y-2">
-          <h2 className="text-xl font-semibold text-neutral6">Sign in to continue</h2>
-          <p className="max-w-sm text-neutral3">You need to sign in to access this page.</p>
+          <Txt as="h2" variant="heading" tone="ink">
+            Sign in to continue
+          </Txt>
+          <p className="max-w-sm text-muted-foreground">You need to sign in to access this page.</p>
         </div>
         {capabilities.login.description && (
-          <div className="flex items-start gap-2.5 rounded-md border border-border1 bg-surface2 p-3 text-left">
-            <Lock className="mt-0.5 h-4 w-4 shrink-0 text-neutral4" />
-            <p className="max-w-sm text-sm text-neutral3">{capabilities.login.description}</p>
+          <div className="flex items-start gap-2.5 rounded-md border border-border bg-background p-3 text-left">
+            <Lock className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+            <Txt tone="muted" className="max-w-sm">
+              {capabilities.login.description}
+            </Txt>
           </div>
         )}
         <LoginButton config={capabilities.login} redirectUri={redirectUri} loginUrl={loginUrl} />
         {(capabilities.login.type === 'credentials' || capabilities.login.type === 'both') &&
           capabilities.login.signUpEnabled !== false && (
-            <div className="text-sm">
-              <span className="text-neutral3">{"Don't have an account? "}</span>
-              <button type="button" onClick={handleSignUp} className="text-neutral6 hover:underline">
-                Sign up
+            <div>
+              <Txt as="span" variant="body" tone="muted">
+                {"Don't have an account? "}
+              </Txt>
+              <button type="button" onClick={handleSignUp} className="text-foreground hover:underline">
+                <Txt as="span" variant="body" className="block">
+                  Sign up
+                </Txt>
               </button>
             </div>
           )}

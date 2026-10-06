@@ -19,6 +19,7 @@ import { Mastra } from '../../../mastra';
 import { MockMemory } from '../../../memory/mock';
 import { InMemoryStore } from '../../../storage';
 import { Agent } from '../../agent';
+import { GOAL_STATE_TYPE } from '../../goal';
 import { createDurableAgent } from '../create-durable-agent';
 import { createEventedAgent } from '../create-evented-agent';
 
@@ -372,12 +373,15 @@ describe('DurableAgent goal step', () => {
       model: createTextModel('Hello!') as LanguageModelV2,
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const storage = new InMemoryStore();
     new Mastra({
       agents: { 'no-goal-agent': durableAgent as any },
       logger: false,
-      storage: new InMemoryStore(),
+      storage,
       pubsub,
     });
+    const threadState = await storage.getStore('threadState');
+    const getState = vi.spyOn(threadState!, 'getState');
 
     const result = await durableAgent.stream('Hello', {
       maxSteps: 1,
@@ -389,6 +393,8 @@ describe('DurableAgent goal step', () => {
     // No goal chunks should be emitted
     const goalChunks = chunks.filter((c: any) => c.type === 'goal');
     expect(goalChunks).toHaveLength(0);
+    const goalReads = getState.mock.calls.filter(([options]) => options.type === GOAL_STATE_TYPE);
+    expect(goalReads).toHaveLength(0);
   });
 
   it('no-ops when no active objective exists on the thread', async () => {
@@ -494,5 +500,75 @@ describe('DurableAgent goal step', () => {
     // Objective should be paused
     const record = await durableAgent.getObjective({ threadId: THREAD });
     expect(record?.status).toBe('paused');
+  });
+
+  it('parks an objective left active at the run budget when a later run re-enters the goal step', async () => {
+    // A `waiting` verdict keeps the record `active` by design, which can leave an
+    // active objective sitting at its budget. The next turn re-enters the goal
+    // step with nothing left to judge: the budget guard must park it rather than
+    // emit a stale `active` chunk (rendered as `continue` forever).
+    const waitingScorer = {
+      id: 'goal-scorer',
+      name: 'Goal Scorer',
+      run: vi.fn().mockResolvedValue({ score: 0.5, reason: 'waiting for your review' }),
+    };
+
+    const THREAD = 'budget-waiting-thread';
+    const RESOURCE = 'user-1';
+
+    const baseAgent = new Agent({
+      id: 'goal-budget-waiting-agent',
+      name: 'Goal Budget Waiting Agent',
+      instructions: 'You are a helpful agent.',
+      model: createTextModel('Working on it...') as LanguageModelV2,
+      memory: new MockMemory(),
+      goal: {
+        judge: 'mock-judge',
+        maxRuns: 1,
+        scorer: waitingScorer as any,
+      },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    new Mastra({
+      agents: { 'goal-budget-waiting-agent': durableAgent as any },
+      logger: false,
+      storage: new InMemoryStore(),
+      pubsub,
+    });
+
+    await durableAgent.setObjective('Build a spaceship', { threadId: THREAD, resourceId: RESOURCE });
+
+    // First run exhausts the budget while the judge answers `waiting`, which
+    // deliberately leaves the record active.
+    const first = await durableAgent.stream('Build a spaceship', {
+      maxSteps: 3,
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await drain(first.fullStream);
+
+    expect(waitingScorer.run).toHaveBeenCalledTimes(1);
+    expect((await durableAgent.getObjective({ threadId: THREAD }))?.status).toBe('active');
+    expect((await durableAgent.getObjective({ threadId: THREAD }))?.runsUsed).toBe(1);
+
+    const second = await durableAgent.stream('keep going', {
+      maxSteps: 3,
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    const chunks = await drain(second.fullStream);
+
+    // The guard is a backstop: no further judge call, no run past the budget.
+    expect(waitingScorer.run).toHaveBeenCalledTimes(1);
+    const goalChunks = chunks.filter((c: any) => c.type === 'goal' && !c.payload?.pending);
+    expect(goalChunks).toHaveLength(1);
+    expect(goalChunks[0].payload).toMatchObject({
+      objective: 'Build a spaceship',
+      passed: false,
+      status: 'paused',
+      maxRunsReached: true,
+    });
+
+    const record = await durableAgent.getObjective({ threadId: THREAD });
+    expect(record?.status).toBe('paused');
+    expect(record?.runsUsed).toBe(1);
   });
 });

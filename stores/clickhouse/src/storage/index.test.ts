@@ -5,9 +5,11 @@ import {
   createClientAcceptanceTests,
   createDomainDirectTests,
 } from '@internal/storage-test-utils';
-import { describe, expect, it, vi } from 'vitest';
+import { EntityType, SpanType } from '@mastra/core/observability';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { MemoryStorageClickhouse } from './domains/memory';
+import { ObservabilityStorageClickhouse } from './domains/observability';
 import { ScoresStorageClickhouse } from './domains/scores';
 import { WorkflowsStorageClickhouse } from './domains/workflows';
 import { ClickhouseStore } from '.';
@@ -128,6 +130,36 @@ createDomainDirectTests({
       client: createTestClient(),
       ttl: { mastra_threads: { row: { interval: 30, unit: 'DAY' } } },
     }),
+});
+
+describe('MemoryStorageClickhouse error propagation (no empty-on-error)', () => {
+  // These reads used to swallow DB errors and return an empty page, so an outage
+  // looked exactly like "no data". They should throw instead.
+  const createFailingDomain = () => {
+    const client = { query: vi.fn().mockRejectedValue(new Error('simulated backend outage')) };
+    return new MemoryStorageClickhouse({ client: client as any });
+  };
+
+  // Also check the cause is the original error, so a broken mock can't pass as
+  // a real outage.
+  const expectOutage = async (promise: Promise<unknown>, idPattern: RegExp) => {
+    const err: any = await promise.then(
+      () => {
+        throw new Error('expected the read to reject, but it resolved');
+      },
+      e => e,
+    );
+    expect(err).toMatchObject({ id: expect.stringMatching(idPattern) });
+    expect(String(err?.cause?.message ?? err?.message)).toContain('simulated backend outage');
+  };
+
+  it('listThreads re-throws backend failures instead of returning empty', async () => {
+    await expectOutage(createFailingDomain().listThreads({}), /LIST_THREADS.*FAILED/);
+  });
+
+  it('listMessages re-throws backend failures instead of returning empty', async () => {
+    await expectOutage(createFailingDomain().listMessages({ threadId: 'thread-err' }), /LIST_MESSAGES.*FAILED/);
+  });
 });
 
 // Additional ClickHouse-specific tests
@@ -463,5 +495,119 @@ describe('ClickHouse Domain with URL/credentials config', () => {
       await memoryDomain.deleteThread({ threadId });
       await client.close();
     });
+  });
+});
+
+describe('ClickHouse memory updateMessages', () => {
+  const domainConfig = {
+    url: TEST_CONFIG.url,
+    username: TEST_CONFIG.username || 'default',
+    password: TEST_CONFIG.password || '',
+  };
+  const memory = new MemoryStorageClickhouse(domainConfig);
+
+  beforeAll(async () => {
+    await memory.init();
+  });
+
+  it('applies a partial content update in place without deleting and re-inserting the message', async () => {
+    const threadId = `thread-update-${Date.now()}`;
+    const resourceId = 'resource-update';
+    const messageId = `msg-update-${Date.now()}`;
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: 'update', metadata: {}, createdAt: new Date(), updatedAt: new Date() },
+    });
+    await memory.saveMessages({
+      messages: [
+        {
+          id: messageId,
+          threadId,
+          resourceId,
+          role: 'user',
+          type: 'v2',
+          createdAt: new Date(),
+          content: { format: 2, parts: [{ type: 'text', text: 'hello' }], metadata: { kept: true } },
+        },
+      ],
+    });
+
+    const command = vi.spyOn((memory as unknown as { client: ReturnType<typeof createClient> }).client, 'command');
+    try {
+      const [updated] = await memory.updateMessages({
+        messages: [{ id: messageId, content: { metadata: { added: 1 } } }],
+      });
+
+      const deletes = command.mock.calls.filter(([params]) => /DELETE FROM/i.test(params.query));
+      expect(deletes).toEqual([]);
+      expect(updated?.content).toMatchObject({
+        parts: [{ type: 'text', text: 'hello' }],
+        metadata: { kept: true, added: 1 },
+      });
+
+      const { messages } = await memory.listMessagesById({ messageIds: [messageId] });
+      expect(messages[0]?.content).toMatchObject({
+        parts: [{ type: 'text', text: 'hello' }],
+        metadata: { kept: true, added: 1 },
+      });
+    } finally {
+      command.mockRestore();
+      await memory.deleteThread({ threadId });
+    }
+  });
+});
+
+describe('ClickHouse legacy observability listTraces', () => {
+  const observability = new ObservabilityStorageClickhouse({
+    url: TEST_CONFIG.url,
+    username: TEST_CONFIG.username || 'default',
+    password: TEST_CONFIG.password || '',
+  });
+  const suffix = Date.now();
+  const failingTrace = `trace-child-error-${suffix}`;
+  const cleanTrace = `trace-child-ok-${suffix}`;
+  const span = (traceId: string, spanId: string, parentSpanId: string | null, error: unknown) => ({
+    traceId,
+    spanId,
+    parentSpanId,
+    name: spanId,
+    spanType: SpanType.AGENT_RUN,
+    isEvent: false,
+    entityType: EntityType.AGENT,
+    entityId: `agent-child-error-${suffix}`,
+    entityName: 'childErrorAgent',
+    attributes: null,
+    metadata: null,
+    links: null,
+    input: null,
+    output: null,
+    error,
+    startedAt: new Date(),
+    endedAt: new Date(),
+  });
+
+  beforeAll(async () => {
+    await observability.init();
+    await observability.batchCreateSpans({
+      records: [
+        span(failingTrace, 'root', null, null),
+        span(failingTrace, 'child', 'root', { message: 'child failed' }),
+        span(cleanTrace, 'root', null, null),
+        span(cleanTrace, 'child', 'root', null),
+      ] as never,
+    });
+  });
+
+  afterAll(async () => {
+    await observability.batchDeleteTraces({ traceIds: [failingTrace, cleanTrace] });
+  });
+
+  it.each([
+    [true, failingTrace],
+    [false, cleanTrace],
+  ])('filters by hasChildError: %s', async (hasChildError, expected) => {
+    const result = await observability.listTraces({
+      filters: { entityId: `agent-child-error-${suffix}`, hasChildError },
+    });
+    expect(result.spans.map(s => s.traceId)).toEqual([expected]);
   });
 });

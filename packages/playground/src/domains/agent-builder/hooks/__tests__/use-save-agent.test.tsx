@@ -1,4 +1,5 @@
 import { MastraReactProvider } from '@mastra/react';
+import type { AuthCapabilities } from '@mastra/react/hooks/auth';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
@@ -9,7 +10,6 @@ import type { AgentBuilderEditFormValues } from '../../schemas';
 import type { AgentTool } from '../../types/agent-tool';
 import { useSaveAgent } from '../use-save-agent';
 import { authDisabledCapabilities, authEnabledCapabilities } from './fixtures/auth';
-import type { AuthCapabilities } from '@/domains/auth/types';
 import { server } from '@/test/msw-server';
 
 const BASE_URL = 'http://localhost:4111';
@@ -62,6 +62,38 @@ const renderSave = ({
 };
 
 describe('useSaveAgent', () => {
+  describe('when saving an agent configuration', () => {
+    it('requests immediate publication', async () => {
+      const { hook, captured } = renderSave({
+        agentId: 'existing-id',
+        availableAgentTools: [],
+        defaultValues: {
+          name: 'Existing',
+          description: '',
+          instructions: 'Updated instructions',
+          tools: {},
+          agents: {},
+          workflows: {},
+          skills: {},
+        },
+      });
+
+      await act(async () => {
+        await hook.current.save({
+          name: 'Existing',
+          description: '',
+          instructions: 'Updated instructions',
+          tools: {},
+          agents: {},
+          workflows: {},
+          skills: {},
+        });
+      });
+
+      expect(captured.body?.autoPublish).toBe(true);
+    });
+  });
+
   describe('when updating an agent with selected tools and agents', () => {
     it('persists the selected tools as a record', async () => {
       const { hook, captured } = renderSave({

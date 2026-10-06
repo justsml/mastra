@@ -1,6 +1,6 @@
 ---
 title: "Reference: chatRoute() | AI SDK"
-description: API reference for chatRoute(), a function to create chat route handlers for streaming agent conversations in AI SDK-compatible format.
+description: "Creates a chat route handler for streaming agent conversations using the AI SDK format."
 packages:
   - "@mastra/ai-sdk"
   - "@mastra/core"
@@ -10,7 +10,7 @@ import PropertiesTable from "@site/src/components/PropertiesTable";
 
 # chatRoute()
 
-Creates a chat route handler for streaming agent conversations using the AI SDK format. This function registers an HTTP `POST` endpoint that accepts messages, executes an agent, and streams the response back to the client in AI SDK-compatible format. You have to use it inside a [custom API route](/docs/server/custom-api-routes).
+Creates a chat route handler for streaming agent conversations in AI SDK format. The function registers an HTTP `POST` endpoint that accepts messages and executes an agent before streaming the response to the client in AI SDK-compatible format. Use it inside a [custom API route](/docs/server/custom-api-routes).
 
 Use [`handleChatStream()`](/reference/ai-sdk/handle-chat-stream) if you need a framework-agnostic handler.
 
@@ -44,7 +44,7 @@ export const mastra = new Mastra({
 })
 ```
 
-You can also use dynamic agent routing based on an `agentId`. The URL `/chat/weatherAgent` will resolve to the agent with the ID `weatherAgent`.
+You can also use runtime-defined agent routing based on an `agentId`. The URL `/chat/weatherAgent` will resolve to the agent with the ID `weatherAgent`.
 
 ```typescript title="src/mastra/index.ts"
 import { Mastra } from '@mastra/core'
@@ -67,9 +67,9 @@ export const mastra = new Mastra({
   content={[
   {
     name: 'version',
-    type: "'v5' | 'v6'",
+    type: "'v5' | 'v6' | 'v7'",
     description:
-      "Selects the AI SDK stream contract to emit. Omit it or pass `'v5'` for the existing default behavior. Pass `'v6'` when your app is typed against AI SDK v6 response helpers.",
+      "Selects the AI SDK stream contract to emit. Omit it or pass `'v5'` for the existing default behavior. Pass `'v6'` when your app is typed against AI SDK v6 response helpers. Pass `'v7'` when your app is typed against AI SDK v7.",
     isOptional: true,
     defaultValue: "'v5'",
   },
@@ -90,7 +90,7 @@ export const mastra = new Mastra({
     name: 'agentVersion',
     type: "{ versionId: string } | { status?: 'draft' | 'published' }",
     description:
-      "Selects a specific agent version. Pass `{ versionId: '<id>' }` to target an exact version, or `{ status: 'draft' }` / `{ status: 'published' }` to resolve by status. When the route is called, query parameters `?versionId=<id>` or `?status=draft|published` take precedence over this static value. Requires the [Editor](/docs/editor/overview) to be configured.",
+      "Selects a specific agent version. Pass `{ versionId: '<id>' }` to target an exact version, or `{ status: 'draft' }` / `{ status: 'published' }` to resolve by status. When the route is called, query parameters `?versionId=<id>` or `?status=draft|published` take precedence over this static value. Requires the [Editor](/docs/studio/editor) to be configured.",
     isOptional: true,
   },
   {
@@ -128,6 +128,13 @@ export const mastra = new Mastra({
     isOptional: true,
     defaultValue: 'false',
   },
+  {
+    name: 'heartbeatMs',
+    type: 'number',
+    description:
+      'Interval in milliseconds for SSE heartbeats that keep connections active through infrastructure with idle timeouts.',
+    isOptional: true,
+  },
 ]}
 />
 
@@ -136,13 +143,15 @@ export const mastra = new Mastra({
 You can use [`prepareSendMessagesRequest`](https://ai-sdk.dev/docs/reference/ai-sdk-ui/use-chat#transport.default-chat-transport.prepare-send-messages-request) to customize the request sent to the chat route, for example to pass additional configuration to the agent:
 
 ```typescript
-const { error, status, sendMessage, messages, regenerate, stop } = useChat({
+const { error, status, sendMessage, messages, stop } = useChat({
   transport: new DefaultChatTransport({
     api: 'http://localhost:4111/chat',
     prepareSendMessagesRequest({ messages }) {
       return {
         body: {
-          messages,
+          // With memory configured, send only the new message. Mastra loads the
+          // rest of the conversation from storage.
+          messages: [messages[messages.length - 1]],
           // Pass memory config
           memory: {
             thread: 'user-1',
@@ -154,3 +163,7 @@ const { error, status, sendMessage, messages, regenerate, stop } = useChat({
   }),
 })
 ```
+
+Without memory, send the full `messages` array as the chat route uses it as the request context.
+
+With memory, the stored thread is the source of truth, so `regenerate` and editing an earlier message in `useChat` don't change it. To change stored history, use `memory.saveMessages` or the memory store's `updateMessages`, then send a new message.

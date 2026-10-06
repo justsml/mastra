@@ -23,7 +23,9 @@ function isStructuredOutputFormatError(error: unknown): boolean {
     NoObjectGeneratedError.isInstance(error) ||
     TypeValidationError.isInstance(error) ||
     (error instanceof MastraError &&
-      (error.id === 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED' || error.id === 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED'))
+      (error.id === 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED' ||
+        error.id === 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED' ||
+        error.id === 'STRUCTURED_OUTPUT_TRUNCATED'))
   );
 }
 
@@ -68,7 +70,7 @@ export async function tryGenerateWithJsonFallback<OUTPUT>(
   } catch (error) {
     if (!isStructuredOutputFormatError(error)) throw error;
 
-    console.warn('Error in tryGenerateWithJsonFallback. Attempting fallback.', error);
+    agent.__getLogger().warn('Error in tryGenerateWithJsonFallback. Attempting fallback.', error);
     const result = await agent.generate(prompt, {
       ...options,
       structuredOutput: {
@@ -97,7 +99,13 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
   prompt: MessageListInput,
   options: AgentExecutionOptionsBase<OUTPUT> & {
     structuredOutput: StructuredOutputOptions<OUTPUT>;
+    /** Override injection placement only for the structured-output retry. */
+    fallbackJsonPromptInjection?: 'system' | 'inline';
     onStream?: (stream: Awaited<ReturnType<Agent['stream']>>) => void | Promise<void>;
+    /** Called immediately before each primary or fallback stream invocation. */
+    onStreamAttempt?: () => void | Promise<void>;
+    /** Called after each stream invocation is consumed, including a failed structured-output attempt. */
+    onStreamFinish?: (stream: Awaited<ReturnType<Agent['stream']>>) => void | Promise<void>;
   },
 ) {
   if (!options.structuredOutput?.schema) {
@@ -109,48 +117,82 @@ export async function tryStreamWithJsonFallback<OUTPUT extends {}>(
     });
   }
 
-  const { onStream, ...streamOptions } = options;
+  const { onStream, onStreamAttempt, onStreamFinish, fallbackJsonPromptInjection, ...streamOptions } = options;
 
   try {
+    await onStreamAttempt?.();
     const result = await agent.stream(prompt, streamOptions);
     void onStream?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
-    const object = await result.object;
-    if (!object) {
-      throw new MastraError({
-        id: 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED',
-        domain: ErrorDomain.AGENT,
-        category: ErrorCategory.USER,
-        text: 'structuredOutput object is undefined',
-      });
+    try {
+      const object = await result.object;
+      if (object === undefined) {
+        throw new MastraError({
+          id: 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: 'structuredOutput object is undefined',
+        });
+      }
+      return result;
+    } finally {
+      await onStreamFinish?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
     }
-    return result;
   } catch (error) {
     if (!isStructuredOutputFormatError(error)) throw error;
 
-    console.warn('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
+    agent.__getLogger().warn('Error in tryStreamWithJsonFallback. Attempting fallback.', error);
+    await onStreamAttempt?.();
     const result = await agent.stream(prompt, {
       ...streamOptions,
       structuredOutput: {
         ...streamOptions.structuredOutput,
         jsonPromptInjection:
-          streamOptions.structuredOutput.jsonPromptInjection === 'inline' ||
+          fallbackJsonPromptInjection ??
+          (streamOptions.structuredOutput.jsonPromptInjection === 'inline' ||
           streamOptions.structuredOutput.jsonPromptInjection === 'system'
             ? streamOptions.structuredOutput.jsonPromptInjection
-            : true,
+            : true),
       },
     });
     void onStream?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
-    const object = await result.object;
-    if (object === undefined) {
-      throw new MastraError({
-        id: 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED',
-        domain: ErrorDomain.AGENT,
-        category: ErrorCategory.USER,
-        text: 'structuredOutput object is undefined',
-      });
+    try {
+      const object = await result.object;
+      if (object === undefined) {
+        throw new MastraError({
+          id: 'STRUCTURED_OUTPUT_OBJECT_UNDEFINED',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: 'structuredOutput object is undefined',
+        });
+      }
+      return result;
+    } finally {
+      await onStreamFinish?.(result as unknown as Awaited<ReturnType<Agent['stream']>>);
     }
-    return result;
   }
+}
+
+/**
+ * Sentinel strings some models emit for the optional `suspendedToolRunId` auto-resume
+ * field when they mean "no value". These are serialization artifacts, not run ids —
+ * treating them as real ids defeats every falsy-based guard downstream (#23739).
+ */
+const SUSPENDED_TOOL_RUN_ID_SENTINELS = new Set(['null', 'undefined', 'none', 'nil']);
+
+/**
+ * Normalizes a model-supplied `suspendedToolRunId` at the LLM trust boundary.
+ * Returns `undefined` for non-strings, empty/whitespace-only strings, and known
+ * serialization sentinels (`"null"`, `"undefined"`, `"none"`, `"nil"`, case-insensitive)
+ * so callers can treat them exactly as if the model had omitted the field.
+ * Any other string is returned unchanged (it may be a framework-persisted or
+ * hook-supplied run id, which are not required to be UUIDs).
+ */
+export function resolveSuspendedToolRunId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (SUSPENDED_TOOL_RUN_ID_SENTINELS.has(trimmed.toLowerCase())) return undefined;
+  return value;
 }
 
 export function resolveThreadIdFromArgs(args: {

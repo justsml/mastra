@@ -1,6 +1,8 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useEffect, useRef } from 'react';
 import type { LogRecord } from '../types';
+import { useDataListKeyboard } from '@/ds/components/DataList';
+import type { DataListSort } from '@/ds/components/DataList';
 import { LogsDataList, LogsDataListSkeleton } from '@/ds/components/LogsDataList';
 
 // Fixed widths on non-flex columns prevent track shifts as the virtualizer swaps rows in/out.
@@ -22,6 +24,9 @@ export interface LogsListViewProps {
   featuredLogId?: string | null;
   /** Called when a row is clicked. The current toggle + trace-sync logic is the consumer's call. */
   onLogClick: (log: LogRecord) => void;
+  /** Current timestamp sort direction. When `onSortChange` is provided the Date/Time headers become sortable. */
+  timestampSort?: DataListSort;
+  onSortChange?: (direction: DataListSort, key: 'timestamp') => void;
 }
 
 /**
@@ -38,6 +43,8 @@ export function LogsListView({
   logIdMap,
   featuredLogId,
   onLogClick,
+  timestampSort,
+  onSortChange,
 }: LogsListViewProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -46,6 +53,13 @@ export function LogsListView({
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: OVERSCAN,
+  });
+
+  const { getRowProps } = useDataListKeyboard({
+    count: logs.length,
+    containerRef: scrollRef,
+    onNavigate: index => virtualizer.scrollToIndex(index),
+    global: true,
   });
 
   // Reset scroll to top whenever a fresh query resolves (filter / date range change).
@@ -67,7 +81,7 @@ export function LogsListView({
   }, [isLoading]);
 
   if (isLoading) {
-    return <LogsDataListSkeleton columns={COLUMNS} />;
+    return <LogsDataListSkeleton columns={COLUMNS} fit="container" />;
   }
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -77,9 +91,15 @@ export function LogsListView({
     virtualItems.length > 0 ? Math.max(0, totalSize - (virtualItems[virtualItems.length - 1]?.end ?? 0)) : 0;
 
   return (
-    <LogsDataList columns={COLUMNS} variant="striped" scrollRef={scrollRef} className="min-w-0">
+    <LogsDataList columns={COLUMNS} scrollRef={scrollRef} className="min-w-0" fit="container">
       <LogsDataList.Top>
-        <LogsDataList.TopCell>Date</LogsDataList.TopCell>
+        {onSortChange ? (
+          <LogsDataList.SortableTopCell sortKey="timestamp" sort={timestampSort} onSortChange={onSortChange}>
+            Date
+          </LogsDataList.SortableTopCell>
+        ) : (
+          <LogsDataList.TopCell>Date</LogsDataList.TopCell>
+        )}
         <LogsDataList.TopCell>Time</LogsDataList.TopCell>
         <LogsDataList.TopCell>Level</LogsDataList.TopCell>
         <LogsDataList.TopCell>Entity</LogsDataList.TopCell>
@@ -107,6 +127,7 @@ export function LogsListView({
                 key={id}
                 ref={virtualizer.measureElement}
                 data-index={vi.index}
+                {...getRowProps(vi.index)}
                 onClick={() => onLogClick(log)}
                 featured={isFeatured}
                 variant={log.level === 'error' || log.level === 'fatal' ? 'error' : 'default'}

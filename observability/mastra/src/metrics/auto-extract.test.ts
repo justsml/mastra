@@ -107,6 +107,58 @@ describe('AutoExtractedMetrics', () => {
     });
   });
 
+  // Processor duration is keyed off the entity type rather than PROCESSOR_RUN
+  // alone, because a processor may declare a domain span type. These pin the
+  // boundary of that rule.
+  describe('processor duration', () => {
+    it('emits for a plain PROCESSOR_RUN span', () => {
+      setup();
+      const span = createMockSpan({
+        type: SpanType.PROCESSOR_RUN,
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityName: 'moderation',
+        attributes: { processorExecutor: 'legacy', processorIndex: 0 },
+        endTime: new Date('2026-01-01T00:00:00.020Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).toContain('mastra_processor_duration_ms');
+    });
+
+    it('emits for a processor that declared a domain span type', () => {
+      setup();
+      const span = createMockSpan({
+        type: SpanType.SKILL_ACTION,
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityName: 'Skills Processor',
+        attributes: { operation: 'inject', processorExecutor: 'legacy', processorIndex: 2 },
+        endTime: new Date('2026-01-01T00:00:00.020Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).toContain('mastra_processor_duration_ms');
+    });
+
+    it('does not emit for a span that only borrows a processor entity type', () => {
+      // Observational memory used to wrap its model passes in a GENERIC span
+      // tagged OUTPUT_STEP_PROCESSOR. Counting those model-call durations as
+      // processor overhead would swamp the metric.
+      setup();
+      const span = createMockSpan({
+        type: SpanType.GENERIC,
+        entityType: EntityType.OUTPUT_STEP_PROCESSOR,
+        entityName: 'Observer',
+        endTime: new Date('2026-01-01T00:00:04Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).not.toContain('mastra_processor_duration_ms');
+    });
+  });
+
   it('should emit duration metric for tool spans', () => {
     setup();
     const span = createMockSpan({
@@ -121,6 +173,23 @@ describe('AutoExtractedMetrics', () => {
     expect(emittedMetrics).toHaveLength(1);
     expect(emittedMetrics[0]!.metric.name).toBe('mastra_tool_duration_ms');
     expect(emittedMetrics[0]!.metric.value).toBe(200);
+  });
+
+  it('should not emit duration metric for event spans', () => {
+    setup();
+    const startTime = new Date('2026-01-01T00:00:00.000Z');
+    const span = createMockSpan({
+      type: SpanType.TOOL_CALL,
+      entityType: EntityType.TOOL,
+      entityName: 'my-tool',
+      isEvent: true,
+      startTime,
+      endTime: startTime,
+    });
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    expect(emittedMetrics).toHaveLength(0);
   });
 
   it('should emit duration metric for workflow spans', () => {
@@ -154,13 +223,14 @@ describe('AutoExtractedMetrics', () => {
     expect(emittedMetrics[0]!.metric.labels.status).toBe('error');
   });
 
-  it('should extract token usage metrics for model generation', () => {
+  it('should use the configured model when the response model is blank', () => {
     setup();
     const span = createMockSpan({
       type: SpanType.MODEL_GENERATION,
       endTime: new Date('2026-01-01T00:00:02Z'),
       attributes: {
         model: 'gpt-4',
+        responseModel: '   ',
         provider: 'openai',
         usage: {
           inputTokens: 100,
@@ -202,6 +272,32 @@ describe('AutoExtractedMetrics', () => {
     });
     const outputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_output_tokens');
     expect(outputTokens!.metric.value).toBe(50);
+  });
+
+  it('marks observed token metrics when the run aggregate is incomplete', () => {
+    setup();
+    const span = createMockSpan({
+      type: SpanType.MODEL_GENERATION,
+      endTime: new Date('2026-01-01T00:00:01Z'),
+      attributes: {
+        model: 'gpt-4o-mini',
+        provider: 'openai',
+        usageIncomplete: true,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 25,
+        },
+      },
+    });
+
+    vi.spyOn(PricingRegistry, 'getGlobal').mockReturnValue(pricingRegistry);
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    const inputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_input_tokens');
+    const outputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_output_tokens');
+    expect(inputTokens?.metric).toMatchObject({ value: 10, labels: { usageIncomplete: 'true' } });
+    expect(outputTokens?.metric).toMatchObject({ value: 25, labels: { usageIncomplete: 'true' } });
   });
 
   it('should extract all InputTokenDetails and OutputTokenDetails', () => {

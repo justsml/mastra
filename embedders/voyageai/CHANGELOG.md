@@ -1,5 +1,67 @@
 # @mastra/voyageai
 
+## 0.4.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.4.1-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 0.4.1-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.4.0
+
+### Minor Changes
+
+- Fixed VoyageAI multimodal embeddings sending text as bare strings (the API rejected the payload) and added a `baseUrl` option so you can point the embedder, reranker, and contextualized models at a provider-hosted Voyage endpoint. ([#19804](https://github.com/mastra-ai/mastra/pull/19804))
+
+  **Before**
+
+  ```ts
+  // multimodal text was serialized as inputs: [["text"]] -> HTTP 400
+  ```
+
+  **After**
+
+  ```ts
+  const embedder = voyage.multimodalEmbedding({
+    model: 'voyage-multimodal-3.5',
+    baseUrl: 'https://ai.mongodb.com/v1',
+  });
+  ```
+
+## 0.4.0-alpha.0
+
+### Minor Changes
+
+- Fixed VoyageAI multimodal embeddings sending text as bare strings (the API rejected the payload) and added a `baseUrl` option so you can point the embedder, reranker, and contextualized models at a provider-hosted Voyage endpoint. ([#19804](https://github.com/mastra-ai/mastra/pull/19804))
+
+  **Before**
+
+  ```ts
+  // multimodal text was serialized as inputs: [["text"]] -> HTTP 400
+  ```
+
+  **After**
+
+  ```ts
+  const embedder = voyage.multimodalEmbedding({
+    model: 'voyage-multimodal-3.5',
+    baseUrl: 'https://ai.mongodb.com/v1',
+  });
+  ```
+
 ## 0.3.0
 
 ### Minor Changes

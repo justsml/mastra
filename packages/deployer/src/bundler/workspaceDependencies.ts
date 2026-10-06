@@ -1,6 +1,5 @@
 import { join, dirname } from 'node:path';
 import type { IMastraLogger } from '@mastra/core/logger';
-import slugify from '@sindresorhus/slugify';
 import * as pkg from 'empathic/package';
 import { findWorkspaces, findWorkspacesRoot, createWorkspacesCache } from 'find-workspaces';
 import { ensureDir } from 'fs-extra';
@@ -11,6 +10,30 @@ export type WorkspacePackageInfo = {
   location: string;
   dependencies: Record<string, string> | undefined;
   version: string | undefined;
+  exports?: unknown;
+};
+
+const isExportTargetImportable = (target: unknown): boolean => {
+  if (!target) return false;
+  if (typeof target === 'string') return true;
+  if (Array.isArray(target)) return target.some(isExportTargetImportable);
+  if (typeof target !== 'object') return false;
+
+  return Object.values(target).some(isExportTargetImportable);
+};
+
+export const hasRootExport = (exportsField: unknown): boolean => {
+  if (exportsField === undefined) return true;
+  if (typeof exportsField === 'string' || Array.isArray(exportsField)) return isExportTargetImportable(exportsField);
+  if (!exportsField || typeof exportsField !== 'object') return false;
+
+  const exportMap = exportsField as Record<string, unknown>;
+  const exportKeys = Object.keys(exportMap);
+  if (exportKeys.length === 0) return false;
+  if (Object.prototype.hasOwnProperty.call(exportMap, '.')) return isExportTargetImportable(exportMap['.']);
+  if (exportKeys.some(key => key.startsWith('./'))) return false;
+
+  return isExportTargetImportable(exportMap);
 };
 
 type TransitiveDependencyResult = {
@@ -54,6 +77,7 @@ export async function getWorkspaceInformation({
         location: workspace.location,
         dependencies: workspace.package.dependencies,
         version: workspace.package.version,
+        exports: workspace.package.exports,
       },
     ]) ?? [],
   );
@@ -75,7 +99,7 @@ export async function getWorkspaceInformation({
 /**
  * Collects all transitive workspace dependencies and their TGZ paths
  */
-export const collectTransitiveWorkspaceDependencies = ({
+export const collectTransitiveWorkspaceDependencies = async ({
   workspaceMap,
   initialDependencies,
   logger,
@@ -83,7 +107,7 @@ export const collectTransitiveWorkspaceDependencies = ({
   workspaceMap: Map<string, WorkspacePackageInfo>;
   initialDependencies: Set<string>;
   logger: IMastraLogger;
-}): TransitiveDependencyResult => {
+}): Promise<TransitiveDependencyResult> => {
   const usedWorkspacePackages = new Set<string>();
   const queue: string[] = Array.from(initialDependencies);
   const resolutions: Record<string, string> = {};
@@ -106,6 +130,8 @@ export const collectTransitiveWorkspaceDependencies = ({
 
       const depsService = new DepsService(root.location);
       depsService.__setLogger(logger);
+
+      const slugify = (await import('@sindresorhus/slugify')).default;
       const sanitizedName = slugify(pkgName);
 
       const tgzPath = depsService.getWorkspaceDependencyPath({
@@ -150,6 +176,7 @@ export const packWorkspaceDependencies = async ({
 
   // package all workspace dependencies
   if (usedWorkspacePackages.size > 0) {
+    const slugify = (await import('@sindresorhus/slugify')).default;
     const workspaceDirPath = join(bundleOutputDir, 'workspace-module');
     await ensureDir(workspaceDirPath);
 
@@ -169,7 +196,12 @@ export const packWorkspaceDependencies = async ({
           const sanitizedName = slugify(pkgName);
           if (!dep) return;
 
-          await depsService.pack({ dir: dep.location, destination: workspaceDirPath, sanitizedName: sanitizedName });
+          await depsService.pack({
+            dir: dep.location,
+            destination: workspaceDirPath,
+            sanitizedName,
+            version: dep.version!,
+          });
         }),
       );
     }

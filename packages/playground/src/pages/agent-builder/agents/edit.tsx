@@ -1,5 +1,9 @@
 import { Button } from '@mastra/playground-ui/components/Button';
 import { Spinner } from '@mastra/playground-ui/components/Spinner';
+import { AgentIcon } from '@mastra/playground-ui/icons/AgentIcon';
+import { useAuthCapabilities } from '@mastra/react/hooks/auth';
+import { useAllProviderTools } from '@mastra/react/hooks/tool-providers';
+import { Settings2 } from 'lucide-react';
 import { useState } from 'react';
 import { FormProvider, useForm, useFormContext, useFormState, useWatch } from 'react-hook-form';
 import { Navigate, useNavigate, useParams } from 'react-router';
@@ -36,8 +40,6 @@ import { useChannelConnectToast } from '@/domains/agent-builder/hooks/use-channe
 import { AgentBuilderEditLayout } from '@/domains/agent-builder/layouts/agent-builder-edit-layout';
 import type { AgentBuilderEditFormValues } from '@/domains/agent-builder/schemas';
 import { storedAgentToFormValues } from '@/domains/agent-builder/services/stored-agent-to-form-values';
-import { useAuthCapabilities } from '@/domains/auth/hooks/use-auth-capabilities';
-import { useAllProviderTools } from '@/domains/tool-providers/hooks/use-all-provider-tools';
 import { startViewTransition } from '@/lib/routing';
 
 export default function AgentBuilderAgentEdit() {
@@ -183,6 +185,7 @@ const MobileInitialCtas = () => {
   return (
     <div className="flex flex-col gap-2 lg:hidden" data-testid="agent-builder-mobile-initial-ctas">
       <Button
+        icon={<AgentIcon />}
         variant="primary"
         onClick={() => navigate(`/agent-builder/agents/${agentId}/view`, { viewTransition: true })}
         data-testid="agent-builder-mobile-initial-cta-chat"
@@ -190,7 +193,7 @@ const MobileInitialCtas = () => {
         Chat with my agent
       </Button>
       <Button
-        variant="outline"
+        icon={<Settings2 />}
         onClick={() => startViewTransition(() => next())}
         data-testid="agent-builder-mobile-initial-cta-config"
       >
@@ -252,7 +255,7 @@ const ProfileSlot = () => {
   // Both buttons are already accessible from the mobile 3-dots menu, so we
   // hide them in the profile panel on mobile to avoid duplication.
   const heroActions = (
-    <div className="hidden lg:flex items-center gap-2" data-testid="agent-builder-hero-actions-desktop">
+    <div className="hidden items-center gap-2 lg:flex" data-testid="agent-builder-hero-actions-desktop">
       {capabilities?.enabled && (
         <span style={{ viewTransitionName: 'agent-visibility-select' }}>
           <VisibilitySelect agentId={agentId} />
@@ -326,7 +329,7 @@ const ProfileSlot = () => {
 };
 
 const AgentBuilderAgentEditSkeleton = () => (
-  <div className="h-screen w-screen flex items-center justify-center">
+  <div className="flex h-screen w-screen items-center justify-center">
     <Spinner />
   </div>
 );

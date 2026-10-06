@@ -2,9 +2,13 @@ import type { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const devBundlerConstructorSpy = vi.hoisted(() => vi.fn());
+const loadedEnvVars = vi.hoisted(() => new Map<string, string>());
+
 vi.mock('node:fs', () => ({
   writeFileSync: vi.fn(),
   existsSync: vi.fn().mockImplementation((path: string) => path.endsWith('index.ts')),
+  statSync: vi.fn().mockReturnValue({ isFile: () => true }),
 }));
 
 vi.mock('execa', () => ({
@@ -80,10 +84,14 @@ vi.mock('./DevBundler', () => {
   // Use a class for constructor (Vitest v4 requirement)
   class MockDevBundler {
     __setLogger = vi.fn();
-    loadEnvVars = vi.fn().mockResolvedValue(new Map());
+    loadEnvVars = vi.fn().mockImplementation(async () => new Map(loadedEnvVars));
     prepare = vi.fn().mockResolvedValue(undefined);
     getAllToolPaths = vi.fn().mockReturnValue([]);
     watch = vi.fn().mockResolvedValue(mockWatcher);
+
+    constructor(...args: any[]) {
+      devBundlerConstructorSpy.apply(this, args);
+    }
   }
 
   return {
@@ -468,5 +476,260 @@ describe('dev command - inspect flag behavior', () => {
       expect(commands).toContain('--inspect-brk');
       expect(commands.some(cmd => cmd.startsWith('--inspect-brk='))).toBe(false);
     });
+  });
+});
+
+describe('dev command - factory mode environment', () => {
+  let execaMock: any;
+  let mockChildProcess: MockChildProcess;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    mockChildProcess = new MockChildProcess();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+
+    const { execa } = await import('execa');
+    execaMock = vi.mocked(execa);
+    execaMock.mockReturnValue(mockChildProcess as unknown as ChildProcess);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('should set MASTRA_FACTORY_DEV=true in spawned env when factory is true', async () => {
+    const { dev } = await import('./dev');
+
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+      factory: true,
+    });
+
+    expect(execaMock).toHaveBeenCalled();
+    const callOptions = execaMock.mock.calls[0][2] as { env: Record<string, string> };
+    expect(callOptions.env.MASTRA_FACTORY_DEV).toBe('true');
+    expect(callOptions.env.MASTRA_TELEMETRY_COMMAND).toBe('factory dev');
+  });
+
+  it('should pass factory: true to DevBundler when factory is set', async () => {
+    const { dev } = await import('./dev');
+
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+      factory: true,
+    });
+
+    expect(devBundlerConstructorSpy).toHaveBeenCalled();
+    const lastCall = devBundlerConstructorSpy.mock.calls[devBundlerConstructorSpy.mock.calls.length - 1];
+    expect(lastCall[1]).toBe(true);
+  });
+
+  it('should not pass factory to DevBundler when factory is not set', async () => {
+    const { dev } = await import('./dev');
+
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+
+    expect(devBundlerConstructorSpy).toHaveBeenCalled();
+    const lastCall = devBundlerConstructorSpy.mock.calls[devBundlerConstructorSpy.mock.calls.length - 1];
+    expect(lastCall[1]).toBeUndefined();
+  });
+
+  it('should not set MASTRA_FACTORY_DEV in spawned env when factory is not set', async () => {
+    const { dev } = await import('./dev');
+
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+
+    expect(execaMock).toHaveBeenCalled();
+    const callOptions = execaMock.mock.calls[0][2] as { env: Record<string, string> };
+    expect(callOptions.env.MASTRA_FACTORY_DEV).toBeUndefined();
+    expect(callOptions.env.MASTRA_TELEMETRY_COMMAND).toBe('dev');
+  });
+
+  it('should retain MASTRA_FACTORY_DEV=true across a hot-reload restart', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ disabled: false }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { dev } = await import('./dev');
+
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+      factory: true,
+    });
+
+    // Initial start should have MASTRA_FACTORY_DEV=true
+    expect(execaMock).toHaveBeenCalledTimes(1);
+    const initialEnv = execaMock.mock.calls[0][2].env as Record<string, string>;
+    expect(initialEnv.MASTRA_FACTORY_DEV).toBe('true');
+
+    // Trigger a BUNDLE_END event to cause a hot-reload restart
+    const watcherOnCall = mockWatcher.on.mock.calls.find((call: any[]) => call[0] === 'event');
+    expect(watcherOnCall).toBeDefined();
+    const eventCallback = watcherOnCall![1];
+
+    eventCallback({ code: 'BUNDLE_END' });
+
+    // Wait for the restart to call execa again
+    await vi.waitFor(() => {
+      expect(execaMock).toHaveBeenCalledTimes(2);
+    });
+
+    const restartEnv = execaMock.mock.calls[1][2].env as Record<string, string>;
+    expect(restartEnv.MASTRA_FACTORY_DEV).toBe('true');
+    expect(restartEnv.MASTRA_TELEMETRY_COMMAND).toBe('factory dev');
+  });
+});
+
+describe('dev command - NODE_ENV precedence', () => {
+  let execaMock: any;
+  let mockChildProcess: MockChildProcess;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    loadedEnvVars.clear();
+
+    mockChildProcess = new MockChildProcess();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+
+    const { execa } = await import('execa');
+    execaMock = vi.mocked(execa);
+    execaMock.mockReturnValue(mockChildProcess as unknown as ChildProcess);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+    loadedEnvVars.clear();
+  });
+
+  const runDev = async () => {
+    const { dev } = await import('./dev');
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+  };
+
+  it('lets a dotenv-provided NODE_ENV override the default', async () => {
+    loadedEnvVars.set('NODE_ENV', 'development');
+
+    await runDev();
+
+    const childEnv = execaMock.mock.calls[0][2].env as Record<string, string>;
+    expect(childEnv.NODE_ENV).toBe('development');
+  });
+
+  it('falls back to production when no dotenv file sets NODE_ENV', async () => {
+    await runDev();
+
+    const childEnv = execaMock.mock.calls[0][2].env as Record<string, string>;
+    expect(childEnv.NODE_ENV).toBe('production');
+  });
+});
+
+describe('dev command - output directory preparation', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+
+    const { execa } = await import('execa');
+    vi.mocked(execa).mockReturnValue(new MockChildProcess() as unknown as ChildProcess);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+    devBundlerConstructorSpy.mockReset();
+  });
+
+  it('empties the output directory before extracting server options so stale build artifacts cannot be resolved', async () => {
+    const callOrder: string[] = [];
+
+    const { getServerOptions } = await import('@mastra/deployer/build');
+    vi.mocked(getServerOptions).mockImplementation(async () => {
+      callOrder.push('getServerOptions');
+      return { port: 4111, host: 'localhost' } as any;
+    });
+
+    devBundlerConstructorSpy.mockImplementation(function (this: { prepare: ReturnType<typeof vi.fn> }) {
+      this.prepare = vi.fn().mockImplementation(async () => {
+        callOrder.push('prepare');
+      });
+    });
+
+    const { dev } = await import('./dev');
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+
+    expect(callOrder).toEqual(['prepare', 'getServerOptions']);
   });
 });

@@ -1,6 +1,6 @@
 ---
 title: "Reference: .getSkill() | Agents"
-description: "API reference for the Agent .getSkill() method, which retrieves a specific skill by name."
+description: "Retrieves a specific skill by name from the agent's configured skills (both agent-level and workspace skills)."
 packages:
   - "@mastra/core"
 ---
@@ -66,7 +66,10 @@ interface Skill {
   description: string
   instructions: string
   path: string
-  source: { type: string; projectPath: string }
+  source:
+    | { type: 'external'; packagePath: string }
+    | { type: 'local'; projectPath: string }
+    | { type: 'managed'; mastraPath: string }
   references: string[]
   scripts: string[]
   assets: string[]
@@ -77,12 +80,14 @@ interface Skill {
 }
 ```
 
+`source` describes where Mastra discovered the skill. Skills from a path with a `node_modules` segment are `external`, skills under `.mastra/skills` are `managed`, and all other skills, including those created with [`createSkill()`](/reference/agents/createSkill), are `local`.
+
 ## Merging behavior
 
 When both agent-level skills and workspace skills are configured, `.getSkill()` searches the merged set. Agent-level skills take precedence on name conflicts.
 
 ## Related
 
-- [Agent skills](/docs/agents/skills)
+- [Agent skills](/docs/skills)
 - [`.listSkills()` reference](/reference/agents/listSkills)
 - [`createSkill()` reference](/reference/agents/createSkill)

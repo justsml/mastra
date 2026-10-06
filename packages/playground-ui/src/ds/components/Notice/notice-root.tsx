@@ -1,5 +1,6 @@
 import { FileTextIcon, InfoIcon, LightbulbIcon, OctagonAlertIcon, TriangleAlertIcon } from 'lucide-react';
 import React from 'react';
+import { Txt } from '@/ds/components/Txt';
 import { cn } from '@/lib/utils';
 
 export type NoticeVariant = 'warning' | 'destructive' | 'success' | 'info' | 'note';
@@ -7,23 +8,23 @@ export type NoticeVariant = 'warning' | 'destructive' | 'success' | 'info' | 'no
 const variantConfig: Record<NoticeVariant, { icon: React.ReactNode; classes: string }> = {
   success: {
     icon: <LightbulbIcon />,
-    classes: 'bg-notice-success/20 border-notice-success/20 text-notice-success-fg',
+    classes: 'bg-success-subtle border-success-edge text-success-subtle-foreground',
   },
   destructive: {
     icon: <OctagonAlertIcon />,
-    classes: 'bg-notice-destructive/20 border-notice-destructive/20 text-notice-destructive-fg',
+    classes: 'bg-destructive-subtle border-destructive-edge text-destructive-subtle-foreground',
   },
   warning: {
     icon: <TriangleAlertIcon />,
-    classes: 'bg-notice-warning/20 border-notice-warning/20 text-notice-warning-fg',
+    classes: 'bg-warning-subtle border-warning-edge text-warning-subtle-foreground',
   },
   info: {
     icon: <InfoIcon />,
-    classes: 'bg-notice-info/20 border-notice-info/20 text-notice-info-fg',
+    classes: 'bg-info-subtle border-info-edge text-info-subtle-foreground',
   },
   note: {
     icon: <FileTextIcon />,
-    classes: 'bg-notice-note border-border1 text-notice-note-fg',
+    classes: 'bg-muted border-border text-foreground',
   },
 };
 
@@ -44,16 +45,17 @@ export function NoticeRoot({ variant, title, icon, action, children, className }
     return (
       <div
         className={cn(
-          '@container relative rounded-2xl border p-3 text-ui-md leading-ui-md',
+          '@container relative rounded-2xl border p-3 text-body',
           'animate-in duration-200 fade-in-0 slide-in-from-top-2',
           classes,
           className,
         )}
       >
         <div className="flex flex-col gap-3 @md:flex-row @md:items-start @md:gap-2">
-          <div className="flex flex-1 items-start gap-2 [&>svg]:size-4">
+          <div className="flex min-w-0 flex-1 items-start gap-2 [&>svg]:size-4">
             <span className="flex h-[1lh] shrink-0 items-center [&>svg]:size-4">{resolvedIcon}</span>
-            {children && <div className="flex-1">{children}</div>}
+            {/* wrap-anywhere — messages carry URLs and tokens with no break opportunity */}
+            {children && <div className="min-w-0 flex-1 wrap-anywhere">{children}</div>}
           </div>
           {action && <div className="@md:-my-1 [&>button]:w-full @md:[&>button]:w-auto">{action}</div>}
         </div>
@@ -64,19 +66,22 @@ export function NoticeRoot({ variant, title, icon, action, children, className }
   return (
     <div
       className={cn(
-        '@container relative flex flex-col gap-4 rounded-2xl border p-3',
+        '@container relative flex flex-col gap-3 rounded-2xl border p-3',
         'animate-in duration-200 fade-in-0 slide-in-from-top-2',
         classes,
         className,
       )}
     >
-      <div className="flex h-4 items-center gap-2 [&>svg]:size-4">
+      <div className="flex h-4 min-w-0 items-center gap-2 [&>svg]:size-4">
         {resolvedIcon}
-        <span className="text-ui-sm leading-none font-medium tracking-wide uppercase">{title}</span>
+        {/* truncate, not wrap — the row is 1rem tall, a wrapped title would spill out of it */}
+        <Txt as="span" variant="column" className="truncate leading-none tracking-wide uppercase">
+          {title}
+        </Txt>
       </div>
       {action && <div className="absolute top-2 right-2 hidden @md:block">{action}</div>}
       {(children || action) && (
-        <div className="flex flex-col gap-5">
+        <div className="flex min-w-0 flex-col gap-3 wrap-anywhere">
           {children}
           {action && <div className="self-start @md:hidden">{action}</div>}
         </div>

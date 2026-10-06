@@ -35,7 +35,7 @@ export function ActionsMenu({
       <PopoverTrigger asChild>
         <Button variant="ghost" size="sm" disabled={disabled} aria-label="Actions menu">
           <Icon>
-            <MoreVertical className="w-4 h-4" />
+            <MoreVertical className="h-4 w-4" />
           </Icon>
         </Button>
       </PopoverTrigger>
@@ -44,34 +44,28 @@ export function ActionsMenu({
           <Button
             variant="ghost"
             size="sm"
-            className="w-full justify-start gap-2"
+            className="w-full justify-start"
             onClick={() => handleAction(onExportClick)}
+            icon={<Download />}
           >
-            <Icon>
-              <Download className="w-4 h-4" />
-            </Icon>
             Export
           </Button>
           <Button
             variant="ghost"
             size="sm"
-            className="w-full justify-start gap-2"
+            className="w-full justify-start"
             onClick={() => handleAction(onCreateDatasetClick)}
+            icon={<FolderPlus />}
           >
-            <Icon>
-              <FolderPlus className="w-4 h-4" />
-            </Icon>
             Create Dataset
           </Button>
           <Button
-            variant="ghost"
+            variant="destructive-ghost"
             size="sm"
-            className="w-full justify-start gap-2 text-red-500 hover:text-red-400"
+            className="w-full justify-start"
             onClick={() => handleAction(onDeleteClick)}
+            icon={<Trash2 />}
           >
-            <Icon>
-              <Trash2 className="w-4 h-4" />
-            </Icon>
             Delete
           </Button>
         </div>

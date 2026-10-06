@@ -1,30 +1,41 @@
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { getDeployer } from '@mastra/deployer';
-import { prepareFsAgentsEntry, writeFsAgentsEntry, mirrorFsAgentWorkspaces } from '@mastra/deployer/build';
+import {
+  analyzeEntryProjectType,
+  prepareFsAgentsEntry,
+  writeFsAgentsEntry,
+  mirrorFsAgentWorkspaces,
+} from '@mastra/deployer/build';
 import { checkMastraPeerDeps, logPeerDepWarnings } from '../../utils/check-peer-deps';
 import { findMastraEntryFile } from '../../utils/find-mastra-entry';
 import { createLogger } from '../../utils/logger';
 import { getMastraPackages } from '../../utils/mastra-packages';
 import { computeSourceHash, writeBuildManifest } from '../../utils/source-hash';
 import { BuildBundler } from './BuildBundler';
+import { buildFactoryUI } from './factory-ui-build';
+import { guardAgainstLiveDevServer, prepareWithLiveDevGuard } from './guard-live-dev-server';
 
 export async function build({
   dir,
   tools,
   root,
   studio,
+  force,
   debug,
 }: {
   dir?: string;
   tools?: string[];
   root?: string;
   studio?: boolean;
+  force?: boolean;
   debug: boolean;
 }) {
-  const rootDir = root || process.cwd();
+  const rootDir = resolve(root || process.cwd());
   const mastraDir = dir ? (dir.startsWith('/') ? dir : join(rootDir, dir)) : join(rootDir, 'src', 'mastra');
   const outputDirectory = join(rootDir, '.mastra');
   const logger = createLogger(debug);
+
+  await guardAgainstLiveDevServer(outputDirectory, force);
 
   // Check for peer dependency version mismatches
   const mastraPackages = await getMastraPackages(rootDir);
@@ -36,6 +47,17 @@ export async function build({
     // file-based project), prepareFsAgentsEntry auto-constructs a Mastra
     // instance from discovered primitives.
     const mastraEntryFile = findMastraEntryFile(mastraDir);
+
+    // For Software Factory projects, copy the prebuilt SPA bundled with the CLI
+    // into the public directory so copyPublic() can include it in the output.
+    // Skip for synthetic file-routed entries (no real index.ts).
+    let projectType: string | undefined;
+    if (mastraEntryFile) {
+      projectType = await analyzeEntryProjectType(mastraEntryFile);
+      if (projectType === 'factory') {
+        await buildFactoryUI(mastraDir, logger);
+      }
+    }
 
     // Discover fs-routed agents under agents/* and, if any exist, wrap the entry
     // so they are registered onto the user's mastra instance during the build.
@@ -56,7 +78,7 @@ export async function build({
       // any tools defined under agents/*/tools for fs-routed agents.
       const discoveredTools = deployer.getAllToolPaths(mastraDir, [...(tools ?? []), ...fsAgents.toolPaths]);
 
-      await deployer.prepare(outputDirectory);
+      await prepareWithLiveDevGuard(outputDirectory, force, () => deployer.prepare(outputDirectory));
       // Write the fs-routed agents wrapper after prepare() empties the output
       // directory, so it survives for the bundler. No-op when none are found.
       await writeFsAgentsEntry(fsAgents);
@@ -70,7 +92,7 @@ export async function build({
       await mirrorFsAgentWorkspaces(mastraDir, join(outputDirectory, 'output'));
 
       // Write build manifest with source hash for staleness detection
-      const sourceHash = await computeSourceHash(rootDir, mastraDir);
+      const sourceHash = await computeSourceHash(rootDir, mastraDir, projectType);
       await writeBuildManifest(outputDirectory, sourceHash);
 
       logger.info('Build successful, you can now deploy the .mastra/output directory to your target platform.');
@@ -90,7 +112,7 @@ export async function build({
 
     const discoveredTools = platformDeployer.getAllToolPaths(mastraDir, [...(tools ?? []), ...fsAgents.toolPaths]);
 
-    await platformDeployer.prepare(outputDirectory);
+    await prepareWithLiveDevGuard(outputDirectory, force, () => platformDeployer.prepare(outputDirectory));
     // Write the fs-routed agents wrapper after prepare() empties the output
     // directory, so it survives for the bundler. No-op when none are found.
     await writeFsAgentsEntry(fsAgents);
@@ -104,7 +126,7 @@ export async function build({
     await mirrorFsAgentWorkspaces(mastraDir, join(outputDirectory, 'output'));
 
     // Write build manifest with source hash for staleness detection
-    const sourceHash = await computeSourceHash(rootDir, mastraDir);
+    const sourceHash = await computeSourceHash(rootDir, mastraDir, projectType);
     await writeBuildManifest(outputDirectory, sourceHash);
 
     // Push-style deployers (e.g. sandbox deploys) opt in to deploying as part

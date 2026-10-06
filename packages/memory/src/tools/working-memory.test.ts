@@ -97,6 +97,25 @@ describe('deepMergeWorkingMemory', () => {
 
       expect(result).toEqual({ a: 1, c: 3 });
     });
+
+    it('should drop null values on a first write when no existing memory exists', () => {
+      const result = deepMergeWorkingMemory(null, { name: 'Ada', role: null });
+
+      expect(result).toEqual({ name: 'Ada' });
+      expect('role' in result).toBe(false);
+    });
+
+    it('should drop null values on a first write when existing memory is undefined', () => {
+      const result = deepMergeWorkingMemory(undefined, { name: 'Ada', role: null });
+
+      expect(result).toEqual({ name: 'Ada' });
+    });
+
+    it('should return an empty object when a first write contains only nulls', () => {
+      const result = deepMergeWorkingMemory(null, { name: null, role: null });
+
+      expect(result).toEqual({});
+    });
   });
 
   describe('nested object merging', () => {
@@ -153,6 +172,23 @@ describe('deepMergeWorkingMemory', () => {
         name: 'Alice',
         work: { company: 'Acme', role: 'Engineer' },
       });
+    });
+
+    it('should drop nulls inside a nested object that did not exist before', () => {
+      const existing = { name: 'Ada' };
+      const update = { work: { company: 'Acme', manager: null } };
+      const result = deepMergeWorkingMemory(existing, update);
+
+      expect(result).toEqual({ name: 'Ada', work: { company: 'Acme' } });
+      expect('manager' in (result.work as Record<string, unknown>)).toBe(false);
+    });
+
+    it('should drop nulls in deeply nested branches that did not exist before', () => {
+      const result = deepMergeWorkingMemory(null, {
+        profile: { work: { company: 'Acme', manager: null }, alias: null },
+      });
+
+      expect(result).toEqual({ profile: { work: { company: 'Acme' } } });
     });
   });
 
@@ -248,6 +284,18 @@ describe('deepMergeWorkingMemory', () => {
 
       expect(update).toEqual(updateCopy);
     });
+
+    it('should not return the update object by reference when existing is null', () => {
+      const update = { name: 'Ada', nested: { key: 'value' } };
+      const result = deepMergeWorkingMemory(null, update);
+
+      expect(result).toEqual(update);
+      expect(result).not.toBe(update);
+      expect(result.nested).not.toBe(update.nested);
+
+      (result as { name: string }).name = 'Grace';
+      expect(update.name).toBe('Ada');
+    });
   });
 });
 
@@ -297,5 +345,85 @@ describe('updateWorkingMemoryTool schema validation (issue #17301)', () => {
     const resolved = await inputSchema['~standard'].validate({ name: 'Grace', age: 42 });
     expect('issues' in resolved && resolved.issues).toBeFalsy();
     expect(resolved.value).toEqual({ memory: { name: 'Grace', age: 42 } });
+  });
+
+  describe('null padding from strict-mode providers', () => {
+    const makePartialTool = () =>
+      updateWorkingMemoryTool({
+        workingMemory: {
+          enabled: true,
+          schema: z.object({
+            people: z.array(z.string()).optional(),
+            work: z.object({ company: z.string() }).optional(),
+          }),
+        },
+      } as any);
+
+    it('drops nulls for optional fields in the wrapped payload', async () => {
+      const inputSchema = makePartialTool().inputSchema as any;
+      const resolved = await inputSchema['~standard'].validate({
+        memory: { people: null, work: { company: 'TechStartup Inc' } },
+      });
+
+      expect('issues' in resolved && resolved.issues).toBeFalsy();
+      expect(resolved.value).toEqual({ memory: { work: { company: 'TechStartup Inc' } } });
+    });
+
+    it('drops nulls for optional fields in the unwrapped payload', async () => {
+      const inputSchema = makePartialTool().inputSchema as any;
+      const resolved = await inputSchema['~standard'].validate({
+        people: null,
+        work: { company: 'TechStartup Inc' },
+      });
+
+      expect('issues' in resolved && resolved.issues).toBeFalsy();
+      expect(resolved.value).toEqual({ memory: { work: { company: 'TechStartup Inc' } } });
+    });
+
+    it('drops nulls for optional fields inside nullable objects and arrays', async () => {
+      const tool = updateWorkingMemoryTool({
+        workingMemory: {
+          enabled: true,
+          schema: z.object({
+            profile: z.object({ nickname: z.string().optional(), city: z.string() }).nullable(),
+            pets: z.array(z.object({ name: z.string(), breed: z.string().optional() })).nullable(),
+          }),
+        },
+      } as any);
+      const resolved = await (tool.inputSchema as any)['~standard'].validate({
+        memory: { profile: { nickname: null, city: 'Vancouver' }, pets: [{ name: 'Rex', breed: null }] },
+      });
+
+      expect('issues' in resolved && resolved.issues).toBeFalsy();
+      expect(resolved.value).toEqual({ memory: { profile: { city: 'Vancouver' }, pets: [{ name: 'Rex' }] } });
+    });
+
+    it('keeps nulls for keys the schema does not declare', async () => {
+      const strictTool = updateWorkingMemoryTool({
+        workingMemory: { enabled: true, schema: z.strictObject({ name: z.string().optional() }) },
+      } as any);
+      const strict = await (strictTool.inputSchema as any)['~standard'].validate({
+        memory: { name: 'Ada', unexpected: null },
+      });
+      expect('issues' in strict && strict.issues).toBeTruthy();
+
+      const recordTool = updateWorkingMemoryTool({
+        workingMemory: { enabled: true, schema: z.record(z.string(), z.string().nullable()) },
+      } as any);
+      const record = await (recordTool.inputSchema as any)['~standard'].validate({
+        memory: { city: null, toString: null },
+      });
+      expect('issues' in record && record.issues).toBeFalsy();
+      expect(record.value).toEqual({ memory: { city: null, toString: null } });
+    });
+  });
+});
+
+describe('deepMergeWorkingMemory undefined padding', () => {
+  it('leaves existing values untouched when the update sends undefined', () => {
+    const existing = { people: ['Alice', 'Bob'], work: { company: 'Old Co' } };
+    const merged = deepMergeWorkingMemory(existing, { people: undefined, work: { company: 'TechStartup Inc' } });
+
+    expect(merged).toEqual({ people: ['Alice', 'Bob'], work: { company: 'TechStartup Inc' } });
   });
 });

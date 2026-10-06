@@ -1,6 +1,6 @@
 ---
 title: "Reference: Run.restart() | Workflows"
-description: Documentation for the `Run.restart()` method in workflows, which restarts an active workflow run that lost connection to the server.
+description: "The .restart() method restarts an active workflow run that lost connection to the server, allowing you to continue execution from the moment it lost connection (the last active step)."
 packages:
   - "@mastra/core"
 ---
@@ -57,6 +57,13 @@ const restartedResult = await run.restart()
     properties: [
       {
         parameters: [
+          {
+            name: 'rootSpanName',
+            type: 'string',
+            isOptional: true,
+            description:
+              "Display name for the root span of this trace, replacing the default `workflow run: '<id>'` or `agent run: '<id>'` name. Use it to tell runs apart in trace lists.",
+          },
           {
             name: 'metadata',
             type: 'Record<string, any>',

@@ -22,6 +22,7 @@ export {
   DEFAULT_GOAL_MAX_RUNS,
   GOAL_SCORE_WAITING,
   GOAL_SCORER_ID,
+  formatGoalBudgetPausedReason,
   resolveGoalStore,
   resolveEffectiveGoalSettings,
   readObjective,
@@ -32,6 +33,8 @@ export {
   type AgentGoalConfigDefaults,
   type ResolvedGoalStore,
 } from './objective';
+
+export { beginGoalActivity, stopGoalActivity, getGoalActivityDurationMs } from './activity';
 
 export { createGoalScorer } from './scorer';
 

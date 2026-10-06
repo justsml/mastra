@@ -41,7 +41,7 @@ export const AllSizes: Story = {
 
 export const OnSurface: Story = {
   render: () => (
-    <div className="flex h-64 w-96 items-center justify-center rounded-lg bg-surface2">
+    <div className="flex h-64 w-96 items-center justify-center rounded-lg bg-background">
       <Logo size="md" animateOnHover />
     </div>
   ),

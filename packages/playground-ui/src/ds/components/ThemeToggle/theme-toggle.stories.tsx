@@ -17,6 +17,9 @@ export default meta;
 type Story = StoryObj<typeof ThemeToggle>;
 
 export const Default: Story = {
+  args: {
+    size: 'md',
+  },
   decorators: [
     Story => (
       <ThemeProvider storageKey="storybook-theme">
@@ -24,6 +27,36 @@ export const Default: Story = {
       </ThemeProvider>
     ),
   ],
+};
+
+export const Small: Story = {
+  args: {
+    size: 'sm',
+  },
+  decorators: [
+    Story => (
+      <ThemeProvider storageKey="storybook-theme-small">
+        <Story />
+      </ThemeProvider>
+    ),
+  ],
+};
+
+export const Sizes: Story = {
+  decorators: [
+    Story => (
+      <ThemeProvider storageKey="storybook-theme-sizes">
+        <Story />
+      </ThemeProvider>
+    ),
+  ],
+  render: () => (
+    <div className="flex items-center gap-4">
+      <ThemeToggle size="sm" />
+      <ThemeToggle size="md" />
+      <ThemeToggle size="lg" />
+    </div>
+  ),
 };
 
 export const Controlled: Story = {

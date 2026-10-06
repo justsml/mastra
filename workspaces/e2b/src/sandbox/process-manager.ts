@@ -5,7 +5,7 @@
  * Wraps the E2B SDK's commands API (background mode, sendStdin, kill, list).
  */
 
-import { ProcessHandle, SandboxProcessManager } from '@mastra/core/workspace';
+import { ProcessHandle, UnsupportedStdinCloseError, SandboxProcessManager } from '@mastra/core/workspace';
 import type { CommandResult, ProcessInfo, SpawnProcessOptions } from '@mastra/core/workspace';
 import type { CommandHandle as E2BCommandHandle, Sandbox } from 'e2b';
 import type { E2BSandbox } from './index';
@@ -27,6 +27,7 @@ class E2BProcessHandle extends ProcessHandle {
   private readonly _e2bHandle: E2BCommandHandle;
   private readonly _sandbox: Sandbox;
   private readonly _startTime: number;
+  private readonly _stdinMode: SpawnProcessOptions['stdinMode'];
 
   constructor(e2bHandle: E2BCommandHandle, sandbox: Sandbox, startTime: number, options?: SpawnProcessOptions) {
     super(options);
@@ -34,6 +35,7 @@ class E2BProcessHandle extends ProcessHandle {
     this._e2bHandle = e2bHandle;
     this._sandbox = sandbox;
     this._startTime = startTime;
+    this._stdinMode = options?.stdinMode;
   }
 
   /** Delegates to E2B's handle so exitCode reflects server-side state without needing wait(). */
@@ -56,19 +58,31 @@ class E2BProcessHandle extends ProcessHandle {
       // Some E2B errors also carry stdout/stderr in error.result
       const errorObj = error as {
         exitCode?: number;
-        result?: { exitCode: number; stdout: string; stderr: string };
+        error?: string;
+        stdout?: string;
+        stderr?: string;
+        result?: { exitCode: number; error?: string; stdout: string; stderr: string };
       };
       const exitCode = errorObj.result?.exitCode ?? errorObj.exitCode ?? this.exitCode ?? 1;
 
-      // Emit any output attached to the error (E2B sometimes puts it in .result)
-      if (errorObj.result?.stdout) this.emitStdout(errorObj.result.stdout);
-      if (errorObj.result?.stderr) this.emitStderr(errorObj.result.stderr);
+      // If E2B skipped the stream callbacks, retain and dispatch its attached
+      // output through the normal path so maxRetainedBytes still applies.
+      const attachedStdout = errorObj.result?.stdout || errorObj.stdout;
+      const attachedStderr = errorObj.result?.stderr || errorObj.stderr;
+      if (!this.stdout && !this.stdoutTruncated && attachedStdout) this.emitStdout(attachedStdout);
+      if (!this.stderr && !this.stderrTruncated && attachedStderr) this.emitStderr(attachedStderr);
+
+      const stdout = this.stdout;
+      const stderr = this.stderr;
+      const terminalError =
+        errorObj.result?.error || errorObj.error || (error instanceof Error ? error.message : String(error));
+      const errorDetail = terminalError && !stderr.includes(terminalError) ? `Error: ${terminalError}` : '';
 
       return {
         success: false,
         exitCode,
-        stdout: this.stdout,
-        stderr: this.stderr || (error instanceof Error ? error.message : String(error)),
+        stdout,
+        stderr: [stderr, errorDetail].filter(Boolean).join('\n'),
         executionTimeMs: Date.now() - this._startTime,
       };
     }
@@ -83,7 +97,18 @@ class E2BProcessHandle extends ProcessHandle {
     if (this.exitCode !== undefined) {
       throw new Error(`Process ${this.pid} has already exited with code ${this.exitCode}`);
     }
+    // Spawned with `stdinMode: 'ignore'`, so the command was started with
+    // stdin detached and there is nothing to write to. Match the local and
+    // Docker handles, which reject rather than posting an input RPC to a
+    // process that has no stdin channel.
+    if (this._stdinMode === 'ignore') {
+      throw new Error(`Process ${this.pid} was not started with stdin support`);
+    }
     await this._sandbox.commands.sendStdin(this._e2bHandle.pid, data);
+  }
+
+  async closeStdin(): Promise<void> {
+    throw new UnsupportedStdinCloseError('E2B SDK does not expose a way to close stdin for a running command');
   }
 }
 
@@ -95,13 +120,25 @@ class E2BProcessHandle extends ProcessHandle {
  * E2B implementation of SandboxProcessManager.
  * Uses the E2B SDK's commands.run() with background: true.
  */
+export interface E2BProcessManagerOptions {
+  /** Default timeout in milliseconds for commands that don't specify one. */
+  defaultTimeout?: number;
+}
+
 export class E2BProcessManager extends SandboxProcessManager<E2BSandbox> {
+  private readonly _defaultTimeout?: number;
+
+  constructor(opts: E2BProcessManagerOptions = {}) {
+    super();
+    this._defaultTimeout = opts.defaultTimeout;
+  }
+
   async spawn(command: string, options: SpawnProcessOptions = {}): Promise<ProcessHandle> {
     return this.sandbox.retryOnDead(async () => {
       const e2b = this.sandbox.e2b;
 
-      // Merge default env with per-spawn env
-      const mergedEnv = { ...this.env, ...options.env };
+      // The base spawn wrapper already merged the sandbox env into options.env
+      const mergedEnv = { ...options.env };
       const envs = Object.fromEntries(
         Object.entries(mergedEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
       );
@@ -113,10 +150,17 @@ export class E2BProcessManager extends SandboxProcessManager<E2BSandbox> {
 
       const e2bHandle = await e2b.commands.run(command, {
         background: true,
-        stdin: true,
-        cwd: options.cwd,
+        // `stdinMode: 'ignore'` closes stdin at spawn so a command that reads it
+        // (a bare `rg`/`grep`/`cat` with no path argument) sees EOF and exits
+        // instead of blocking forever. Callers that drive stdin (`spawn` for an
+        // LSP server) keep the default attached stdin.
+        stdin: options.stdinMode !== 'ignore',
+        cwd: options.cwd ?? this.sandbox.workingDirectory,
         envs,
-        timeoutMs: options.timeout,
+        // Without this the E2B SDK falls back to its own 60s connection
+        // deadline, which bounds the whole streaming command lifetime and kills
+        // any command that runs longer than a minute.
+        timeoutMs: options.timeout ?? this._defaultTimeout,
         onStdout: (data: string) => handle.emitStdout(data),
         onStderr: (data: string) => handle.emitStderr(data),
       });

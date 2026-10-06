@@ -51,14 +51,15 @@ export function MemoryStudioPanel({
   const [manualOMRecordId, setManualOMRecordId] = useState<string | null>(null);
 
   const markers = useMemo(() => extractOmMarkers(messages), [messages]);
-  const tDomain = useMemo(() => {
-    if (messages.length === 0) return { tMin: 0, tMax: 1 };
-    return timestampsToTDomain(messages.map(m => new Date(m.createdAt).toISOString()));
-  }, [messages]);
+  // timestampsToTDomain already returns the unit domain for an empty list.
+  const tDomain = useMemo(
+    () => timestampsToTDomain(messages.map(m => new Date(m.createdAt).toISOString())),
+    [messages],
+  );
   const windowState = useMemo(() => getLatestThreadContextWindowState({ markers, omRecords }), [markers, omRecords]);
 
-  const memoryTokens = contextWindow?.memoryTokens ?? windowState?.memoryTokens;
-  const memoryThreshold = contextWindow?.memoryThreshold ?? windowState?.memoryThreshold;
+  const memoryTokens = contextWindow?.memoryTokens ?? windowState.memoryTokens;
+  const memoryThreshold = contextWindow?.memoryThreshold ?? windowState.memoryThreshold;
 
   // Zoom range (epoch ms) is owned here so it can both scope the FlameGraph
   // charts and filter the observation list. It resets to the full domain
@@ -93,13 +94,13 @@ export function MemoryStudioPanel({
 
   return (
     <div className="flex size-full flex-col overflow-hidden">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border1 px-3 py-2.5">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
         <Button type="button" variant="ghost" size="icon-sm" tooltip="Back to memory" onClick={() => onClose?.()}>
           <ArrowLeftIcon />
         </Button>
-        <span className="flex min-w-0 items-center gap-1.5 text-neutral6">
+        <span className="flex min-w-0 items-center gap-1.5 text-foreground">
           <MemoryIcon className="size-4 shrink-0" />
-          <Txt as="span" variant="ui-sm" className="font-medium">
+          <Txt as="span" variant="column">
             Observational memory
           </Txt>
         </span>
@@ -121,10 +122,10 @@ export function MemoryStudioPanel({
               isLoading={isLoading}
             />
           </div>
-          <div className="border-t border-border1">
+          <div className="border-t border-border">
             <ThreadContextProgress
-              messageTokens={contextWindow?.messageTokens ?? windowState?.messageTokens}
-              messageThreshold={contextWindow?.messageThreshold ?? windowState?.messageThreshold}
+              messageTokens={contextWindow?.messageTokens ?? windowState.messageTokens}
+              messageThreshold={contextWindow?.messageThreshold ?? windowState.messageThreshold}
               memoryTokens={memoryTokens}
               memoryThreshold={memoryThreshold}
               memoryLabel="Observations"

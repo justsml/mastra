@@ -33,6 +33,7 @@
  */
 
 import { parseSqlIdentifier } from '@mastra/core/utils';
+import { parseSchemaName } from '../../../../shared/schema-name';
 import {
   buildColumnDefinitions,
   FEEDBACK_EVENT_COLUMNS,
@@ -78,21 +79,21 @@ export const SIGNAL_TIME_COLUMN: Record<(typeof ALL_SIGNAL_TABLES)[number], stri
 
 /** Returns a fully-qualified, double-quoted table name. */
 export function qualifiedTable(schema: string, table: string): string {
-  const s = parseSqlIdentifier(schema, 'schema name');
+  const s = parseSchemaName(schema);
   const t = parseSqlIdentifier(table, 'table name');
   return `"${s}"."${t}"`;
 }
 
 /** Returns a parsed, quoted, schema-prefixed object name (constraint, index, etc.). */
 export function qualifiedName(schema: string, name: string): string {
-  const s = parseSqlIdentifier(schema, 'schema name');
+  const s = parseSchemaName(schema);
   const n = parseSqlIdentifier(name, 'object name');
   return `"${s}"."${n}"`;
 }
 
 /** Schema CREATE. Safe to run repeatedly before table DDL. */
 export function schemaDDL(schema: string): string {
-  const s = parseSqlIdentifier(schema, 'schema name');
+  const s = parseSchemaName(schema);
   return `CREATE SCHEMA IF NOT EXISTS "${s}"`;
 }
 
@@ -306,6 +307,11 @@ function tableIndexes(): IndexSpec[] {
       columns: '("entityType", "entityId", "timestamp" DESC)',
     },
     { name: 'mastra_score_events_tags_gin', table: TABLE_SCORE_EVENTS, columns: '("tags")', using: 'gin' },
+    {
+      name: 'mastra_score_events_scoreid_cursor_idx',
+      table: TABLE_SCORE_EVENTS,
+      columns: '("scoreId", "cursorId" DESC)',
+    },
     { name: 'mastra_score_events_cursor_idx', table: TABLE_SCORE_EVENTS, columns: '("xactId", "cursorId")' },
 
     // feedback_events
@@ -354,6 +360,35 @@ export function allTableDDL(schema: string, mode: TableDDLMode): string[] {
     discoveryTableDDL(schema),
   ];
 }
+
+/**
+ * Additive column migrations for tables created by an older version of this
+ * schema. `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new
+ * columns have to be added out of band.
+ *
+ * `ALTER TABLE` takes an AccessExclusiveLock on the partitioned parent, so
+ * callers must check {@link columnExistsSQL} first and only run the statement
+ * when the column is genuinely missing. On Postgres 11+ the non-volatile
+ * default does not rewrite the table, and the ALTER cascades to partitions.
+ */
+export function additiveColumns(schema: string): { table: string; column: string; ddl: string }[] {
+  return [
+    {
+      table: TABLE_SPAN_EVENTS,
+      column: 'isPending',
+      ddl: `ALTER TABLE ${qualifiedTable(schema, TABLE_SPAN_EVENTS)} ADD COLUMN IF NOT EXISTS "isPending" boolean NOT NULL DEFAULT false`,
+    },
+    {
+      table: TABLE_FEEDBACK_EVENTS,
+      column: 'reviewStatus',
+      ddl: `ALTER TABLE ${qualifiedTable(schema, TABLE_FEEDBACK_EVENTS)} ADD COLUMN IF NOT EXISTS "reviewStatus" text NOT NULL DEFAULT 'needs-review'`,
+    },
+  ];
+}
+
+/** Existence probe for an additive column. Params: schema, table, column. */
+export const columnExistsSQL = `SELECT 1 FROM information_schema.columns
+   WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`;
 
 /** Index CREATEs. Safe to run repeatedly. */
 export function allIndexDDL(schema: string): string[] {

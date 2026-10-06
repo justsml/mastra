@@ -1,8 +1,7 @@
+import { useBrowserSessionProbe, useCloseBrowser } from '@mastra/react/hooks/agents';
 import { useCallback, useState, useMemo, useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
-import { useBrowserSessionProbe } from '../hooks/use-browser-session-probe';
 import type { StreamStatus } from '../hooks/use-browser-stream';
-import { useCloseBrowser } from '../hooks/use-close-browser';
 import { createBrowserFrameStore } from './browser-frame-store';
 import { BrowserFrameStoreContext, BrowserSessionContext } from './browser-session-context';
 import type { BrowserViewMode } from './browser-session-context';
@@ -34,9 +33,12 @@ export interface BrowserSessionProviderProps {
  * keep the surrounding UI from re-rendering at frame rate.
  *
  * 1. **`enabled` gate (client-side, cheap pre-filter).** Callers pass
- *    `enabled={agent.browserTools?.length > 0}`. When false, the probe never
- *    fires and the WS never opens. This is the cheap "we already know this
- *    agent has no browser, don't even ask the server" check.
+ *    `enabled={Boolean(agent?.hasBrowser ?? agent?.browserTools?.length)}`.
+ *    `hasBrowser` covers both agent-level SDK browsers and workspace-level CLI
+ *    browsers (which expose no SDK tools); the tool-count fallback keeps older
+ *    servers working. When false, the probe never fires and the WS never
+ *    opens. This is the cheap "we already know this agent has no browser,
+ *    don't even ask the server" check.
  *
  * 2. **Probe (server-side, authoritative).** When enabled, the provider asks
  *    the server `{ hasSession, screencastAvailable }` once. `tool-fallback.tsx`
@@ -78,7 +80,11 @@ export function BrowserSessionProvider({ children, agentId, threadId, enabled = 
   // `setQueriesData` when a browser_* tool transitions, so there's no
   // polling — the cache update flips `serverHasSession` to true the
   // instant the first browser tool call's status is known.
-  const { data: probe } = useBrowserSessionProbe({ agentId, threadId, enabled });
+  const { data: probe } = useBrowserSessionProbe({
+    agentId: agentId,
+    threadId: threadId,
+    queryOptions: { enabled: enabled && Boolean(agentId) },
+  });
   const screencastAvailable = probe?.screencastAvailable ?? false;
   const serverHasSession = probe?.hasSession ?? false;
 

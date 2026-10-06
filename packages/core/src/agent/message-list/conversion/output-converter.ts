@@ -2,13 +2,26 @@ import { convertToCoreMessages as convertToCoreMessagesV4 } from '@internal/ai-s
 import type { CoreMessage as CoreMessageV4, UIMessage as UIMessageV4 } from '@internal/ai-sdk-v4';
 import * as AIV5 from '@internal/ai-sdk-v5';
 
+import { deepEqual } from '../../../utils/deep-equal';
 import { AIV4Adapter, AIV5Adapter, AIV6Adapter } from '../adapters';
 import type { AdapterContext } from '../adapters';
 import { TypeDetector } from '../detection/TypeDetector';
+import { categorizeFileData } from '../prompt/image-utils';
 import type { MastraDBMessage, MessageSource } from '../state/types';
 import type { AIV5Type, AIV6Type } from '../types';
-import { ensureAnthropicCompatibleMessages, sanitizeOrphanedToolPairs } from '../utils/provider-compat';
-import { getResponseProviderItemKey } from '../utils/response-item-metadata';
+import {
+  ensureAnthropicCompatibleMessages,
+  pairOrphanedToolCalls,
+  sanitizeOrphanedToolPairs,
+} from '../utils/provider-compat';
+import {
+  getResponseProviderItemId,
+  getResponseProviderItemKey,
+  getResponseResultItemId,
+  RESPONSE_ITEM_ID_PROVIDERS,
+  RESPONSE_RESULT_ITEM_ID_KEY,
+} from '../utils/response-item-metadata';
+import { normalizeToolOutput } from '../utils/unwrap-legacy-tool-output';
 
 /**
  * Merges text parts that share the same OpenAI-compatible itemId.
@@ -82,6 +95,116 @@ function mergeTextPartsWithDuplicateItemIds<T extends { type: string }>(parts: T
 }
 
 /**
+ * Detects a hosted OpenAI `tool_search` part that can no longer be replayed.
+ *
+ * A hosted (provider-executed) `tool_search` call only replays as a pair of
+ * `item_reference`s built from its Responses item ids. When those ids are
+ * gone (e.g. a UI round-trip stripped providerMetadata), the provider instead
+ * rebuilds a full `tool_search_call` without its required `arguments` and an
+ * orphaned `function_call_output` — both rejected by the API. Such parts are
+ * dropped from prompts; the model re-discovers tools on the next turn.
+ *
+ * A COMPLETED hosted search needs both ids — the call's and the output's. History
+ * persisted before the two were kept apart carries only one (whichever half wrote
+ * last), which conversion then copies onto both model parts, producing the same
+ * `item_reference` twice ("Duplicate item found"). One id is therefore as
+ * unreplayable as none. An in-flight call has no output yet, so its call id alone
+ * is complete.
+ *
+ * Client-executed `tool_search` (non-null `call_id` in the input) replays as
+ * a plain function call and is never dropped here.
+ */
+function isUnreplayableHostedToolSearchPart(part: AIV5Type.ToolUIPart): boolean {
+  if (AIV5.getToolName(part) !== 'tool_search') return false;
+
+  // Only a provider-executed search replays by item reference. A user-defined tool
+  // that happens to be named `tool_search` is an ordinary client function call on
+  // every provider, so it must survive even though it carries no item ids.
+  if (!part.providerExecuted) return false;
+
+  const callProviderMetadata =
+    'callProviderMetadata' in part ? (part.callProviderMetadata as Record<string, unknown> | undefined) : undefined;
+  const callItem = getResponseProviderItemId(callProviderMetadata);
+  if (callItem) {
+    // Both completed states emit a tool-call AND a tool-result, each carrying the
+    // part's call metadata, so a lone id lands on both. An in-flight call emits no
+    // result part, so its call id alone is complete.
+    const isCompleted = part.state === 'output-available' || part.state === 'output-error';
+    // Read the result id from the same namespace the call id came from -
+    // getResponseProviderItemId picks one namespace, and a pair stored under a
+    // DIFFERENT namespace does not make this id replayable.
+    if (!isCompleted || getResponseResultItemId(callProviderMetadata, callItem.provider)) return false;
+  }
+
+  const input = part.input;
+  if (input && typeof input === 'object' && typeof (input as Record<string, unknown>).call_id === 'string') {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Splits merged Responses item ids back onto their own tool parts.
+ *
+ * A stored tool part holds the result's item id under `resultItemId` when it
+ * differs from the call's (see {@link RESPONSE_RESULT_ITEM_ID_KEY}), and UI →
+ * model conversion copies the same metadata onto both the tool-call and the
+ * tool-result part. Rewrite each side to carry only its own id — call keeps
+ * `itemId`, result gets `resultItemId` as its `itemId` — so the provider emits
+ * two distinct `item_reference`s instead of the same one twice ("Duplicate
+ * item found").
+ */
+function splitResponsesToolItemReferences(modelMessages: AIV5Type.ModelMessage[]): AIV5Type.ModelMessage[] {
+  return modelMessages.map(msg => {
+    if (typeof msg.content === 'string') return msg;
+
+    let modified = false;
+    const content = msg.content.map(part => {
+      if (part.type !== 'tool-call' && part.type !== 'tool-result') return part;
+      const providerOptions = (part as { providerOptions?: Record<string, Record<string, unknown>> }).providerOptions;
+      if (!providerOptions) return part;
+
+      let rewritten: Record<string, Record<string, unknown>> | undefined;
+      const split = new Set<string>();
+      for (const provider of RESPONSE_ITEM_ID_PROVIDERS) {
+        const namespace = providerOptions[provider];
+        if (!namespace) continue;
+        const resultItemId = namespace[RESPONSE_RESULT_ITEM_ID_KEY];
+        if (typeof resultItemId !== 'string') continue;
+
+        const { [RESPONSE_RESULT_ITEM_ID_KEY]: _removed, ...rest } = namespace;
+        split.add(provider);
+        rewritten = {
+          ...(rewritten ?? providerOptions),
+          [provider]: part.type === 'tool-result' ? { ...rest, itemId: resultItemId } : rest,
+        };
+      }
+      if (!rewritten) return part;
+
+      // A namespace with no `resultItemId` has one id for both halves of the
+      // pair. On the call part that is correct; on the result part it is the
+      // call's id a second time ("Duplicate item found"), so drop it and let
+      // the split namespace carry the reference.
+      if (part.type === 'tool-result') {
+        for (const provider of RESPONSE_ITEM_ID_PROVIDERS) {
+          if (split.has(provider)) continue;
+          const leftover: Record<string, unknown> | undefined = rewritten[provider];
+          if (typeof leftover?.itemId !== 'string') continue;
+          const { itemId: _duplicate, ...withoutItemId } = leftover;
+          rewritten = { ...rewritten, [provider]: withoutItemId };
+        }
+      }
+
+      modified = true;
+      return { ...part, providerOptions: rewritten } as typeof part;
+    });
+
+    return modified ? ({ ...msg, content } as AIV5Type.ModelMessage) : msg;
+  });
+}
+
+/**
  * Sanitizes AIV4 UI messages by filtering out incomplete tool calls.
  * Removes messages with empty parts arrays after sanitization.
  */
@@ -89,13 +212,19 @@ export function sanitizeAIV4UIMessages(messages: UIMessageV4[]): UIMessageV4[] {
   const msgs = messages
     .map(m => {
       if (m.parts.length === 0) return false;
-      const safeParts = m.parts.filter(
-        p =>
+      const safeParts = m.parts.filter(p => {
+        // Mastra-only record of a terminal failure. It exists for DB/UI history
+        // and must never reach a provider. Cast because the v4 UI part union has
+        // no `error` member even though the adapter passes the part through.
+        if ((p as { type: string }).type === 'error') return false;
+
+        return (
           p.type !== `tool-invocation` ||
           // calls and partial-calls should be updated to be results at this point
           // if they haven't we can't send them back to the llm and need to remove them.
-          (p.toolInvocation.state !== `call` && p.toolInvocation.state !== `partial-call`),
-      );
+          (p.toolInvocation.state !== `call` && p.toolInvocation.state !== `partial-call`)
+        );
+      });
 
       // fully remove this message if it has an empty parts array after stripping out incomplete tool calls.
       if (!safeParts.length) return false;
@@ -122,7 +251,7 @@ export function sanitizeAIV4UIMessages(messages: UIMessageV4[]): UIMessageV4[] {
  */
 export function sanitizeV5UIMessages(
   messages: AIV5Type.UIMessage[],
-  filterIncompleteToolCalls = false,
+  mode: ToolCallConversionMode = 'response',
 ): AIV5Type.UIMessage[] {
   // Precompute the index of the last user message. A deferred provider-executed
   // tool call (e.g. Anthropic non-deterministically defers web_search across
@@ -151,6 +280,15 @@ export function sanitizeV5UIMessages(
         return false;
       }
 
+      // Filter out Mastra-only `error` parts (persisted terminal-failure records).
+      // Like data-* parts they are not provider content: an error-only assistant
+      // message therefore drops out below instead of reaching the model as an
+      // empty turn. Cast because the v5 UI part union has no `error` member even
+      // though the adapter passes the part through.
+      if ((p as { type: string }).type === 'error') {
+        return false;
+      }
+
       // Filter out empty text parts to handle legacy data from before this filtering was implemented.
       // For assistant messages, preserve empty text parts if they are the only parts (placeholder messages).
       // For user messages, always filter them out — Anthropic rejects empty user text content blocks.
@@ -170,16 +308,27 @@ export function sanitizeV5UIMessages(
       // When sending messages TO the LLM: keep completed tool calls and provider-executed tools.
       // Filter out incomplete client-side tool calls (input-available without providerExecuted)
       // and input-streaming states.
-      if (filterIncompleteToolCalls) {
+      if (mode !== 'response') {
+        // Hosted tool_search parts whose Responses item ids were lost cannot be
+        // replayed in any state — drop them before the state-based checks below.
+        if (isUnreplayableHostedToolSearchPart(p)) return false;
+
         // Completed tools (client or provider) — keep them
         if (p.state === 'output-available' || p.state === 'output-error') return true;
-        // Provider-executed tools may be deferred by the provider (e.g. Anthropic non-deterministically
-        // defers web_search when mixed with client tool calls). Keep these so the provider API sees
-        // the server_tool_use block on the next request — but ONLY on the most recent surviving
-        // assistant message. On any earlier assistant turn an unresolved provider-executed call is
-        // an orphan (provider dropped the result chunk, or the run aborted mid-stream) and must be
-        // dropped to keep the tool-call/tool-result invariant required by provider APIs. See #15668, #14148.
-        if (p.state === 'input-available' && p.providerExecuted && assistantTurnStillOpen) return true;
+        if (p.state === 'input-available') {
+          // Provider-executed tools may be deferred by the provider (e.g. Anthropic non-deterministically
+          // defers web_search when mixed with client tool calls). Keep these so the provider API sees
+          // the server_tool_use block on the next request — but ONLY on the most recent surviving
+          // assistant message. On any earlier assistant turn an unresolved provider-executed call is
+          // an orphan (provider dropped the result chunk, or the run aborted mid-stream) and must be
+          // dropped to keep the tool-call/tool-result invariant required by provider APIs. See #15668, #14148.
+          // This holds whichever way the caller configured suspended tool calls — the provider decides
+          // when it resumes its own call, not the caller.
+          if (p.providerExecuted) return assistantTurnStillOpen;
+          // Client-side suspended calls are kept only when the caller asked to see them. They are
+          // paired with a pending result downstream so the prompt stays valid.
+          return mode === 'prompt-with-suspended';
+        }
         return false;
       }
 
@@ -224,19 +373,10 @@ export function sanitizeV5UIMessages(
           if (AIV5.isToolUIPart(part) && part.state === 'output-available') {
             return {
               ...part,
-              output: (() => {
-                const o = part.output;
-                if (o == null || typeof o !== 'object') return o;
-                const obj = o as Record<string, unknown>;
-                // Preserve { type: 'content', value: [...] } — this is the AI SDK's
-                // native multimodal tool result shape. Unwrapping it here causes
-                // convertToModelMessages to receive a raw array which gets stringified.
-                // See: https://github.com/mastra-ai/mastra/issues/17876
-                if (obj.type === 'content' && Array.isArray(obj.value)) return o;
-                // For other wrapped shapes (legacy), unwrap as before
-                if ('value' in obj) return obj.value;
-                return o;
-              })(),
+              // Preserve the AI SDK's native multimodal content wrapper here.
+              // convertToModelMessages stringifies the raw array if it is unwrapped.
+              // See: https://github.com/mastra-ai/mastra/issues/17876
+              output: normalizeToolOutput(part.output, { unwrapContent: false }).output,
             };
           }
           return part;
@@ -289,9 +429,65 @@ export function addStartStepPartsForAIV5(messages: AIV5Type.UIMessage[]): AIV5Ty
 
 /**
  * Converts AIV4 UI messages to AIV4 Core messages.
+ *
+ * Provider file IDs (e.g. OpenAI Files API "file-...") stored in
+ * `experimental_attachments` would make AI SDK v4's internal `attachmentsToParts`
+ * throw `Invalid URL: file-...` inside `convertToCoreMessages`. Strip them before
+ * conversion and re-append them as file parts on the resulting user core message
+ * so the IDs survive untouched.
  */
 export function aiV4UIMessagesToAIV4CoreMessages(messages: UIMessageV4[]): CoreMessageV4[] {
-  return convertToCoreMessagesV4(sanitizeAIV4UIMessages(messages));
+  const sanitized = sanitizeAIV4UIMessages(messages);
+
+  type AttachmentV4 = NonNullable<UIMessageV4['experimental_attachments']>[number];
+  // Keyed by the user message's position among user messages: each user UI message
+  // converts to exactly one user core message, in order.
+  const fileIdAttachmentsByUserIndex = new Map<number, AttachmentV4[]>();
+  let userIndex = 0;
+
+  const prepared = sanitized.map(m => {
+    if (m.role !== 'user') return m;
+    const currentUserIndex = userIndex++;
+
+    if (!m.experimental_attachments?.length) return m;
+
+    const fileIdAttachments = m.experimental_attachments.filter(
+      a => categorizeFileData(a.url, a.contentType).type === 'providerFileId',
+    );
+    if (!fileIdAttachments.length) return m;
+
+    fileIdAttachmentsByUserIndex.set(currentUserIndex, fileIdAttachments);
+    const remaining = m.experimental_attachments.filter(a => !fileIdAttachments.includes(a));
+    return {
+      ...m,
+      experimental_attachments: remaining.length ? remaining : undefined,
+    };
+  });
+
+  const coreMessages = convertToCoreMessagesV4(prepared);
+  if (!fileIdAttachmentsByUserIndex.size) return coreMessages;
+
+  let coreUserIndex = 0;
+  return coreMessages.map(coreMessage => {
+    if (coreMessage.role !== 'user') return coreMessage;
+    const fileIdAttachments = fileIdAttachmentsByUserIndex.get(coreUserIndex++);
+    if (!fileIdAttachments) return coreMessage;
+
+    const fileParts = fileIdAttachments.map(a => ({
+      type: 'file' as const,
+      data: a.url,
+      mimeType: a.contentType || 'application/octet-stream',
+    }));
+    const existingContent =
+      typeof coreMessage.content === 'string'
+        ? [{ type: 'text' as const, text: coreMessage.content }]
+        : coreMessage.content;
+
+    return {
+      ...coreMessage,
+      content: [...existingContent, ...fileParts],
+    };
+  });
 }
 
 /**
@@ -342,6 +538,8 @@ function collectRawToolResultOutputs(dbMessages: MastraDBMessage[]): Map<string,
 
     for (const part of message.content.parts) {
       if (part.type !== 'tool-invocation' || part.toolInvocation?.state !== 'result') continue;
+      const mastraMetadata = part.providerMetadata?.mastra;
+      if (mastraMetadata && typeof mastraMetadata === 'object' && 'modelOutput' in mastraMetadata) continue;
       outputs.set(part.toolInvocation.toolCallId, part.toolInvocation.result);
     }
   }
@@ -352,7 +550,7 @@ function isDefaultToolResultOutput(output: unknown, rawOutput: unknown): boolean
   if (!output || typeof output !== 'object') return false;
   const typedOutput = output as Record<string, unknown>;
   if (typedOutput.type !== 'json') return false;
-  return JSON.stringify(typedOutput.value) === JSON.stringify(rawOutput);
+  return typedOutput.value === rawOutput || deepEqual(typedOutput.value, rawOutput);
 }
 
 function applyMcpContentToolResultOutputs(
@@ -368,10 +566,18 @@ function applyMcpContentToolResultOutputs(
     let modified = false;
     const content = message.content.map(part => {
       if (part.type !== 'tool-result' || !rawOutputs.has(part.toolCallId)) return part;
+      if (part.output?.type !== 'json') return part;
       const rawOutput = rawOutputs.get(part.toolCallId);
-      if (!isDefaultToolResultOutput(part.output, rawOutput)) return part;
-      const converted = convertMcpContentToolResultOutput(rawOutput);
-      if (!converted) return part;
+      let converted: ReturnType<typeof convertMcpContentToolResultOutput>;
+      try {
+        converted = convertMcpContentToolResultOutput(rawOutput);
+        if (!converted) return part;
+        if (!isDefaultToolResultOutput(part.output, rawOutput)) return part;
+      } catch {
+        // MCP content may contain values that cannot be serialized or structurally compared.
+        // Preserve the original JSON output when the optional conversion cannot complete.
+        return part;
+      }
       modified = true;
       return { ...part, output: converted } as typeof part;
     });
@@ -430,19 +636,60 @@ function restoreAssistantFileProviderMetadata(
 }
 
 /**
+ * How suspended (result-less) tool calls are handled when converting to model messages.
+ *
+ * - `response`: messages coming FROM the LLM. Suspended calls are kept so they stay in
+ *   message history, and no pairing is enforced — nothing here is sent to a provider.
+ * - `prompt`: messages going TO the LLM. Suspended calls are dropped.
+ * - `prompt-with-suspended`: messages going TO the LLM with suspended calls kept visible to
+ *   the agent. Each is paired with a pending result so the prompt stays valid.
+ *
+ * The last two both submit to a provider, so both enforce tool-call/tool-result pairing.
+ * That requirement belongs to the provider protocol, not to the caller's preference.
+ */
+export type ToolCallConversionMode = 'response' | 'prompt' | 'prompt-with-suspended';
+
+/**
+ * A step that dies after the model starts thinking but before the reasoning
+ * signature arrives leaves a step block holding only unsigned reasoning.
+ * Providers that require signed thinking (Anthropic, Bedrock) drop such parts,
+ * sending `content: []` and failing every later turn with a 400 (#24558).
+ */
+const REPLAYABLE_REASONING_KEYS = [
+  'signature',
+  'redactedData',
+  'itemId',
+  'reasoningEncryptedContent',
+  'thoughtSignature',
+];
+
+function hasReplayableReasoningMetadata(providerOptions: AIV5Type.ProviderMetadata | undefined): boolean {
+  return Object.values(providerOptions ?? {}).some(
+    value => !!value && typeof value === 'object' && REPLAYABLE_REASONING_KEYS.some(key => key in value),
+  );
+}
+
+function isUnforwardableReasoningOnlyMessage(message: AIV5Type.ModelMessage): boolean {
+  if (message.role !== 'assistant' || !Array.isArray(message.content) || message.content.length === 0) return false;
+  return message.content.every(
+    part => part.type === 'reasoning' && !hasReplayableReasoningMetadata(part.providerOptions),
+  );
+}
+
+/**
  * Converts AIV5 UI messages to AIV5 Model messages.
  * Handles sanitization, step-start insertion, provider options restoration, and Anthropic compatibility.
  *
  * @param messages - AIV5 UI messages to convert
  * @param dbMessages - MastraDB messages used to look up tool call args for Anthropic compatibility
- * @param filterIncompleteToolCalls - Whether to filter out incomplete tool calls
+ * @param mode - How to handle suspended tool calls
  */
 export function aiV5UIMessagesToAIV5ModelMessages(
   messages: AIV5Type.UIMessage[],
   dbMessages: MastraDBMessage[],
-  filterIncompleteToolCalls = false,
+  mode: ToolCallConversionMode = 'response',
 ): AIV5Type.ModelMessage[] {
-  const sanitized = sanitizeV5UIMessages(messages, filterIncompleteToolCalls);
+  const sanitized = sanitizeV5UIMessages(messages, mode);
   const preprocessed = addStartStepPartsForAIV5(sanitized);
 
   // Convert per UI message: an assistant turn with a tool call splits into
@@ -471,16 +718,27 @@ export function aiV5UIMessagesToAIV5ModelMessages(
       }
     }
 
-    converted.push(...produced);
+    for (const message of produced) {
+      if (mode !== 'response' && isUnforwardableReasoningOnlyMessage(message)) continue;
+      converted.push(message);
+    }
   }
 
-  const withFileMetadata = restoreAssistantFileProviderMetadata(converted, preprocessed);
+  const withSplitItemReferences = splitResponsesToolItemReferences(converted);
+  const withFileMetadata = restoreAssistantFileProviderMetadata(withSplitItemReferences, preprocessed);
   const withMcpContentOutputs = applyMcpContentToolResultOutputs(withFileMetadata, dbMessages);
 
   // Add input field to tool-result parts for Anthropic API compatibility (fixes issue #11376)
   const anthropicCompat = ensureAnthropicCompatibleMessages(withMcpContentOutputs, dbMessages);
 
-  return filterIncompleteToolCalls ? sanitizeOrphanedToolPairs(anthropicCompat) : anthropicCompat;
+  switch (mode) {
+    case 'prompt':
+      return sanitizeOrphanedToolPairs(anthropicCompat);
+    case 'prompt-with-suspended':
+      return pairOrphanedToolCalls(anthropicCompat);
+    default:
+      return anthropicCompat;
+  }
 }
 
 /**

@@ -1,10 +1,12 @@
 import { Container } from '@earendil-works/pi-tui';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { DEFAULT_RENDER_COALESCE_MS } from '../../render-scheduler.js';
 import {
   clearPendingShellOutputs,
   clearToolInputParsers,
   handleShellOutput,
+  handleToolApprovalRequired,
   handleToolEnd,
   handleToolInputDelta,
   handleToolInputEnd,
@@ -20,7 +22,7 @@ async function flushParserMicrotasks(): Promise<void> {
 
 async function flushParser(): Promise<void> {
   await flushParserMicrotasks();
-  await new Promise(resolve => setTimeout(resolve, 100));
+  await new Promise(resolve => setTimeout(resolve, DEFAULT_RENDER_COALESCE_MS + 20));
 }
 
 function createShellOutputContext() {
@@ -108,7 +110,68 @@ describe('tool event handlers', () => {
 
     expect(appendStreamingOutput).toHaveBeenCalledWith('hello world');
     expect(updateResult).toHaveBeenCalled();
+    expect(ctx.state.pendingTools.has('call-1')).toBe(false);
     expect(requestRender).toHaveBeenCalled();
+  });
+
+  it('keeps a deferred background tool row pending until its authoritative result arrives', () => {
+    const { ctx, updateResult } = createShellOutputContext();
+    ctx.state.options = { backgroundToolsEnabled: true };
+
+    handleToolEnd(
+      ctx,
+      'call-1',
+      'Background task started. Task ID: task-1. The tool "view" is running in the background.',
+      false,
+      { mastra: { backgroundTask: { taskId: 'task-1', status: 'running' } } },
+    );
+
+    expect(updateResult).toHaveBeenCalledWith(
+      {
+        content: [
+          {
+            type: 'text',
+            text: 'Background task started. Task ID: task-1. The tool "view" is running in the background.',
+          },
+        ],
+        isError: false,
+      },
+      true,
+    );
+    expect(ctx.state.pendingTools.has('call-1')).toBe(true);
+
+    handleToolEnd(ctx, 'call-1', { content: 'package contents' }, false);
+
+    expect(updateResult).toHaveBeenLastCalledWith(
+      { content: [{ type: 'text', text: 'package contents' }], isError: false },
+      false,
+    );
+    expect(ctx.state.pendingTools.has('call-1')).toBe(false);
+  });
+
+  it('inserts task-tool errors before streaming output without invalidating completed chat children', () => {
+    const completed = new Container();
+    const streaming = new Container();
+    const component = { updateResult: vi.fn() };
+    const invalidate = vi.fn();
+    const ctx = {
+      state: {
+        pendingTools: new Map([['call-1', component]]),
+        pendingTaskToolIds: new Set(['call-1']),
+        pendingSubagents: new Map(),
+        pendingAskUserComponents: new Map(),
+        pendingSubmitPlanComponents: new Map(),
+        allToolComponents: [],
+        chatContainer: { children: [completed, streaming], invalidate },
+        streamingComponent: streaming,
+        ui: { requestRender: vi.fn() },
+      },
+    } as any;
+
+    handleToolEnd(ctx, 'call-1', { content: 'failed' }, true);
+
+    expect(ctx.state.chatContainer.children.indexOf(component)).toBe(1);
+    expect(invalidate).not.toHaveBeenCalled();
   });
 
   it('does not append cleared shell output after abort/error lifecycle cleanup', () => {
@@ -214,11 +277,14 @@ describe('tool event handlers', () => {
       addChildBeforeFollowUps: vi.fn(child => ctx.state.chatContainer.children.push(child)),
       state: {
         quietMode: false,
+        options: { backgroundToolsEnabled: true },
         pluginManager: {
           getToolRenderConfig: vi.fn(() => ({ type: 'subagent', agentType: 'alexandria' })),
         },
         pendingTools: new Map(),
         pendingSubagents: new Map(),
+        pendingAskUserComponents: new Map(),
+        pendingSubmitPlanComponents: new Map(),
         allToolComponents: [],
         seenToolCallIds: new Set(),
         session: {
@@ -260,5 +326,46 @@ describe('tool event handlers', () => {
     expect(rendered).toContain('search_content');
     expect(rendered).not.toContain('Streaming answer text');
     expect(rendered).toContain('Updated answer text');
+
+    handleToolEnd(
+      ctx,
+      'call-1',
+      'Background task started. Task ID: task-1. The tool "mastra_expert" is running in the background.',
+      false,
+      { mastra: { backgroundTask: { taskId: 'task-1', status: 'running' } } },
+    );
+
+    expect(ctx.state.pendingSubagents.has('call-1')).toBe(true);
+    expect(
+      ctx.state.chatContainer.children.map((child: any) => child.render?.(120)?.join('\n') ?? '').join('\n'),
+    ).toContain('background · task-1');
+
+    handleToolEnd(ctx, 'call-1', 'Authoritative Alexandria result', false);
+
+    expect(ctx.state.pendingSubagents.has('call-1')).toBe(false);
+    const subagentComponent = ctx.state.allToolComponents[0];
+    subagentComponent.setExpanded(true);
+    expect(subagentComponent.render(120).join('\n')).toContain('Authoritative Alexandria result');
+  });
+});
+
+describe('handleToolApprovalRequired', () => {
+  it('does not notify from the queued handler (#20398 — notification fires at event receipt)', () => {
+    const ctx = {
+      state: {
+        ui: {
+          showOverlay: vi.fn(() => ({ close: vi.fn() })),
+          requestRender: vi.fn(),
+          terminal: { columns: 120, rows: 40 },
+        },
+        hookManager: undefined,
+      },
+      notify: vi.fn(),
+    } as any;
+
+    handleToolApprovalRequired(ctx, 'call-approve', 'execute_command', { command: 'ls' });
+
+    expect(ctx.state.ui.showOverlay).toHaveBeenCalledTimes(1);
+    expect(ctx.notify).not.toHaveBeenCalled();
   });
 });

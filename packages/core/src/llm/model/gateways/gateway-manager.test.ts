@@ -9,6 +9,7 @@ import type {
   ProviderConfig,
 } from './base';
 import { defaultGateways } from './defaults';
+import { findGatewayForModel } from './gateway-helpers';
 import { GatewayManager } from './gateway-manager';
 
 /**
@@ -238,6 +239,34 @@ describe('GatewayManager', () => {
       expect(auth.apiKey).toBe('env-key');
       expect(auth.source).toBe('legacy');
     });
+
+    it('falls back to getApiKey when resolveAuth returns empty headers', async () => {
+      const gateway = createFakeGateway({
+        id: 'test-gateway',
+        provider: 'acme',
+        apiKey: 'env-key',
+        resolveAuth: () => ({ headers: {} }),
+      });
+      const manager = new GatewayManager([gateway]);
+      const auth = await manager.resolveAuth('test-gateway/acme/sonic-fast');
+
+      expect(auth).toEqual({ apiKey: 'env-key', source: 'legacy' });
+      expect(gateway.getApiKey).toHaveBeenCalledWith('test-gateway/acme/sonic-fast');
+    });
+
+    it('accepts non-empty gateway headers without falling back to getApiKey', async () => {
+      const gateway = createFakeGateway({
+        id: 'test-gateway',
+        provider: 'acme',
+        apiKey: 'env-key',
+        resolveAuth: () => ({ headers: { 'x-api-key': 'gateway-key' } }),
+      });
+      const manager = new GatewayManager([gateway]);
+      const auth = await manager.resolveAuth('test-gateway/acme/sonic-fast');
+
+      expect(auth).toEqual({ headers: { 'x-api-key': 'gateway-key' }, source: 'gateway' });
+      expect(gateway.getApiKey).not.toHaveBeenCalled();
+    });
   });
 
   describe('hasAuth', () => {
@@ -258,6 +287,18 @@ describe('GatewayManager', () => {
         apiKey: '',
       });
       const manager = new GatewayManager([gateway]);
+      expect(await manager.hasAuth('test-gateway/acme/sonic-fast')).toBe(false);
+    });
+
+    it('returns false when gateway auth contains empty headers and getApiKey is empty', async () => {
+      const gateway = createFakeGateway({
+        id: 'test-gateway',
+        provider: 'acme',
+        apiKey: '',
+        resolveAuth: () => ({ headers: {} }),
+      });
+      const manager = new GatewayManager([gateway]);
+
       expect(await manager.hasAuth('test-gateway/acme/sonic-fast')).toBe(false);
     });
 
@@ -480,5 +521,19 @@ describe('GatewayManager', () => {
         modelId: 'claude-sonnet-4-5',
       });
     });
+  });
+});
+
+describe('findGatewayForModel', () => {
+  it('skips disabled gateways, matching the router', () => {
+    const modelsDev = createFakeGateway({ id: 'models.dev' });
+    const disabledPrefix = createFakeGateway({ id: 'mastra', enabled: false });
+    const disabledClaimer = createFakeGateway({ id: 'claimer', enabled: false, handlesModel: () => true });
+
+    const gateways = [disabledPrefix, disabledClaimer, modelsDev];
+
+    expect(findGatewayForModel('mastra/openai/gpt-5', gateways).id).toBe('models.dev');
+    expect(findGatewayForModel('openai/gpt-5', gateways).id).toBe('models.dev');
+    expect(new GatewayManager(gateways).findGatewayForModel('mastra/openai/gpt-5').id).toBe('models.dev');
   });
 });
